@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-overlay",
+  "description": "Local overlay events, window dragging and preferences; native window management stays in Rust.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-start-dragging",
+    "store:default"
+  ]
+}
+

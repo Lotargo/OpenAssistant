@@ -1,0 +1,210 @@
+import { createColorPicker } from './color-picker.js';
+import { getIcon } from './icons.js';
+import { normalizeSettings } from './settings.js';
+
+const TABS = ['appearance', 'behavior', 'sources'];
+
+/** Settings stay local. Capture/model fields are unavailable until their native pipelines exist. */
+export function createSettingsModal({ getSettings, onChange, onOpenChange, getRuntimeState = () => ({}) }) {
+  const host = document.getElementById('settings-root');
+  const overlay = document.getElementById('overlay');
+  const settingsButton = document.querySelector('[data-action="settings"]');
+  const abort = new AbortController();
+  let opened = false;
+  let activeTab = 'appearance';
+  let colorTarget = 'panelColor';
+  let previousFocus = null;
+  let current = normalizeSettings(getSettings());
+
+  host.innerHTML = `
+    <div id="settings-backdrop" class="settings-backdrop" hidden>
+      <section id="settings-dialog" class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
+        <header class="settings-header">
+          ${getIcon('settings')}<h1 id="settings-title">Настройки</h1>
+          <button class="icon-button" type="button" data-close-settings aria-label="Закрыть настройки">${getIcon('close')}</button>
+        </header>
+        <div class="settings-body">
+          <nav class="settings-nav" role="tablist" aria-label="Разделы настроек" aria-orientation="vertical">
+            <button id="tab-appearance" class="settings-tab" type="button" role="tab" aria-selected="true" aria-controls="section-appearance" data-tab="appearance">${getIcon('appearance')}<span>Внешний вид</span></button>
+            <button id="tab-behavior" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-behavior" tabindex="-1" data-tab="behavior">${getIcon('behavior')}<span>Поведение</span></button>
+            <button id="tab-sources" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-sources" tabindex="-1" data-tab="sources">${getIcon('sources')}<span>Источники</span></button>
+          </nav>
+          <div class="settings-main">
+            <section id="section-appearance" class="settings-section" role="tabpanel" aria-labelledby="tab-appearance">
+              <h2>Внешний вид</h2>
+              <p class="settings-description">Изменения сразу видны на панели ассистента.</p>
+              <div class="color-targets" role="group" aria-label="Изменяемый цвет">
+                <button class="color-target" type="button" data-color-target="panelColor" aria-pressed="true"><span class="color-target-dot" data-swatch="panelColor"></span>Цвет панели</button>
+                <button class="color-target" type="button" data-color-target="textColor" aria-pressed="false"><span class="color-target-dot" data-swatch="textColor"></span>Цвет текста</button>
+              </div>
+              <div id="appearance-color-picker" class="color-picker"></div>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-opacity">Непрозрачность</label><small>0% — прозрачная, 100% — плотная панель.</small></div>
+                <div class="settings-control"><input id="setting-opacity" data-setting="opacity" type="range" min="0" max="100" step="1"/><output for="setting-opacity" data-value="opacity"></output></div>
+              </div>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-font-size">Размер шрифта</label><small>Текст ответов и пояснений.</small></div>
+                <div class="settings-control"><input id="setting-font-size" data-setting="fontSize" type="range" min="12" max="22" step="1"/><output for="setting-font-size" data-value="fontSize"></output></div>
+              </div>
+            </section>
+            <section id="section-behavior" class="settings-section" role="tabpanel" aria-labelledby="tab-behavior" hidden>
+              <h2>Поведение</h2>
+              <p class="settings-description">Прокрутка и размер панели во время ответа.</p>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-scroll-lock">Блокировка прокрутки</label><small>Колёсико не перемещает текст в оверлее.</small></div>
+                <label class="switch"><input id="setting-scroll-lock" data-setting="scrollLocked" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label>
+              </div>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-auto-scroll">Следовать за ответом</label><small>После ручной прокрутки вверх позиция сохраняется.</small></div>
+                <label class="switch"><input id="setting-auto-scroll" data-setting="autoScroll" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label>
+              </div>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-max-height">Максимальная высота</label><small>Доля доступной высоты экрана.</small></div>
+                <div class="settings-control"><input id="setting-max-height" data-setting="maxHeightPercent" type="range" min="40" max="85" step="1"/><output for="setting-max-height" data-value="maxHeightPercent"></output></div>
+              </div>
+              <p class="settings-hint">Нижняя граница остаётся на месте: панель растёт вверх. Код и пояснения прокручиваются независимо.</p>
+            </section>
+            <section id="section-sources" class="settings-section" role="tabpanel" aria-labelledby="tab-sources" hidden>
+              <h2>Источники</h2>
+              <p class="settings-description">Аудио, экран и подключение модели.</p>
+              <p id="settings-runtime-error" class="settings-message" role="status" hidden></p>
+              <div class="source-card"><h3>Микрофон</h3><p>Захват аудио пока не подключён.</p><select aria-label="Микрофон" disabled><option>Устройства появятся после подключения</option></select></div>
+              <div class="source-card"><h3>Системный звук</h3><p>Канал звука собеседника будет работать отдельно от микрофона.</p><select aria-label="Системный звук" disabled><option>Захват системного звука не подключён</option></select></div>
+              <div class="source-card"><h3>Изображение экрана</h3><p>Передача кадров модели пока не подключена.</p><select aria-label="Источник изображения" disabled><option>Выбор экрана недоступен</option></select></div>
+              <div class="source-card"><h3>Модель</h3><p>Подключение Gemini Live будет доступно после добавления сетевого клиента.</p></div>
+            </section>
+          </div>
+        </div>
+      </section>
+    </div>
+  `;
+  const backdrop = host.querySelector('#settings-backdrop');
+  const dialog = host.querySelector('#settings-dialog');
+  const runtimeError = host.querySelector('#settings-runtime-error');
+  const picker = createColorPicker(host.querySelector('#appearance-color-picker'), {
+    value: current.panelColor,
+    onChange(hex) { update({ [colorTarget]: hex }, false); },
+  });
+
+  function renderValues(refreshPicker = true) {
+    for (const input of host.querySelectorAll('[data-setting]')) {
+      const key = input.dataset.setting;
+      if (input.type === 'checkbox') input.checked = current[key];
+      else input.value = current[key];
+    }
+    for (const output of host.querySelectorAll('[data-value]')) {
+      const key = output.dataset.value;
+      output.value = `${current[key]}${key === 'fontSize' ? ' px' : '%'}`;
+      output.textContent = output.value;
+    }
+    for (const swatch of host.querySelectorAll('[data-swatch]')) swatch.style.backgroundColor = current[swatch.dataset.swatch];
+    for (const target of host.querySelectorAll('[data-color-target]')) target.setAttribute('aria-pressed', String(target.dataset.colorTarget === colorTarget));
+    if (refreshPicker) picker.setValue(current[colorTarget]);
+    const runtime = getRuntimeState() || {};
+    const message = runtime.lastError || runtime.message || '';
+    runtimeError.textContent = typeof message === 'string' ? message : '';
+    runtimeError.hidden = !runtimeError.textContent;
+  }
+
+  function update(patch, refreshPicker = true) {
+    current = normalizeSettings({ ...current, ...patch });
+    renderValues(refreshPicker);
+    // Updates can persist asynchronously; surface failures inside settings only.
+    Promise.resolve(onChange?.({ ...current })).catch((error) => {
+      runtimeError.textContent = `Не удалось сохранить настройки: ${error instanceof Error ? error.message : String(error)}`;
+      runtimeError.hidden = false;
+    });
+  }
+
+  function selectTab(tab, focus = false) {
+    activeTab = TABS.includes(tab) ? tab : 'appearance';
+    for (const button of host.querySelectorAll('[data-tab]')) {
+      const active = button.dataset.tab === activeTab;
+      button.setAttribute('aria-selected', String(active));
+      button.tabIndex = active ? 0 : -1;
+      if (active && focus) button.focus();
+    }
+    for (const tabName of TABS) host.querySelector(`#section-${tabName}`).hidden = tabName !== activeTab;
+    host.querySelector('.settings-main').scrollTop = 0;
+    if (activeTab === 'appearance') requestAnimationFrame(() => picker.refresh());
+  }
+
+  async function open(tab = 'appearance') {
+    current = normalizeSettings(getSettings());
+    renderValues();
+    selectTab(tab);
+    if (!opened) {
+      opened = true;
+      previousFocus = document.activeElement;
+      backdrop.hidden = false;
+      overlay.inert = true;
+      document.body.classList.add('settings-open');
+      settingsButton?.setAttribute('aria-expanded', 'true');
+      await onOpenChange?.(true);
+      if (!opened) return;
+    }
+    requestAnimationFrame(() => {
+      if (!opened) return;
+      host.querySelector(`[data-tab="${activeTab}"]`).focus({ preventScroll: true });
+      picker.refresh();
+    });
+  }
+
+  async function close() {
+    if (!opened) return;
+    opened = false;
+    backdrop.hidden = true;
+    overlay.inert = false;
+    document.body.classList.remove('settings-open');
+    settingsButton?.setAttribute('aria-expanded', 'false');
+    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+    await onOpenChange?.(false);
+  }
+
+  host.addEventListener('click', (event) => {
+    const tab = event.target.closest('[data-tab]');
+    const colorButton = event.target.closest('[data-color-target]');
+    if (tab) selectTab(tab.dataset.tab);
+    if (colorButton) { colorTarget = colorButton.dataset.colorTarget; renderValues(); }
+    if (event.target.closest('[data-close-settings]') || event.target === backdrop) void close();
+  }, { signal: abort.signal });
+
+  host.addEventListener('input', (event) => {
+    const key = event.target.dataset.setting;
+    if (key) update({ [key]: event.target.type === 'checkbox' ? event.target.checked : Number(event.target.value) }, false);
+  }, { signal: abort.signal });
+
+  host.querySelector('.settings-nav').addEventListener('keydown', (event) => {
+    const index = TABS.indexOf(activeTab);
+    if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+      event.preventDefault(); selectTab(TABS[(index + 1) % TABS.length], true);
+    } else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+      event.preventDefault(); selectTab(TABS[(index + TABS.length - 1) % TABS.length], true);
+    } else if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault(); selectTab(event.key === 'Home' ? TABS[0] : TABS.at(-1), true);
+    }
+  }, { signal: abort.signal });
+
+  document.addEventListener('keydown', (event) => {
+    if (!opened) return;
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void close(); return; }
+    if (event.key !== 'Tab') return;
+    const focusable = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex="0"]')]
+      .filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0);
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first) { event.preventDefault(); dialog.focus(); return; }
+    if (!dialog.contains(document.activeElement)) { event.preventDefault(); first.focus(); }
+    else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }, { signal: abort.signal });
+
+  renderValues();
+  return {
+    open,
+    close,
+    refresh() { current = normalizeSettings(getSettings()); renderValues(); },
+    get isOpen() { return opened; },
+    destroy() { void close(); abort.abort(); picker.destroy(); host.replaceChildren(); },
+  };
+}

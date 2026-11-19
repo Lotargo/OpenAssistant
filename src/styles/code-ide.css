@@ -1,0 +1,21 @@
+.code-card { display: flex; flex-direction: column; min-width: 0; min-height: 0; max-height: var(--content-max-height, 620px); border: 1px solid var(--line-color); border-radius: 13px; overflow: hidden; background: rgba(23, 26, 32, .63); }
+.code-header { display: flex; align-items: center; gap: 10px; flex: 0 0 42px; min-width: 0; padding: 10px 16px; border-bottom: 1px solid var(--line-color); background: rgba(255,255,255,.025); font-size: .9em; font-weight: 550; }
+.file-icon { width: 17px; height: 17px; flex: 0 0 17px; color: #b6c0d0; }
+#code-filename { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-panel { flex: 1 1 auto; }
+#code-content { min-height: 100%; }
+#code-content pre { margin: 0; padding: 16px 16px 20px 0; width: max-content; min-width: 100%; overflow: visible; background: transparent !important; font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Liberation Mono", monospace; font-size: var(--code-font-size); line-height: 1.65; tab-size: 4; }
+#code-content code { display: block; counter-reset: line; font: inherit; }
+#code-content .line, #code-content .code-line { position: relative; display: block; min-height: 1.65em; min-width: 100%; padding-left: 58px; padding-right: 8px; }
+#code-content .line::before, #code-content .code-line::before { counter-increment: line; content: counter(line); position: absolute; top: 0; left: 0; width: 42px; padding-right: 13px; text-align: right; font-variant-numeric: tabular-nums; color: #858b97; user-select: none; border-right: 1px solid rgba(255,255,255,.1); }
+#code-content .line::after, #code-content .code-line::after { content: ""; position: absolute; left: 58px; top: 0; bottom: 0; width: calc(var(--indent-columns, 0) * 1ch); background: repeating-linear-gradient(to right, rgba(255,255,255,.08) 0, rgba(255,255,255,.08) 1px, transparent 1px, transparent 4ch); pointer-events: none; }
+#code-content .line > span { position: relative; }
+#code-content .indent-guide { display: inline; border-left: 1px solid rgba(255,255,255,.09); margin-left: -1px; }
+#code-content .code-fallback { color: #e0e5ed; }
+@media (max-width: 720px) {
+  .code-header { padding: 9px 12px; gap: 7px; }
+  #code-content pre { padding-top: 12px; font-size: max(11px, calc(var(--code-font-size) - 1px)); }
+  #code-content .line, #code-content .code-line { padding-left: 44px; }
+  #code-content .line::before, #code-content .code-line::before { width: 33px; padding-right: 9px; }
+  #code-content .line::after, #code-content .code-line::after { left: 44px; }
+}
