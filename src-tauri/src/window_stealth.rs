@@ -1,8 +1,8 @@
-use crate::state::OverlayState;
+use crate::state::{OverlayState, WindowRect};
 use serde::Serialize;
 #[cfg(windows)]
 use tauri::{Emitter, Manager};
-use tauri::{LogicalSize, PhysicalPosition, WebviewWindow};
+use tauri::{LogicalSize, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 pub fn protect(window: &WebviewWindow) -> Result<(), String> {
     // Linux does not implement exclusion from capture. Do not imply protection there.
@@ -35,8 +35,23 @@ pub fn set_settings_focus(
     state: &OverlayState,
     open: bool,
 ) -> Result<(), String> {
+    let was_open = state.snapshot()?.settings_open;
+    if open && !was_open {
+        // Modal expansion may hit the monitor's top edge. Preserve the original
+        // physical rectangle so closing does not permanently move the bottom anchor.
+        let position = window.outer_position().map_err(|error| error.to_string())?;
+        let size = window.outer_size().map_err(|error| error.to_string())?;
+        state.update(|data| {
+            data.before_settings = Some(WindowRect {
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+            })
+        })?;
+    }
     #[cfg(windows)]
-    if open && !state.snapshot()?.settings_open {
+    if open && !was_open {
         use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
         // A handle is kept only to return focus after the explicitly focused modal closes.
         let foreground = unsafe { GetForegroundWindow() } as isize;
@@ -53,7 +68,27 @@ pub fn set_settings_focus(
         show(window)?;
         window.set_focus().map_err(|error| error.to_string())?;
     }
-    state.update(|data| data.runtime.settings_open = open)?;
+    if !open && was_open {
+        let original = state
+            .0
+            .lock()
+            .map_err(|_| "Overlay state is unavailable")?
+            .before_settings;
+        if let Some(original) = original {
+            window
+                .set_size(PhysicalSize::new(original.width, original.height))
+                .map_err(|error| error.to_string())?;
+            window
+                .set_position(PhysicalPosition::new(original.x, original.y))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    state.update(|data| {
+        data.runtime.settings_open = open;
+        if !open {
+            data.before_settings = None;
+        }
+    })?;
 
     #[cfg(windows)]
     if !open {
@@ -179,6 +214,7 @@ mod windows {
     use windows_sys::Win32::{
         Foundation::{LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
+        UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
         UI::WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
             UnhookWindowsHookEx, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MOUSEWHEEL,
@@ -285,6 +321,8 @@ mod windows {
             .name("overlay-pointer-routing".into())
             .spawn(move || {
                 let mut last_ignore = None;
+                let mut left_was_down = false;
+                let mut pointer_drag = false;
                 loop {
                     let Ok(visible) = window.is_visible() else {
                         break;
@@ -303,12 +341,25 @@ mod windows {
                             let x = (cursor.x - origin.x as f64) / scale;
                             let y = (cursor.y - origin.y as f64) / scale;
                             // Start interactive until the frontend provides geometry, avoiding an inaccessible first frame.
-                            let interactive = runtime.settings_open
+                            let over_interactive = runtime.settings_open
                                 || rects.toolbar.is_none()
-                                || [rects.toolbar, rects.drag]
-                                    .into_iter()
-                                    .flatten()
-                                    .any(|rect| rect.contains(x, y));
+                                || rects.interactive_at(x, y);
+                            let left_down = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0;
+                            if left_down && !left_was_down {
+                                pointer_drag = over_interactive;
+                            }
+                            if !left_down {
+                                pointer_drag = false;
+                            }
+                            left_was_down = left_down;
+                            // A scrollbar drag remains interactive until release, even
+                            // after the cursor leaves its narrow track. A drag begun in
+                            // the application underneath must remain click-through.
+                            let interactive = if left_down {
+                                pointer_drag
+                            } else {
+                                over_interactive
+                            };
                             let ignore = visible && !interactive;
                             if last_ignore != Some(ignore)
                                 && window.set_ignore_cursor_events(ignore).is_ok()

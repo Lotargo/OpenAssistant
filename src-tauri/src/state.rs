@@ -75,10 +75,14 @@ pub struct HitRects {
     pub notes: Option<Rect>,
     pub modal: Option<Rect>,
     pub drag: Option<Rect>,
+    pub scrollbars: Vec<Rect>,
 }
 
 impl HitRects {
     pub fn validate(&self) -> Result<(), String> {
+        if self.scrollbars.len() > 6 {
+            return Err("At most six scrollbar rectangles are supported".into());
+        }
         if [
             self.toolbar,
             self.text,
@@ -89,12 +93,21 @@ impl HitRects {
         ]
         .into_iter()
         .flatten()
+        .chain(self.scrollbars.iter().copied())
         .all(|rect| rect.valid())
         {
             Ok(())
         } else {
             Err("Panel coordinates must be finite and have nonnegative sizes".into())
         }
+    }
+
+    pub fn interactive_at(&self, x: f64, y: f64) -> bool {
+        [self.toolbar, self.drag]
+            .into_iter()
+            .flatten()
+            .chain(self.scrollbars.iter().copied())
+            .any(|rect| rect.contains(x, y))
     }
 
     pub fn panel_at(&self, x: f64, y: f64) -> Option<&'static str> {
@@ -109,10 +122,19 @@ impl HitRects {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct WindowRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Default)]
 pub struct OverlayData {
     pub runtime: RuntimeState,
     pub rects: HitRects,
+    pub before_settings: Option<WindowRect>,
     #[cfg(windows)]
     pub previous_focus: Option<isize>,
 }
@@ -201,6 +223,35 @@ mod tests {
             width: -1.0,
             ..Default::default()
         });
+        assert!(rects.validate().is_err());
+    }
+
+    #[test]
+    fn only_explicit_scrollbar_tracks_receive_pointer_input() {
+        let mut rects = HitRects {
+            code: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            }),
+            scrollbars: vec![Rect {
+                x: 192.0,
+                y: 0.0,
+                width: 8.0,
+                height: 100.0,
+            }],
+            ..Default::default()
+        };
+        assert!(rects.validate().is_ok());
+        assert!(!rects.interactive_at(50.0, 50.0));
+        assert!(rects.interactive_at(195.0, 50.0));
+        rects.scrollbars = vec![Rect::default(); 7];
+        assert!(rects.validate().is_err());
+        rects.scrollbars = vec![Rect {
+            width: f64::INFINITY,
+            ..Default::default()
+        }];
         assert!(rects.validate().is_err());
     }
 }

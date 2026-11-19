@@ -19,6 +19,26 @@ function visibleRect(element) {
   return width > 0 && height > 0 ? { x, y, width, height } : null;
 }
 
+function scrollbarRects(element) {
+  if (!element || !visibleRect(element)) return [];
+  const rect = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
+  const left = parseFloat(style.borderLeftWidth) || 0;
+  const right = parseFloat(style.borderRightWidth) || 0;
+  const top = parseFloat(style.borderTopWidth) || 0;
+  const bottom = parseFloat(style.borderBottomWidth) || 0;
+  const vertical = element.offsetWidth - element.clientWidth - left - right;
+  const horizontal = element.offsetHeight - element.clientHeight - top - bottom;
+  const result = [];
+  if (style.overflowY !== 'hidden' && vertical > 0 && element.scrollHeight > element.clientHeight) {
+    result.push({ x: rect.right - right - vertical, y: rect.top + top, width: vertical, height: element.clientHeight });
+  }
+  if (style.overflowX !== 'hidden' && horizontal > 0 && element.scrollWidth > element.clientWidth) {
+    result.push({ x: rect.left + left, y: rect.bottom - bottom - horizontal, width: element.clientWidth, height: horizontal });
+  }
+  return result;
+}
+
 export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }) {
   let stopped = false;
   let timer;
@@ -38,6 +58,8 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
       code: visibleRect(byId('code-panel')),
       notes: visibleRect(byId('notes-panel')),
       modal: isModalOpen() ? visibleRect(byId('settings-dialog')) : null,
+      scrollbars: getSettings().scrollLocked || isModalOpen() ? []
+        : ['text-panel', 'code-panel', 'notes-panel'].flatMap(id => scrollbarRects(byId(id))),
     };
     const signature = JSON.stringify(rects);
     if (signature === lastRects) return;
