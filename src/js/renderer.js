@@ -153,26 +153,42 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
         previous[key] = value;
       }
     }
-    codeFilename.textContent = current.codeMeta?.filename || 'untitled.txt';
-    const source = current.code || '';
-    const language = resolveLanguage(current.codeMeta?.lang, current.codeMeta?.filename);
-    if (source !== previous.code || language !== previous.language) {
-      // Paint immediately; slow grammar loading must not stall live text updates.
-      preserveScroll(codeContent, () => codeContent.replaceChildren(codeFragment(document, source)), autoScroll);
-      previous.code = source;
-      previous.language = language;
-      const lines = source.split('\n');
-      if (source && language !== 'text' && source.length <= 60_000
-        && lines.length <= 2000 && lines.every((line) => line.length <= 2000)) {
+    const blocksFor = value => value.codeBlocks?.length ? value.codeBlocks : [{
+      code: value.code || '', filename: value.codeMeta?.filename || 'untitled.txt', lang: value.codeMeta?.lang || 'text',
+    }];
+    const blocks = blocksFor(current);
+    const signature = JSON.stringify(blocks);
+    codeFilename.textContent = blocks.length > 1 ? blocks.length + ' фрагмента кода' : blocks[0].filename;
+    function blockFragment(tokens = []) {
+      const fragment = document.createDocumentFragment();
+      blocks.forEach((block, index) => {
+        if (blocks.length > 1) {
+          const heading = document.createElement('div');
+          heading.className = 'code-fragment-heading';
+          heading.textContent = block.filename;
+          fragment.append(heading);
+        }
+        fragment.append(codeFragment(document, block.code, tokens[index]));
+      });
+      return fragment;
+    }
+    if (signature !== previous.code) {
+      preserveScroll(codeContent, () => codeContent.replaceChildren(blockFragment()), autoScroll);
+      previous.code = signature;
+      const tokens = await Promise.all(blocks.map(async block => {
+        const source = block.code;
+        const language = resolveLanguage(block.lang, block.filename);
+        const lines = source.split('\n');
+        if (!source || language === 'text' || source.length > 60_000 || lines.length > 2000
+          || lines.some(line => line.length > 2000)) return null;
         try {
           const highlighter = await highlighterFor(language);
-          if (destroyed || source !== latest.code
-            || language !== resolveLanguage(latest.codeMeta?.lang, latest.codeMeta?.filename)) return;
-          const { tokens } = highlighter.codeToTokens(source, { lang: language, theme: 'dark-plus' });
-          preserveScroll(codeContent, () => codeContent.replaceChildren(codeFragment(document, source, tokens)), Boolean(getAutoScroll()));
-        } catch {
-          // A missing/unsupported grammar leaves the already rendered safe text.
-        }
+          return highlighter.codeToTokens(source, { lang: language, theme: 'dark-plus' }).tokens;
+        } catch { return null; }
+      }));
+      if (destroyed || signature !== JSON.stringify(blocksFor(latest))) return;
+      if (tokens.some(Boolean)) {
+        preserveScroll(codeContent, () => codeContent.replaceChildren(blockFragment(tokens)), Boolean(getAutoScroll()));
       }
     }
     if (!destroyed && currentRevision === revision) {

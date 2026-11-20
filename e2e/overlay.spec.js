@@ -135,20 +135,20 @@ test('scroll lock blocks manual wheel and unlock restores scrolling', async ({ p
   await expect.poll(() => panel.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
 });
 
-test('unavailable screen capture and reconnect open Sources without pretending to connect', async ({ page }) => {
+test('browser preview explains unavailable capture and native-only Codex without pretending to connect', async ({ page }) => {
   await openDemo(page, 'text');
   const screen = page.locator('#toolbar [data-action="screen"]');
   await screen.click();
   await expect(page.getByRole('tab', { name: 'Источники' })).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('#settings-runtime-error')).toContainText('Захват экрана ещё не подключён');
+  await expect(page.locator('#settings-runtime-error')).toContainText('Передача изображения экрана модели в этой версии не подключена');
   await expect(screen).toHaveAttribute('aria-pressed', 'false');
-  await expect(page.getByRole('combobox', { name: 'Источник изображения', exact: true })).toBeDisabled();
+  await expect(page.locator('#section-sources')).toContainText('Захват системного звука и изображения ещё не подключён');
   await page.keyboard.press('Escape');
   const reconnect = page.locator('#toolbar [data-action="reconnect"]');
   await reconnect.click();
-  await expect(page.locator('#settings-runtime-error')).toContainText('Gemini Live ещё не подключён');
-  await expect(reconnect).toHaveAttribute('data-state', 'unavailable');
-  await expect(page.getByRole('tab', { name: 'Источники' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#agent-error')).toContainText('Codex доступен в приложении OpenAssistant');
+  await expect(reconnect).not.toHaveAttribute('data-state', 'ready');
+  await expect(page.getByRole('tab', { name: 'Агент', exact: true })).toHaveAttribute('aria-selected', 'true');
 });
 
 test('narrow viewport preserves both panes and keeps the modal inside the viewport', async ({ page }) => {

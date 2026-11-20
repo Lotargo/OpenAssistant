@@ -1,5 +1,6 @@
 import { createBridge } from './bridge.js';
 import { createStreamParser } from './stream-parser.js';
+import { createMarkdownStream } from './markdown-stream.js';
 import { createRenderer } from './renderer.js';
 import { createSettingsModal } from './settings-modal.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
@@ -55,16 +56,14 @@ const renderer = createRenderer({
   onRender: () => geometry?.schedule(),
 });
 
-const parser = createStreamParser({
-  onUpdate(snapshot) {
-    overlay.dataset.mode = snapshot.mode === 'text' ? 'text' : 'code';
-    renderer.update(snapshot);
-    geometry?.schedule();
-  },
-  onError: error => {
-    if (bridge) bridge.reportError(error?.message ?? error);
-  },
-});
+function updateSnapshot(snapshot) {
+  overlay.dataset.mode = snapshot.mode === 'text' ? 'text' : 'code';
+  renderer.update(snapshot);
+  geometry?.schedule();
+}
+const parser = createStreamParser({ onUpdate: updateSnapshot, onError: error => bridge?.reportError(error?.message ?? error) });
+const liveParser = createMarkdownStream({ onUpdate: updateSnapshot, onError: error => bridge?.reportError(error?.message ?? error) });
+let activeParser = liveParser;
 
 function scrollPanel({ target, deltaY }) {
   if (settings.scrollLocked || modalOpen || !['text', 'code', 'notes'].includes(target) || !Number.isFinite(deltaY)) return;
@@ -88,17 +87,21 @@ async function start() {
   bridge = await createBridge({
     onState: renderControls,
     onScroll: scrollPanel,
-    onSettings: ({ open }) => open ? modal?.open() : modal?.close(),
+    onSettings: ({ open, tab, request }) => open ? modal?.open(tab || 'agent', request) : modal?.close(),
     onError: () => modal?.refresh(),
-    onTurnStart: payload => parser.reset({ preserveCode: Boolean(payload?.preserveCode) }),
-    onChunk: payload => { if (typeof payload?.text === 'string') parser.feed(payload.text); },
-    onTurnEnd: () => parser.finish(),
+    onTurnStart: payload => {
+      activeParser = payload?.format === 'tagged' ? parser : liveParser;
+      activeParser.reset({ preserveCode: Boolean(payload?.preserveCode) });
+    },
+    onChunk: payload => { if (typeof payload?.text === 'string') activeParser.feed(payload.text); },
+    onTurnEnd: () => activeParser.finish(),
   });
   document.body.classList.toggle('browser-preview', !bridge.native);
   settings = normalizeSettings(await bridge.loadSettings());
   applyTheme(settings);
 
   modal = createSettingsModal({
+    bridge,
     getSettings: () => settings,
     onChange: next => applySettings(next),
     onOpenChange(open) {
@@ -124,7 +127,7 @@ async function start() {
       if (action === 'reconnect') await bridge.command('reconnect_session');
       if (action === 'scroll-lock') await bridge.command('set_scroll_locked', { locked: !runtime.scrollLocked });
     } catch {
-      modal.open('sources');
+      modal.open(action === 'microphone' || action === 'screen' ? 'sources' : 'agent');
     } finally { button.disabled = false; }
   });
 

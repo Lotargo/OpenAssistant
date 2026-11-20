@@ -213,11 +213,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_geometry() {
-        let mut rects = HitRects::default();
-        rects.text = Some(Rect {
-            x: f64::NAN,
+        let mut rects = HitRects {
+            text: Some(Rect {
+                x: f64::NAN,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert!(rects.validate().is_err());
         rects.text = Some(Rect {
             width: -1.0,

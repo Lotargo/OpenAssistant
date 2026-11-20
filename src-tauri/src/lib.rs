@@ -1,3 +1,4 @@
+mod assistant;
 mod state;
 mod window_stealth;
 
@@ -10,8 +11,6 @@ use tauri::{
 
 const CAPTURE_UNAVAILABLE: &str =
     "Screen capture is not connected yet. No screen images are being captured or sent.";
-const CONNECTION_UNAVAILABLE: &str =
-    "Gemini Live is not connected in this foundation build. No audio or screen data is being sent.";
 
 fn publish(app: &AppHandle, state: RuntimeState) -> Result<RuntimeState, String> {
     app.emit("overlay:state", &state)
@@ -36,10 +35,32 @@ fn set_microphone_muted(
     state: State<'_, OverlayState>,
     muted: bool,
 ) -> Result<RuntimeState, String> {
-    // This is the requested mute preference. audioAvailable stays false until the audio backend exists.
+    app.emit(
+        "overlay:action",
+        serde_json::json!({"action":"microphone","muted":muted}),
+    )
+    .map_err(|error| error.to_string())?;
+    state.snapshot()
+}
+
+/// Reports actual capture state after WebView audio setup/teardown.
+#[tauri::command]
+fn sync_audio_state(
+    app: AppHandle,
+    state: State<'_, OverlayState>,
+    muted: bool,
+    available: bool,
+) -> Result<RuntimeState, String> {
+    let current = state.snapshot()?;
+    if current.microphone_muted == muted && current.audio_available == available {
+        return Ok(current);
+    }
     publish(
         &app,
-        state.update(|data| data.runtime.microphone_muted = muted)?,
+        state.update(|data| {
+            data.runtime.microphone_muted = muted;
+            data.runtime.audio_available = available;
+        })?,
     )
 }
 
@@ -59,8 +80,13 @@ fn set_screen_capture_enabled(
 }
 
 #[tauri::command]
-fn reconnect_session() -> Result<RuntimeState, String> {
-    Err(CONNECTION_UNAVAILABLE.into())
+fn reconnect_session(
+    app: AppHandle,
+    state: State<'_, OverlayState>,
+) -> Result<RuntimeState, String> {
+    app.emit("overlay:action", serde_json::json!({"action":"reconnect"}))
+        .map_err(|error| error.to_string())?;
+    state.snapshot()
 }
 
 #[tauri::command]
@@ -117,6 +143,17 @@ struct SettingsEvent {
     open: bool,
 }
 
+fn retire_webview_session(app: &AppHandle) {
+    app.state::<assistant::AssistantState>().invalidate_view();
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        handle
+            .state::<assistant::AssistantState>()
+            .close_stale_view()
+            .await;
+    });
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "Показать / скрыть", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Настройки", true, None::<&str>)?;
@@ -128,7 +165,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     for y in 4..28 {
         for x in 4..28 {
             let index = (y * 32 + x) * 4;
-            let edge = x < 7 || x >= 25 || y < 7 || y >= 25;
+            let edge = !(7..25).contains(&x) || !(7..25).contains(&y);
             let color = if edge {
                 [230, 234, 241, 255]
             } else {
@@ -148,7 +185,9 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
                     .ok_or_else(|| "Overlay window is unavailable".to_owned())
                     .and_then(|window| window_stealth::toggle_visibility(&window)),
                 "settings" => open_settings(app),
-                "reconnect" => Err(CONNECTION_UNAVAILABLE.to_owned()),
+                "reconnect" => app
+                    .emit("overlay:action", serde_json::json!({"action":"reconnect"}))
+                    .map_err(|error| error.to_string()),
                 "quit" => {
                     app.exit(0);
                     Ok(())
@@ -170,7 +209,7 @@ fn setup_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     };
     let keys = [Code::Space, Code::KeyM, Code::KeyL, Code::KeyS];
     let shortcuts = keys.map(|key| Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), key));
-    let register_shortcuts = shortcuts.clone();
+    let register_shortcuts = shortcuts;
     app.plugin(
         tauri_plugin_global_shortcut::Builder::new()
             .with_handler(move |app, shortcut, event| {
@@ -185,10 +224,12 @@ fn setup_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                             .ok_or("Overlay window is unavailable")?;
                         window_stealth::toggle_visibility(&window)?;
                     } else if shortcut == &shortcuts[1] {
-                        let snapshot = state.update(|data| {
-                            data.runtime.microphone_muted = !data.runtime.microphone_muted
-                        })?;
-                        publish(app, snapshot)?;
+                        let muted = !state.snapshot()?.microphone_muted;
+                        app.emit(
+                            "overlay:action",
+                            serde_json::json!({"action":"microphone","muted":muted}),
+                        )
+                        .map_err(|error| error.to_string())?;
                     } else if shortcut == &shortcuts[2] {
                         let snapshot = state.update(|data| {
                             data.runtime.scroll_locked = !data.runtime.scroll_locked
@@ -215,12 +256,31 @@ fn setup_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(OverlayState::default())
+        .manage(assistant::AssistantState::default())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+            {
+                retire_webview_session(webview.app_handle());
+            }
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                retire_webview_session(window.app_handle());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            assistant::assistant_status,
+            assistant::assistant_connect,
+            assistant::assistant_send,
+            assistant::assistant_audio,
+            assistant::assistant_disconnect,
             get_runtime_state,
             set_microphone_muted,
+            sync_audio_state,
             set_screen_capture_enabled,
             reconnect_session,
             set_scroll_locked,
@@ -238,6 +298,11 @@ pub fn run() {
             setup_shortcuts(app.handle())?;
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("could not start OpenAssistant");
+    app.run(|handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            tauri::async_runtime::block_on(handle.state::<assistant::AssistantState>().shutdown());
+        }
+    });
 }
