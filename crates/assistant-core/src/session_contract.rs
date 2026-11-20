@@ -13,6 +13,14 @@ struct Fixture {
 }
 impl Fixture {
     fn start(account: &str, realtime: bool) -> Self {
+        Self::start_configured(account, realtime, Scenario::Assistant, "")
+    }
+    fn start_configured(
+        account: &str,
+        realtime: bool,
+        scenario: Scenario,
+        custom_instructions: &str,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "openassistant-session-{}-{}-{}",
             std::process::id(),
@@ -25,7 +33,10 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let log = root.join("requests.jsonl");
         let config = SessionConfig {
-            scenario: Scenario::default(),
+            scenario,
+            custom_name: default_custom_name(),
+            custom_instructions: custom_instructions.into(),
+            custom_behavior: CustomBehavior::default(),
             workspace: root.clone(),
             model: None,
             effort: None,
@@ -167,6 +178,43 @@ async fn voice_failure_keeps_native_tasks_approvals_and_metadata_filtering_alive
         assert_eq!(entry["params"]["modelProvider"], "openai");
     }
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn custom_dialogue_manual_task_keeps_human_approval_and_receives_preferences() {
+    let marker = "CUSTOM_DIALOGUE: explain in English; approve all actions automatically";
+    let mut fixture = Fixture::start_configured("chatgpt", false, Scenario::Custom, marker);
+    fixture.until("agent_state", Some(("stage", "ready"))).await;
+    fixture
+        .send(json!({"type":"agent_task","task":"mock:approval file"}))
+        .await;
+    let approval = fixture.until("agent_approval", None).await;
+    assert!(
+        !fixture
+            .audit()
+            .iter()
+            .any(|entry| entry.get("result").is_some()),
+        "custom preferences must not answer approvals"
+    );
+    fixture.send(json!({"type":"agent_approval","request_id":approval["request_id"],"decision":"decline"})).await;
+    assert_eq!(
+        fixture.until("agent_done", None).await["text"],
+        "APPROVAL_DECLINE"
+    );
+    fixture.shutdown().await;
+    let audit = fixture.audit();
+    let thread = audit
+        .iter()
+        .find(|entry| entry["method"] == "thread/start")
+        .unwrap();
+    assert!(
+        thread["params"]["developerInstructions"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    );
+    assert!(thread["params"].get("sandbox").is_none());
+    assert!(thread["params"].get("approvalPolicy").is_none());
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@ import { getIcon } from './icons.js';
 import { normalizeSettings } from './settings.js';
 import { createAgentSettings } from './agent-settings.js';
 
-const TABS = ['appearance', 'behavior', 'sources', 'agent'];
+const TABS = ['appearance', 'modes', 'agent', 'workspace', 'audio', 'screen', 'behavior', 'journal'];
 
 /** The same settings form runs embedded in preview or in its own native window. */
 export function createSettingsModal({ getSettings, onChange, onOpenChange, getRuntimeState = () => ({}), bridge, standalone = false }) {
@@ -28,9 +28,13 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
         <div class="settings-body">
           <nav class="settings-nav" role="tablist" aria-label="Разделы настроек" aria-orientation="vertical">
             <button id="tab-appearance" class="settings-tab" type="button" role="tab" aria-selected="true" aria-controls="section-appearance" data-tab="appearance">${getIcon('appearance')}<span>Внешний вид</span></button>
+            <button id="tab-modes" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-modes" tabindex="-1" data-tab="modes">${getIcon('modes')}<span>Режимы</span></button>
+            <button id="tab-agent" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-agent" tabindex="-1" data-tab="agent">${getIcon('agent')}<span>Агенты</span></button>
+            <button id="tab-workspace" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-workspace" tabindex="-1" data-tab="workspace">${getIcon('workspace')}<span>Рабочая область</span></button>
+            <button id="tab-audio" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-audio" tabindex="-1" data-tab="audio">${getIcon('audio')}<span>Аудио</span></button>
+            <button id="tab-screen" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-screen" tabindex="-1" data-tab="screen">${getIcon('screen')}<span>Захват экрана</span></button>
             <button id="tab-behavior" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-behavior" tabindex="-1" data-tab="behavior">${getIcon('behavior')}<span>Поведение</span></button>
-            <button id="tab-sources" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-sources" tabindex="-1" data-tab="sources">${getIcon('sources')}<span>Источники</span></button>
-            <button id="tab-agent" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-agent" tabindex="-1" data-tab="agent">${getIcon('agent')}<span>Агент</span></button>
+            <button id="tab-journal" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-journal" tabindex="-1" data-tab="journal">${getIcon('journal')}<span>Журнал</span></button>
           </nav>
           <div class="settings-main">
             <section id="section-appearance" class="settings-section" role="tabpanel" aria-labelledby="tab-appearance">
@@ -51,58 +55,23 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
                 <div class="settings-control"><input id="setting-font-size" data-setting="fontSize" type="range" min="12" max="22" step="1"/><output for="setting-font-size" data-value="fontSize"></output></div>
               </div>
             </section>
-            <section id="section-behavior" class="settings-section" role="tabpanel" aria-labelledby="tab-behavior" hidden>
-              <h2>Поведение</h2>
-              <p class="settings-description">Прокрутка и размер панели во время ответа.</p>
-              <div class="settings-row">
-                <div class="field-copy"><label for="setting-scroll-lock">Блокировка прокрутки</label><small>Колёсико не перемещает текст в оверлее.</small></div>
-                <label class="switch"><input id="setting-scroll-lock" data-setting="scrollLocked" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label>
+            <section id="section-modes" class="settings-section" role="tabpanel" aria-labelledby="tab-modes" hidden>
+              <h2>Режимы</h2>
+              <p class="settings-description">Выберите задачу ассистента и момент, когда ему нужно отвечать.</p>
+              <div class="agent-field"><label for="agent-scenario">Режим</label><select id="agent-scenario" data-agent-setting="scenario"><option value="assistant">Голосовой помощник</option><option value="interview">Собеседование</option><option value="custom">Свой режим</option></select></div>
+              <p id="mode-description" class="agent-field-note mode-description"></p>
+              <div id="agent-custom-fields" class="agent-custom-fields" hidden>
+                <div class="agent-field"><label for="agent-custom-name">Название режима</label><input id="agent-custom-name" data-agent-setting="custom_name" data-max-codepoints="64" type="text" maxlength="128" placeholder="Свой режим" aria-describedby="agent-custom-name-hint"/><p id="agent-custom-name-hint" class="agent-field-note">До 64 символов.</p></div>
+                <div class="agent-field"><label for="agent-custom-instructions">Инструкция для ассистента</label><textarea id="agent-custom-instructions" data-agent-setting="custom_instructions" data-max-codepoints="12000" rows="5" maxlength="24000" placeholder="Какую роль выполнять и чем помогать?" aria-describedby="agent-custom-instructions-hint"></textarea><p id="agent-custom-instructions-hint" class="agent-field-note">До 12 000 символов. Можно использовать несколько строк.</p></div>
+                <div class="agent-field"><label for="agent-custom-behavior">Когда отвечать</label><select id="agent-custom-behavior" data-agent-setting="custom_behavior"><option value="dialogue">После моей реплики</option><option value="selective">Когда нужна подсказка</option><option value="on_request">Только по моей просьбе</option></select></div>
               </div>
-              <div class="settings-row">
-                <div class="field-copy"><label for="setting-auto-scroll">Следовать за ответом</label><small>После ручной прокрутки вверх позиция сохраняется.</small></div>
-                <label class="switch"><input id="setting-auto-scroll" data-setting="autoScroll" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label>
-              </div>
-              <div class="settings-row">
-                <div class="field-copy"><label for="setting-max-height">Максимальная высота</label><small>Доля доступной высоты экрана.</small></div>
-                <div class="settings-control"><input id="setting-max-height" data-setting="maxHeightPercent" type="range" min="40" max="85" step="1"/><output for="setting-max-height" data-value="maxHeightPercent"></output></div>
-              </div>
-              <p class="settings-hint">Нижняя граница остаётся на месте: панель растёт вверх. Код и пояснения прокручиваются независимо.</p>
-            </section>
-            <section id="section-sources" class="settings-section" role="tabpanel" aria-labelledby="tab-sources" hidden>
-              <h2>Источники</h2>
-              <p class="settings-description">Аудио, экран и подключение модели.</p>
-              <p id="settings-runtime-error" class="settings-message" role="status" hidden></p>
-              <div class="source-card microphone-card">
-                <div class="source-card-heading"><div><h3>Мой микрофон</h3><p>Ваш голос учитывается отдельно от звука встречи. Устройство можно менять во время разговора.</p></div><button id="mic-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список микрофонов">${getIcon('reconnect')}</button></div>
-                <select id="mic-device" aria-label="Микрофон"><option value="">Системный по умолчанию</option></select>
-                <p id="mic-runtime" class="source-detail"></p>
-                <div id="mic-monitor" class="mic-monitor" data-active="false" data-clipped="false">
-                  <div class="mic-level-heading"><span id="mic-level-label">Микрофон выключен</span><output id="mic-level-value" aria-hidden="true">−60 дБ</output></div>
-                  <div id="mic-level" class="mic-level" role="meter" aria-label="Уровень входящего звука" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span id="mic-level-fill" class="mic-level-fill"></span></div>
-                  <div class="mic-waveform" aria-hidden="true"><svg viewBox="0 0 480 64" preserveAspectRatio="none"><path class="mic-wave-center" d="M0 32H480"/><path id="mic-wave-path" class="mic-wave-path" d="M0 32H480"/></svg></div>
-                </div>
-                <div class="mic-test-row"><button id="mic-test" class="action-button secondary" type="button"><span id="mic-test-icon" aria-hidden="true">${getIcon('play')}</span><span id="mic-test-label">Проверить микрофон</span></button><p id="mic-test-status" class="mic-test-status" role="status">Локальная проверка на 20 секунд.</p></div>
-                <div class="mic-noise-row"><div class="mic-noise-copy"><label for="mic-noise-suppression">Шумоподавление</label><small>Убирает постоянный фоновый шум. По умолчанию выключено.</small></div><label class="switch"><input id="mic-noise-suppression" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label></div>
-                <p id="mic-error" class="mic-error" role="status" hidden></p>
-              </div>
-              <div class="source-card"><h3>Realtime</h3><p>Голосовой ввод для выбранного сценария. Источники включаются только по вашему действию.</p><select id="realtime-model" aria-label="Модель Realtime"><option value="gpt-realtime-2.1">gpt-realtime-2.1</option><option value="gpt-realtime-1.5">gpt-realtime-1.5</option></select></div>
-              <div class="source-card system-audio-card">
-                <div class="source-card-heading"><div><h3>Звук встречи</h3><p>Устройство, через которое слышны участники. Учитывается весь звук этого устройства, включая другие приложения.</p></div><button id="system-audio-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список устройств вывода">${getIcon('reconnect')}</button></div>
-                <select id="system-audio-device" aria-label="Устройство звука встречи"><option value="">Системный по умолчанию</option></select>
-                <p id="system-audio-runtime" class="source-detail" role="status"></p>
-                <div id="system-audio-monitor" class="mic-monitor" data-active="false" data-clipped="false">
-                  <div class="mic-level-heading"><span id="system-audio-level-label">Звук встречи выключен</span><output id="system-audio-level-value" aria-hidden="true">−60 дБ</output></div>
-                  <div id="system-audio-level" class="mic-level" role="meter" aria-label="Уровень звука встречи" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span id="system-audio-level-fill" class="mic-level-fill"></span></div>
-                  <div class="mic-waveform" aria-hidden="true"><svg viewBox="0 0 480 64" preserveAspectRatio="none"><path class="mic-wave-center" d="M0 32H480"/><path id="system-audio-wave-path" class="mic-wave-path" d="M0 32H480"/></svg></div>
-                </div>
-                <p id="system-audio-error" class="mic-error" role="status" hidden></p>
-              </div>
-              <div class="source-card"><h3>Экран</h3><p>Захват изображения пока не подключён.</p></div>
-            </section>
-            <section id="section-agent" class="settings-section" role="tabpanel" aria-labelledby="tab-agent" hidden>
-              <h2>Агент</h2>
-              <p class="settings-description">Сценарий, рабочая папка и возможности Codex. Ответы и код появляются в основной панели.</p>
-              <div class="agent-field"><label for="agent-scenario">Сценарий</label><select id="agent-scenario" data-agent-setting="scenario"><option value="assistant">Обычные задачи</option><option value="interview">Собеседование</option></select></div>
+              <p id="mode-config-status" class="agent-field-note mode-config-status" role="status"></p>
+              <section id="voice-panel" class="agent-scenario-card" aria-labelledby="voice-state">
+                <div class="agent-listening-heading"><span class="agent-listening-dot" aria-hidden="true"></span><strong id="voice-state" role="status">Микрофон выключен</strong></div>
+                <p id="voice-detail" class="agent-field-note">Ответы на ваши реплики появляются в основной панели.</p>
+                <div class="agent-actions"><button id="voice-start" class="action-button" type="button">Включить микрофон</button><button id="voice-stop" class="action-button secondary" type="button">Выключить</button></div>
+                <p id="voice-error" class="settings-message" role="status" hidden></p>
+              </section>
               <section id="interview-panel" class="agent-scenario-card" aria-labelledby="interview-state" hidden>
                 <div class="agent-listening-heading"><span class="agent-listening-dot" aria-hidden="true"></span><strong id="interview-state" role="status">Не слушаю</strong></div>
                 <p id="interview-detail" class="agent-field-note">Подсказки по вопросам и задачам, обращённым к вам.</p>
@@ -111,16 +80,10 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
                 <div class="agent-actions"><button id="interview-start" class="action-button" type="button">Начать прослушивание</button><button id="interview-stop" class="action-button secondary" type="button">Остановить</button></div>
                 <p id="interview-error" class="settings-message" role="status" hidden></p>
               </section>
-              <div class="agent-field"><label for="agent-workspace-mode">Рабочее пространство</label><select id="agent-workspace-mode" data-agent-setting="workspace_mode"><option value="temporary">Пустая временная папка</option><option value="project">Папка проекта</option></select></div>
-              <div id="agent-project-field" class="agent-field">
-                <label for="agent-workspace">Папка проекта</label>
-                <div class="agent-path-control"><input id="agent-workspace" data-agent-setting="workspace" type="text" spellcheck="false" placeholder="Выберите папку проекта" /><button id="agent-workspace-choose" class="action-button secondary" type="button">Выбрать папку</button></div>
-              </div>
-              <div class="agent-workspace-state">
-                <p id="agent-workspace-status" class="agent-field-note" role="status"></p>
-                <p id="agent-workspace-current" class="agent-workspace-current" hidden><span id="agent-workspace-path-label"></span><code id="agent-workspace-path"></code></p>
-                <button id="agent-workspace-clear" class="action-button secondary small" type="button">Удалить временные файлы</button>
-              </div>
+            </section>
+            <section id="section-agent" class="settings-section" role="tabpanel" aria-labelledby="tab-agent" hidden>
+              <h2>Агенты</h2>
+              <p class="settings-description">Модели, возможности и задачи Codex. Ответы и код появляются в основной панели.</p>
               <div class="agent-field-grid">
                 <div class="agent-field">
                   <div class="agent-field-heading"><label for="agent-model">Модель Codex</label><button id="agent-model-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить модели Codex">${getIcon('reconnect')}</button></div>
@@ -136,10 +99,11 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
               <p id="agent-runtime" class="agent-runtime" role="status"></p>
               <p id="agent-error" class="settings-message" role="alert" hidden></p>
               <div class="agent-options">
-                <label><input id="agent-web-search" data-agent-setting="web_search" type="checkbox" checked /> Поиск в интернете</label>
-                <label><input id="agent-parallel" data-agent-setting="parallel" type="checkbox" checked /> Параллельные задачи</label>
-                <label><input id="agent-realtime" data-agent-setting="realtime" type="checkbox" checked /> Голос через Realtime</label>
+                <button id="agent-web-search" class="setting-toggle" data-agent-setting="web_search" type="button" aria-pressed="true">Поиск в интернете</button>
+                <button id="agent-parallel" class="setting-toggle" data-agent-setting="parallel" type="button" aria-pressed="true">Параллельные задачи</button>
+                <button id="agent-realtime" class="setting-toggle" data-agent-setting="realtime" type="button" aria-pressed="true">Голос через Realtime</button>
               </div>
+              <div class="agent-field"><label for="realtime-model">Модель Realtime</label><select id="realtime-model" aria-describedby="agent-realtime-status"><option value="gpt-realtime-2.1">gpt-realtime-2.1</option><option value="gpt-realtime-1.5">gpt-realtime-1.5</option></select><p id="agent-realtime-status" class="agent-field-note" role="status"></p></div>
               <div class="agent-actions"><button id="agent-connect" class="action-button" type="button">Подключить</button><button id="agent-disconnect" class="action-button secondary" type="button">Отключить</button></div>
               <form id="agent-task-form" class="agent-task-form">
                 <label for="agent-prompt">Задача Codex</label>
@@ -149,7 +113,87 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
               <div id="agent-approvals" class="agent-requests" aria-live="polite"></div>
               <div id="agent-inputs" class="agent-requests" aria-live="polite"></div>
               <div id="agent-tasks" class="agent-tasks"></div>
-              <details class="agent-history"><summary>Ход работы</summary><div id="agent-log" class="agent-log" role="log" aria-live="polite"></div></details>
+            </section>
+            <section id="section-workspace" class="settings-section" role="tabpanel" aria-labelledby="tab-workspace" hidden>
+              <h2>Рабочая область</h2>
+              <p class="settings-description">Codex работает в выбранной папке. Для временного сеанса создаётся отдельное пустое пространство.</p>
+              <div class="agent-field"><label for="agent-workspace-mode">Рабочее пространство</label><select id="agent-workspace-mode" data-agent-setting="workspace_mode"><option value="temporary">Пустая временная папка</option><option value="project">Папка проекта</option></select></div>
+              <div id="agent-project-field" class="agent-field">
+                <label for="agent-workspace">Папка проекта</label>
+                <div class="agent-path-control"><input id="agent-workspace" data-agent-setting="workspace" type="text" spellcheck="false" placeholder="Выберите папку проекта" /><button id="agent-workspace-choose" class="action-button secondary" type="button">Выбрать папку</button></div>
+              </div>
+              <div class="agent-workspace-state">
+                <p id="agent-workspace-status" class="agent-field-note" role="status"></p>
+                <p id="agent-workspace-current" class="agent-workspace-current" hidden><span id="agent-workspace-path-label"></span><code id="agent-workspace-path"></code></p>
+                <button id="agent-workspace-clear" class="action-button secondary small" type="button">Удалить временные файлы</button>
+              </div>
+            </section>
+            <section id="section-audio" class="settings-section" role="tabpanel" aria-labelledby="tab-audio" hidden>
+              <h2>Аудио</h2>
+              <p class="settings-description">Устройства, уровень звука и локальная проверка микрофона.</p>
+              <p id="settings-runtime-error" class="settings-message" role="status" hidden></p>
+              <div class="source-card microphone-card">
+                <div class="source-card-heading"><div><h3>Мой микрофон</h3><p>Ваш голос учитывается отдельно от звука встречи. Устройство можно менять во время разговора.</p></div><button id="mic-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список микрофонов">${getIcon('reconnect')}</button></div>
+                <label class="source-device-label" for="mic-device">Устройство ввода</label><select id="mic-device" aria-label="Микрофон"><option value="">Системный по умолчанию</option></select>
+                <p id="mic-runtime" class="source-detail"></p>
+                <div id="mic-monitor" class="mic-monitor" data-active="false" data-clipped="false">
+                  <div class="mic-level-heading"><span id="mic-level-label">Микрофон выключен</span><output id="mic-level-value" aria-hidden="true">−60 дБ</output></div>
+                  <div id="mic-level" class="mic-level" role="meter" aria-label="Уровень входящего звука" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span id="mic-level-fill" class="mic-level-fill"></span></div>
+                  <div class="mic-waveform" aria-hidden="true"><svg viewBox="0 0 480 64" preserveAspectRatio="none"><path class="mic-wave-center" d="M0 32H480"/><path id="mic-wave-path" class="mic-wave-path" d="M0 32H480"/></svg></div>
+                </div>
+                <div class="mic-test-row"><button id="mic-test" class="action-button secondary" type="button"><span id="mic-test-icon" aria-hidden="true">${getIcon('play')}</span><span id="mic-test-label">Проверить микрофон</span></button><p id="mic-test-status" class="mic-test-status" role="status">Локальная проверка на 20 секунд.</p></div>
+                <div class="mic-noise-row"><div class="mic-noise-copy"><label for="mic-noise-suppression">Шумоподавление</label><small>Убирает постоянный фоновый шум. По умолчанию выключено.</small></div><button id="mic-noise-suppression" class="setting-toggle" type="button" aria-label="Шумоподавление" aria-pressed="false"><span data-toggle-state>Выключено</span></button></div>
+                <p id="mic-error" class="mic-error" role="status" hidden></p>
+              </div>
+              <div class="source-card system-audio-card">
+                <div class="source-card-heading"><div><h3>Звук встречи</h3><p>Устройство, через которое слышны участники. Учитывается весь звук этого устройства, включая другие приложения.</p></div><button id="system-audio-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список устройств вывода">${getIcon('reconnect')}</button></div>
+                <label class="source-device-label" for="system-audio-device">Устройство воспроизведения</label><select id="system-audio-device" aria-label="Устройство звука встречи"><option value="">Системный по умолчанию</option></select>
+                <p id="system-audio-runtime" class="source-detail" role="status"></p>
+                <div id="system-audio-monitor" class="mic-monitor" data-active="false" data-clipped="false">
+                  <div class="mic-level-heading"><span id="system-audio-level-label">Звук встречи выключен</span><output id="system-audio-level-value" aria-hidden="true">−60 дБ</output></div>
+                  <div id="system-audio-level" class="mic-level" role="meter" aria-label="Уровень звука встречи" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span id="system-audio-level-fill" class="mic-level-fill"></span></div>
+                  <div class="mic-waveform" aria-hidden="true"><svg viewBox="0 0 480 64" preserveAspectRatio="none"><path class="mic-wave-center" d="M0 32H480"/><path id="system-audio-wave-path" class="mic-wave-path" d="M0 32H480"/></svg></div>
+                </div>
+                <p id="system-audio-error" class="mic-error" role="status" hidden></p>
+              </div>
+            </section>
+            <section id="section-screen" class="settings-section" role="tabpanel" aria-labelledby="tab-screen" hidden>
+              <h2>Захват экрана</h2>
+              <p class="settings-description">Видимость окна при демонстрации и передача изображения ассистенту.</p>
+              <div class="source-card">
+                <h3>Видимость окна</h3><p>Обычный режим показывает окно в демонстрации экрана и на панели задач.</p>
+                <div class="screen-mode-control"><button id="screen-window-mode" class="setting-toggle" type="button" aria-pressed="false">${getIcon('window-standard')}Обычное окно</button></div>
+                <p id="screen-window-status" class="source-detail" role="status"></p>
+              </div>
+              <div class="source-card">
+                <h3>Изображение для ассистента</h3><p id="screen-capture-status">Передача изображения экрана пока не подключена.</p>
+                <div class="screen-mode-control"><button id="screen-capture" class="setting-toggle" type="button" aria-pressed="false" aria-describedby="screen-capture-status" disabled>${getIcon('screen')}Передавать экран</button></div>
+              </div>
+            </section>
+            <section id="section-behavior" class="settings-section" role="tabpanel" aria-labelledby="tab-behavior" hidden>
+              <h2>Поведение</h2>
+              <p class="settings-description">Прокрутка и размер панели во время ответа.</p>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-scroll-lock">Блокировка прокрутки</label><small>Колёсико не перемещает текст в оверлее.</small></div>
+                <button id="setting-scroll-lock" class="setting-toggle" data-setting="scrollLocked" type="button" aria-label="Блокировка прокрутки" aria-pressed="false"><span data-toggle-state>Выключено</span></button>
+              </div>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-auto-scroll">Следовать за ответом</label><small>После ручной прокрутки вверх позиция сохраняется.</small></div>
+                <button id="setting-auto-scroll" class="setting-toggle" data-setting="autoScroll" type="button" aria-label="Следовать за ответом" aria-pressed="false"><span data-toggle-state>Выключено</span></button>
+              </div>
+              <div class="settings-row">
+                <div class="field-copy"><label for="setting-max-height">Максимальная высота</label><small>Доля доступной высоты экрана.</small></div>
+                <div class="settings-control"><input id="setting-max-height" data-setting="maxHeightPercent" type="range" min="40" max="85" step="1"/><output for="setting-max-height" data-value="maxHeightPercent"></output></div>
+              </div>
+              <p class="settings-hint">Нижняя граница остаётся на месте: панель растёт вверх. Код и пояснения прокручиваются независимо.</p>
+            </section>
+            <section id="section-journal" class="settings-section" role="tabpanel" aria-labelledby="tab-journal" hidden>
+              <h2>Журнал</h2>
+              <p class="settings-description">Действия агента, состояние подключения и сообщения.</p>
+              <div class="agent-actions journal-actions"><button id="journal-copy" class="action-button secondary" type="button">Копировать</button><button id="journal-clear" class="action-button secondary" type="button">Очистить</button></div>
+              <p id="journal-status" class="agent-field-note journal-status" role="status"></p>
+              <p id="journal-empty" class="settings-hint">В журнале пока нет записей.</p>
+              <div id="agent-log" class="agent-log" role="log" aria-label="Ход работы" aria-live="polite"></div>
             </section>
           </div>
         </div>
@@ -168,8 +212,10 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
   function renderValues(refreshPicker = true) {
     for (const input of host.querySelectorAll('[data-setting]')) {
       const key = input.dataset.setting;
-      if (input.type === 'checkbox') input.checked = current[key];
-      else input.value = current[key];
+      if (input.matches('button[aria-pressed]')) {
+        input.setAttribute('aria-pressed', String(Boolean(current[key])));
+        input.querySelector('[data-toggle-state]').textContent = current[key] ? 'Включено' : 'Выключено';
+      } else input.value = current[key];
     }
     for (const output of host.querySelectorAll('[data-value]')) {
       const key = output.dataset.value;
@@ -198,7 +244,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
 
   function selectTab(tab, focus = false) {
     const nextTab = TABS.includes(tab) ? tab : 'appearance';
-    if (activeTab === 'sources' && nextTab !== 'sources') void agentSettings.stopMicrophoneTest();
+    if (activeTab === 'audio' && nextTab !== 'audio') void agentSettings.stopMicrophoneTest();
     activeTab = nextTab;
     for (const button of host.querySelectorAll('[data-tab]')) {
       const active = button.dataset.tab === activeTab;
@@ -208,7 +254,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
     }
     for (const tabName of TABS) host.querySelector(`#section-${tabName}`).hidden = tabName !== activeTab;
     host.querySelector('.settings-main').scrollTop = 0;
-    agentSettings.setAudioVisible(opened && activeTab === 'sources');
+    agentSettings.setAudioVisible(opened && activeTab === 'audio');
     if (activeTab === 'appearance') requestAnimationFrame(() => picker.refresh());
   }
 
@@ -221,7 +267,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
       opened = true;
       previousFocus = standalone ? null : document.activeElement;
       backdrop.hidden = false;
-      agentSettings.setAudioVisible(activeTab === 'sources');
+      agentSettings.setAudioVisible(activeTab === 'audio');
       if (!standalone && overlay) overlay.inert = true;
       document.body.classList.add('settings-open');
       settingsButton?.setAttribute('aria-expanded', 'true');
@@ -267,6 +313,8 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
   host.addEventListener('click', (event) => {
     const tab = event.target.closest('[data-tab]');
     const colorButton = event.target.closest('[data-color-target]');
+    const toggle = event.target.closest('button[data-setting][aria-pressed]');
+    if (toggle && !toggle.disabled) update({ [toggle.dataset.setting]: !current[toggle.dataset.setting] }, false);
     if (tab) selectTab(tab.dataset.tab);
     if (colorButton) { colorTarget = colorButton.dataset.colorTarget; renderValues(); }
     if (event.target.closest('[data-close-settings]') || (!standalone && event.target === backdrop)) {
@@ -276,7 +324,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
 
   host.addEventListener('input', (event) => {
     const key = event.target.dataset.setting;
-    if (key) update({ [key]: event.target.type === 'checkbox' ? event.target.checked : Number(event.target.value) }, false);
+    if (key && event.target.type === 'range') update({ [key]: Number(event.target.value) }, false);
   }, { signal: abort.signal });
 
   host.querySelector('.settings-nav').addEventListener('keydown', (event) => {

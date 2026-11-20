@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { openNative, openAgent, connectAgent, sendTask, emitSession, settingsPage } from './helpers/native.js';
+import { openNative, openAgent, connectAgent, sendTask, emitSession, settingsPage, setPressed } from './helpers/native.js';
 
 test('Codex connects without keys and streams tool activity, code and guidance through native Channel', async ({ page }, testInfo) => {
   let settings;
@@ -45,7 +45,7 @@ test('Codex connects without keys and streams tool activity, code and guidance t
   await page.screenshot({ path: testInfo.outputPath('codex-result.png'), animations: 'disabled' });
 
   settings = await openAgent(page);
-  await settings.locator('.agent-history summary').click();
+  await settings.locator('#tab-journal').click();
   await expect(settings.locator('#agent-log [data-kind="command"]')).toHaveCount(1);
   await expect(settings.locator('#agent-log [data-kind="command"]')).toContainText('42');
   await expect(settings.locator('#agent-log [data-kind="file"]')).toContainText('+fn main()');
@@ -129,7 +129,7 @@ test('Realtime startup failure leaves text tasks available on the same Codex ses
   let settings;
   await openNative(page, { autoReady: false });
   settings = await openAgent(page);
-  await settings.locator('#agent-realtime').check();
+  await setPressed(settings.locator('#agent-realtime'), true);
   await settings.locator('#agent-connect').click();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(1);
   const sessionId = await page.evaluate(() => window.__nativeContract.sessionIds[0]);
@@ -175,7 +175,7 @@ test('disconnect during a pending native connect disposes the late session witho
   let settings;
   await openNative(page, { autoReady: false });
   settings = await openAgent(page);
-  await settings.locator('#agent-realtime').uncheck();
+  await setPressed(settings.locator('#agent-realtime'), false);
   await page.evaluate(() => window.__nativeContract.delayNext('assistant_connect'));
   await settings.locator('#agent-connect').click();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.filter(item => item.name === 'assistant_connect').length)).toBe(1);
@@ -194,7 +194,7 @@ test('startup agent error releases connecting controls and permits a clean retry
   page.on('pageerror', error => errors.push(error.message));
   await openNative(page, { autoReady: false });
   settings = await openAgent(page);
-  await settings.locator('#agent-realtime').check();
+  await setPressed(settings.locator('#agent-realtime'), true);
   await settings.locator('#agent-connect').click();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(1);
   const failedId = await page.evaluate(() => window.__nativeContract.sessionIds[0]);

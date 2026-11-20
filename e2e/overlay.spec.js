@@ -139,16 +139,17 @@ test('browser preview explains unavailable capture and native-only Codex without
   await openDemo(page, 'text');
   const screen = page.locator('#toolbar [data-action="screen"]');
   await screen.click();
-  await expect(page.getByRole('tab', { name: 'Источники' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#tab-screen')).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#settings-runtime-error')).toContainText('Передача изображения экрана модели в этой версии не подключена');
   await expect(screen).toHaveAttribute('aria-pressed', 'false');
-  await expect(page.locator('#section-sources')).toContainText('Захват системного звука и изображения ещё не подключён');
+  await expect(page.locator('#section-screen')).toBeVisible();
+  await expect(page.locator('#screen-capture')).toBeDisabled();
   await page.keyboard.press('Escape');
   const reconnect = page.locator('#toolbar [data-action="reconnect"]');
   await reconnect.click();
   await expect(page.locator('#agent-error')).toContainText('Codex доступен в приложении OpenAssistant');
   await expect(reconnect).not.toHaveAttribute('data-state', 'ready');
-  await expect(page.getByRole('tab', { name: 'Агент', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#tab-agent')).toHaveAttribute('aria-selected', 'true');
 });
 
 test('narrow viewport preserves both panes and keeps the modal inside the viewport', async ({ page }) => {

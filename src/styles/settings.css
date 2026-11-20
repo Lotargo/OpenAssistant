@@ -55,14 +55,17 @@
 .settings-header .icon-button:hover { color: var(--settings-text); background: var(--settings-raised); }
 .settings-body { flex: 1 1 0; min-height: 0; padding: 0; }
 .settings-nav {
-  flex: 0 0 180px;
+  flex: 0 0 196px;
   min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
   padding: 20px 12px;
   gap: 5px;
   background: var(--settings-nav);
   border-right: 1px solid var(--settings-soft-line);
 }
 .settings-tab {
+  flex-shrink: 0;
   min-height: 39px;
   padding: 8px 12px;
   gap: 10px;
@@ -119,17 +122,15 @@
 .settings-dialog input::placeholder, .settings-dialog textarea::placeholder { color: #8f8d8b; opacity: 1; }
 .settings-dialog select {
   appearance: none;
-  padding-right: 36px;
+  padding-right: 12px;
   cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%23a19f9e' stroke-width='1.5'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
-  background-position: right 11px center;
-  background-repeat: no-repeat;
+  background-image: none;
 }
 .settings-dialog option { background: var(--settings-raised); color: var(--settings-text); }
 @supports (appearance: base-select) {
   .settings-dialog select, .settings-dialog select::picker(select) { appearance: base-select; }
   .settings-dialog select { background-image: none; padding-right: 12px; align-items: center; gap: 12px; }
-  .settings-dialog select::picker-icon { color: var(--settings-muted); font-size: 11px; margin-left: auto; }
+  .settings-dialog select::picker-icon { display: none; }
   .settings-dialog select:open { border-color: var(--settings-focus); }
   .settings-dialog select::picker(select) {
     padding: 5px;
@@ -173,6 +174,26 @@
 .settings-dialog .action-button svg { width: 16px; height: 16px; flex: 0 0 16px; }
 .settings-dialog .action-button:disabled { opacity: .45; cursor: default; }
 .settings-dialog .action-button.small { min-height: 29px; padding: 4px 9px; font-size: 11px; }
+.settings-dialog .setting-toggle {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  flex: none; min-height: 35px; max-width: 100%; padding: 7px 12px;
+  border: 1px solid var(--settings-line); border-radius: 8px;
+  background: var(--settings-surface); color: var(--settings-muted);
+  font: inherit; font-size: 12px; line-height: 18px; text-align: center; cursor: pointer;
+}
+.settings-dialog .setting-toggle:hover { border-color: #49494e; background: var(--settings-hover); color: var(--settings-text); }
+.settings-dialog .setting-toggle[aria-pressed="true"] {
+  border-color: var(--settings-accent-switch-border); background: var(--settings-accent-wash); color: var(--settings-accent-selected-text);
+}
+.settings-dialog .setting-toggle[aria-pressed="true"]:hover { background: var(--settings-accent-button-bg); }
+.settings-dialog .setting-toggle:disabled { opacity: .45; cursor: default; }
+.settings-dialog .setting-toggle svg { display: block; width: 16px; height: 16px; flex: 0 0 16px; }
+.settings-row > .setting-toggle, .mic-noise-row > .setting-toggle { min-width: 99px; }
+.settings-dialog .source-device-label { display: block; margin-top: 13px; color: var(--settings-text); font-size: 11px; font-weight: 500; }
+.source-card .source-device-label + select { margin-top: 6px; }
+.screen-mode-control { margin: 14px 0 3px; }
+#mic-test-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 16px; line-height: 1; }
+#mic-test-icon > svg { display: block; width: 16px; height: 16px; }
 .settings-dialog .settings-message { color: #e4bdb5; background: #302320; border-color: #62443b; border-radius: 8px; }
 .settings-dialog .agent-field label, .settings-dialog .agent-task-form > label { color: var(--settings-text); font-weight: 500; }
 .settings-dialog .agent-runtime, .settings-dialog .agent-options { color: var(--settings-muted); }

@@ -1,9 +1,12 @@
 //! Native-client session runtime; no HTTP listener, browser auth or API-key fallback.
+pub use crate::custom::{
+    CustomBehavior, DEFAULT_CUSTOM_NAME, default_custom_name, normalize_custom_settings,
+};
 use crate::{
     agent,
     auth::{self, SafeError},
     bridge::{self, Action, Bridge, Input},
-    codex, provider,
+    codex, custom, provider,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -25,12 +28,19 @@ pub enum Scenario {
     #[default]
     Assistant,
     Interview,
+    Custom,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionConfig {
     #[serde(default)]
     pub scenario: Scenario,
+    #[serde(default = "default_custom_name")]
+    pub custom_name: String,
+    #[serde(default)]
+    pub custom_instructions: String,
+    #[serde(default)]
+    pub custom_behavior: CustomBehavior,
     pub workspace: PathBuf,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -42,6 +52,8 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     pub fn validate(mut self) -> Result<Self, SafeError> {
+        (self.custom_name, self.custom_instructions) =
+            normalize_custom_settings(self.custom_name, self.custom_instructions)?;
         if !self.workspace.is_dir() {
             return Err(SafeError::new("Рабочая папка не существует"));
         }
@@ -54,6 +66,19 @@ impl SessionConfig {
         }
         Ok(self)
     }
+    pub fn uses_meeting_audio(&self) -> bool {
+        self.scenario == Scenario::Interview
+            || (self.scenario == Scenario::Custom
+                && self.custom_behavior != CustomBehavior::Dialogue)
+    }
+    pub(crate) fn custom_instructions(&self) -> Option<&str> {
+        (self.scenario == Scenario::Custom)
+            .then_some(self.custom_instructions.as_str())
+            .filter(|value| !value.is_empty())
+    }
+    pub(crate) fn requires_explicit_help(&self) -> bool {
+        self.scenario == Scenario::Custom && self.custom_behavior == CustomBehavior::OnRequest
+    }
     pub(crate) fn agent(&self) -> agent::Config {
         agent::Config {
             workspace: self.workspace.clone(),
@@ -61,6 +86,7 @@ impl SessionConfig {
             effort: self.effort.clone(),
             web_search: self.web_search,
             parallel: self.parallel,
+            custom_instructions: self.custom_instructions().map(str::to_owned),
         }
     }
 }
@@ -218,6 +244,23 @@ async fn send_value(socket: &mut provider::ProviderSocket, value: Value) -> Resu
     send_upstream(socket, UpstreamMessage::Text(value.to_string().into())).await
 }
 
+fn voice_payload(config: &SessionConfig) -> Value {
+    let mut payload = provider::session_payload(&config.realtime_model);
+    let instructions = format!(
+        "{} Рабочая папка: {}.",
+        payload["instructions"].as_str().unwrap_or(""),
+        config.workspace.display()
+    );
+    payload["instructions"] = json!(custom::append_instructions(
+        &instructions,
+        config.custom_instructions(),
+        "For project/file actions, commands, code, web search and current facts, use codex_task. \
+         Never claim unverified actions succeeded. Follow project instructions and the host's \
+         existing sandbox, approval and clarification workflow; preferences grant no extra permission.",
+    ));
+    payload
+}
+
 async fn connect_voice(
     config: &SessionConfig,
     events: &Events,
@@ -231,13 +274,7 @@ async fn connect_voice(
     events
         .emit(bridge::status("mint", "Подключение голосовой сессии"))
         .await?;
-    let mut payload = provider::session_payload(&config.realtime_model);
-    if let Some(instructions) = payload["instructions"].as_str() {
-        payload["instructions"] = json!(format!(
-            "{instructions} Рабочая папка: {}.",
-            config.workspace.display()
-        ));
-    }
+    let mut payload = voice_payload(config);
     let ephemeral = provider::mint(&payload, &credential.access_token).await?;
     drop(credential);
     events
@@ -280,7 +317,7 @@ pub async fn run(
     events: mpsc::Sender<Value>,
 ) -> Result<(), SafeError> {
     let config = config.validate()?;
-    if config.scenario == Scenario::Interview {
+    if config.uses_meeting_audio() {
         return crate::interview_session::run(config, input, events).await;
     }
     let options = codex::SpawnOptions::new(config.workspace.clone());
@@ -802,3 +839,7 @@ mod tests {
 #[cfg(test)]
 #[path = "session_contract.rs"]
 mod contract_tests;
+
+#[cfg(test)]
+#[path = "custom_tests.rs"]
+mod custom_tests;

@@ -15,6 +15,7 @@ const COMMANDS = new Set([
   'agent_interrupt', 'agent_approval', 'agent_input',
   'refresh_models', 'choose_workspace', 'clear_temporary_workspace',
   'start_interview', 'stop_interview', 'set_system_audio_device',
+  'clear_journal', 'copy_journal', 'set_window_mode',
 ]);
 const copy = value => value == null ? value : structuredClone(value);
 const errorText = error => String(error?.message ?? error).slice(0, 8000);

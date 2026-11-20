@@ -3,6 +3,7 @@ pub mod agent;
 pub mod auth;
 pub mod bridge;
 pub mod codex;
+mod custom;
 pub mod interview;
 mod interview_audio;
 mod interview_session;

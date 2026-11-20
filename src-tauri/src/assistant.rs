@@ -7,19 +7,19 @@ use assistant_core::{
     },
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tauri::{ipc::Channel, AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, ipc::Channel};
 use tauri_plugin_dialog::DialogExt;
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 
@@ -147,6 +147,9 @@ pub struct ConnectOptions {
     workspace_mode: WorkspaceMode,
     workspace: String,
     scenario: session::Scenario,
+    custom_name: String,
+    custom_instructions: String,
+    custom_behavior: session::CustomBehavior,
     model: String,
     effort: String,
     web_search: bool,
@@ -161,6 +164,9 @@ impl Default for ConnectOptions {
             workspace_mode: WorkspaceMode::Temporary,
             workspace: String::new(),
             scenario: session::Scenario::default(),
+            custom_name: session::default_custom_name(),
+            custom_instructions: String::new(),
+            custom_behavior: session::CustomBehavior::default(),
             model: String::new(),
             effort: String::new(),
             web_search: true,
@@ -186,6 +192,9 @@ fn options(config: ConnectOptions) -> Result<(SessionConfig, Arc<WorkspaceLease>
     if !assistant_core::provider::allowed_model(&config.realtime_model) {
         return Err("Unsupported Realtime model.".into());
     }
+    let (custom_name, custom_instructions) =
+        session::normalize_custom_settings(config.custom_name, config.custom_instructions)
+            .map_err(|error| error.to_string())?;
     let model = optional_setting(config.model, "model", 128)?;
     let effort = optional_setting(config.effort, "effort", 32)?;
     let project =
@@ -197,6 +206,9 @@ fn options(config: ConnectOptions) -> Result<(SessionConfig, Arc<WorkspaceLease>
     let session = SessionConfig {
         workspace: workspace.path().to_owned(),
         scenario: config.scenario,
+        custom_name,
+        custom_instructions,
+        custom_behavior: config.custom_behavior,
         model,
         effort,
         web_search: config.web_search,
@@ -541,6 +553,51 @@ mod tests {
     }
 
     #[test]
+    fn custom_options_validate_native_boundary_and_preserve_effective_routing() {
+        let input: ConnectOptions = serde_json::from_value(json!({
+            "scenario":"custom","custom_name":"  Режим SQL  ",
+            "custom_instructions":"  Отвечай кратко.\nПоказывай SQL.  ",
+            "custom_behavior":"on_request"
+        }))
+        .unwrap();
+        let (config, workspace) = options(input).unwrap();
+        assert_eq!(config.scenario, session::Scenario::Custom);
+        assert_eq!(config.custom_name, "Режим SQL");
+        assert_eq!(
+            config.custom_instructions,
+            "  Отвечай кратко.\nПоказывай SQL.  "
+        );
+        assert_eq!(config.custom_behavior, session::CustomBehavior::OnRequest);
+        assert!(config.uses_meeting_audio());
+        assert_eq!(workspace.cleanup().cleanup_status, CleanupStatus::Removed);
+        for invalid in [
+            ConnectOptions {
+                custom_name: "я".repeat(65),
+                ..Default::default()
+            },
+            ConnectOptions {
+                custom_name: "bad\nname".into(),
+                ..Default::default()
+            },
+            ConnectOptions {
+                custom_instructions: "я".repeat(12_001),
+                ..Default::default()
+            },
+            ConnectOptions {
+                custom_instructions: "bad\0prompt".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(options(invalid).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ConnectOptions>(
+                json!({"scenario":"custom","custom_behavior":"unrestricted"})
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn options_keep_default_provider_and_reject_control_characters() {
         let (config, workspace) = options(ConnectOptions::default()).unwrap();
         assert!(config.workspace.is_dir());
@@ -550,22 +607,28 @@ mod tests {
         assert_eq!(workspace.status().mode, WorkspaceMode::Temporary);
         assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
         assert_eq!(workspace.cleanup().cleanup_status, CleanupStatus::Removed);
-        assert!(options(ConnectOptions {
-            model: "model\nsecret".into(),
-            ..Default::default()
-        })
-        .is_err());
-        assert!(options(ConnectOptions {
-            workspace_mode: WorkspaceMode::Project,
-            workspace: "relative".into(),
-            ..Default::default()
-        })
-        .is_err());
-        assert!(options(ConnectOptions {
-            realtime_model: "third-party".into(),
-            ..Default::default()
-        })
-        .is_err());
+        assert!(
+            options(ConnectOptions {
+                model: "model\nsecret".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            options(ConnectOptions {
+                workspace_mode: WorkspaceMode::Project,
+                workspace: "relative".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            options(ConnectOptions {
+                realtime_model: "third-party".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 }
 

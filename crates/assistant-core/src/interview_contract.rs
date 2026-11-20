@@ -120,6 +120,19 @@ struct Fixture {
 }
 impl Fixture {
     fn start(auto_clear: bool) -> Self {
+        Self::start_configured(
+            auto_clear,
+            session::Scenario::Interview,
+            session::CustomBehavior::Dialogue,
+            "",
+        )
+    }
+    fn start_configured(
+        auto_clear: bool,
+        scenario: session::Scenario,
+        custom_behavior: session::CustomBehavior,
+        custom_instructions: &str,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "openassistant-interview-contract-{}-{}",
             std::process::id(),
@@ -146,7 +159,10 @@ impl Fixture {
         ]);
         let config = SessionConfig {
             workspace: root.clone(),
-            scenario: session::Scenario::Interview,
+            scenario,
+            custom_name: session::default_custom_name(),
+            custom_instructions: custom_instructions.into(),
+            custom_behavior,
             model: None,
             effort: None,
             web_search: false,
@@ -270,6 +286,128 @@ impl Drop for Fixture {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[tokio::test]
+async fn custom_on_request_waits_for_local_help_and_passes_preferences_to_manual_and_hint_threads()
+{
+    let marker = "CUSTOM_CONTRACT: concise SQL hints";
+    let mut fixture = Fixture::start_configured(
+        true,
+        session::Scenario::Custom,
+        session::CustomBehavior::OnRequest,
+        marker,
+    );
+    fixture.ready().await;
+    fixture.start_listening().await;
+    fixture
+        .hub
+        .phrase(Source::System, "remote", "Помоги: explain SQL left join")
+        .await;
+    fixture.event("transcript", None).await;
+    fixture.no_gate().await;
+    assert!(
+        !fixture
+            .audit()
+            .iter()
+            .any(|entry| entry["method"] == "turn/start")
+    );
+
+    fixture
+        .hub
+        .phrase(Source::Microphone, "local", "Подскажи ответ")
+        .await;
+    fixture.event("transcript", None).await;
+    let request = fixture.gate().await;
+    assert!(
+        request["response"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    );
+    assert_eq!(
+        request["response"]["tool_choice"]["name"],
+        "interview_decision"
+    );
+    fixture.decision(&request, true).await;
+    let done = fixture.event("agent_done", None).await;
+    assert!(
+        done["task_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("interview-hint-")
+    );
+    assert_eq!(done["status"], "completed");
+
+    fixture
+        .message(json!({"type":"text","text":"Explicit manual task"}))
+        .await;
+    let manual = fixture.event("agent_done", None).await;
+    assert!(
+        manual["task_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("interview-manual-")
+    );
+    fixture.finish().await;
+    let audit = fixture.audit();
+    let threads: Vec<_> = audit
+        .iter()
+        .filter(|entry| entry["method"] == "thread/start")
+        .collect();
+    assert_eq!(threads.len(), 2);
+    assert!(threads.iter().all(|entry| {
+        entry["params"]["developerInstructions"]
+            .as_str()
+            .unwrap()
+            .contains(marker)
+    }));
+    assert!(threads[0]["params"].get("sandbox").is_none());
+    assert_eq!(threads[1]["params"]["sandbox"], "read-only");
+    assert_eq!(threads[1]["params"]["approvalPolicy"], "never");
+    let turns: Vec<_> = audit
+        .iter()
+        .filter(|entry| entry["method"] == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["params"]["sandboxPolicy"]["type"], "readOnly");
+    assert_eq!(turns[0]["params"]["approvalPolicy"], "never");
+    assert!(turns[1]["params"].get("sandboxPolicy").is_none());
+    assert!(turns[1]["params"].get("approvalPolicy").is_none());
+}
+
+#[tokio::test]
+async fn custom_selective_evaluates_remote_context_with_custom_instructions() {
+    let mut fixture = Fixture::start_configured(
+        true,
+        session::Scenario::Custom,
+        session::CustomBehavior::Selective,
+        "CUSTOM_SELECTIVE: focus on concise explanations",
+    );
+    fixture.ready().await;
+    fixture.start_listening().await;
+    fixture
+        .hub
+        .phrase(Source::System, "remote", "Explain this SQL query")
+        .await;
+    fixture.event("transcript", None).await;
+    let request = fixture.gate().await;
+    assert!(
+        request["response"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("CUSTOM_SELECTIVE")
+    );
+    fixture.decision(&request, false).await;
+    fixture.event("interview_state", Some("listening")).await;
+    fixture.no_gate().await;
+    fixture.finish().await;
+    assert!(
+        !fixture
+            .audit()
+            .iter()
+            .any(|entry| entry["method"] == "turn/start")
+    );
 }
 
 #[tokio::test]

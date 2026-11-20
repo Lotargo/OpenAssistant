@@ -4,6 +4,8 @@ import { load } from '@tauri-apps/plugin-store';
 import { createMicrophone } from './microphone.js';
 import { createAssistantTransport } from './session-transport.js';
 import { createSystemAudio } from './system-audio.js';
+import { DEFAULT_AGENT, normalizeAgent, validateCustomSettings, usesMeetingAudio, modeLabel } from './agent-config.js';
+import { createActivityJournal, formatJournal } from './activity-journal.js';
 
 const APPEARANCE_KEY = 'openassistant.settings.v1';
 const AGENT_KEY = 'openassistant.agent.v1';
@@ -11,25 +13,6 @@ const AUDIO_KEY = 'openassistant.audio.v1';
 const WINDOW_MODE_KEY = 'openassistant.window-mode.v1';
 const validWindowMode = mode => mode === 'overlay' || mode === 'standard';
 const PREVIEW_ONLY = 'Codex доступен в приложении OpenAssistant. Браузер открыт только для просмотра интерфейса.';
-const DEFAULT_AGENT = Object.freeze({
-  workspace: '', workspace_mode: 'temporary', scenario: 'assistant', model: '', effort: '', web_search: true, parallel: true,
-  realtime: true, realtime_model: 'gpt-realtime-2.1',
-});
-
-function normalizeAgent(value = {}) {
-  const source = value && typeof value === 'object' ? value : {};
-  return {
-    workspace: typeof source.workspace === 'string' ? source.workspace.trim() : '',
-    workspace_mode: source.workspace_mode === 'project' ? 'project' : 'temporary',
-    scenario: source.scenario === 'interview' ? 'interview' : 'assistant',
-    model: typeof source.model === 'string' ? source.model : '',
-    effort: typeof source.effort === 'string' ? source.effort : '',
-    web_search: typeof source.web_search === 'boolean' ? source.web_search : true,
-    parallel: typeof source.parallel === 'boolean' ? source.parallel : true,
-    realtime: typeof source.realtime === 'boolean' ? source.realtime : true,
-    realtime_model: ['gpt-realtime-2.1', 'gpt-realtime-1.5'].includes(source.realtime_model) ? source.realtime_model : 'gpt-realtime-2.1',
-  };
-}
 function normalizeAudio(value = {}) {
   const source = value && typeof value === 'object' ? value : {};
   return {
@@ -76,6 +59,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let connectionPromise = null;
   let sessionConfig = null;
   let modelsPromise = null;
+  let dialogueStartToken = null;
   let interviewStarting = false;
   let interviewListeningIntent = false;
   let interviewStartToken = null;
@@ -85,9 +69,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let pinnedAgent = false;
   let progressTask = null;
   const taskText = new Map();
+  const journal = createActivityJournal();
   let realtimeText = '';
   let runtime = {
-    microphoneMuted: true, microphoneDevice: audioConfig.deviceId, microphoneDevices: [],
+    microphoneMuted: true, microphoneStarting: false, microphoneDevice: audioConfig.deviceId, microphoneDevices: [],
     microphoneNoiseSuppression: audioConfig.noiseSuppression, microphoneTesting: false,
     microphoneBusy: false, microphoneError: '', microphoneStatus: '', microphoneLevels: null,
     systemAudioActive: false, systemAudioBusy: false, systemAudioAvailable: false,
@@ -95,7 +80,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     systemAudioStatus: '', systemAudioError: '',
     modelCatalog: { status: 'idle', error: '', updatedAt: null },
     workspaceState: { mode: config.workspace_mode, path: '', cleanupStatus: 'idle', detail: '' },
-    interviewState: { stage: 'idle', detail: 'Прослушивание выключено' },
+    interviewStarting: false, interviewState: { stage: 'idle', detail: 'Прослушивание выключено' },
     speakerState: { status: 'idle', detail: '' }, transcriptHistory: [],
     screenCaptureEnabled: false, scrollLocked: false, settingsOpen: false,
     windowMode: !native && validWindowMode(storedWindowMode) ? storedWindowMode : 'overlay',
@@ -122,6 +107,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   }
   function reportError(error, open = false) {
     const message = error instanceof Error ? error.message : String(error);
+    log({ kind: 'error', title: 'Ошибка', detail: message, status: 'failed' });
     publish({ lastError: message });
     onError?.(message);
     if (open) onSettings?.({ open: true, tab: 'agent' });
@@ -161,11 +147,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   });
   function send(type, data = {}) { return transport.send({ type, ...data }); }
   function log(activity) {
-    publish({ activities: [...runtime.activities, {
-      title: activity.title || activity.kind || 'Событие',
-      detail: String(activity.detail || '').slice(0, 8000),
-      ...activity,
-    }].slice(-80) });
+    publish({ activities: journal.record(activity, generation) });
   }
   const mic = createMicrophone({
     nativeAudio: native ? { invoke, Channel } : null,
@@ -207,7 +189,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       onAudioLevels?.(levels);
     },
     onError: reportError,
-    isReady: () => native && runtime.liveAvailable && sessionConfig?.scenario === 'interview' && transport.connected,
+    isReady: () => native && runtime.liveAvailable && usesMeetingAudio(sessionConfig) && transport.connected,
     sendEvent: send,
     sendAudio: buffer => transport.audio(buffer, 'system'),
   });
@@ -248,6 +230,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       // before native capture shutdown and the final cleared snapshot complete.
       interviewListeningIntent = false;
       interviewStarting = false;
+      publish({ interviewStarting: false });
       if (interviewStartToken) {
         interviewStartToken.cancelled = true;
         interviewStartToken.cancel();
@@ -256,11 +239,11 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     if (interviewStopping) return interviewStopping;
     const operation = (async () => {
       publish({ interviewState: { ...runtime.interviewState, stage: 'stopping', detail } });
-      if (transport.connected && sessionConfig?.scenario === 'interview') {
+      if (transport.connected && usesMeetingAudio(sessionConfig)) {
         await send('interview_stop').catch(() => {});
       }
       const stopped = await Promise.allSettled([mic.stop(false), systemAudio.stop(false)]);
-      if (transport.connected && sessionConfig?.scenario === 'interview') {
+      if (transport.connected && usesMeetingAudio(sessionConfig)) {
         await send('mic_stop').catch(() => {});
         await send('system_stop').catch(() => {});
       }
@@ -275,7 +258,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   }
   async function startInterview() {
     if (!native) throw new Error(PREVIEW_ONLY);
-    if (config.scenario !== 'interview') throw new Error('Выбери сценарий «Собеседование».');
+    if (!usesMeetingAudio(config)) throw new Error('Выбери режим с прослушиванием встречи.');
     if (!config.realtime) throw new Error('Включи голосовое подключение для прослушивания встречи.');
     if (interviewActive() || interviewStarting) return;
     if (runtime.configDirty && runtime.tasks.some(task => task.status === 'running')) throw new Error('Сначала заверши текущую задачу.');
@@ -290,7 +273,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       if (result === cancelled || token.cancelled || destroyed) throw cancelled;
       return result;
     }
-    publish({ interviewState: { stage: 'starting', detail: 'Подключаю собеседование' } });
+    publish({ interviewStarting: true, interviewState: { stage: 'starting', detail: 'Подключаю режим «' + modeLabel(config) + '»' } });
     try {
       await step(mic.stopTest());
       await step(connect(true));
@@ -313,11 +296,55 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       if (interviewStartToken === token) {
         interviewStartToken = null;
         interviewStarting = false;
+        publish({ interviewStarting: false });
       }
     }
   }
+  function cancelDialogueStart() {
+    if (dialogueStartToken) {
+      dialogueStartToken.cancelled = true;
+      dialogueStartToken.cancel();
+      dialogueStartToken = null;
+    }
+    if (runtime.microphoneStarting) publish({ microphoneStarting: false });
+  }
+  async function startDialogue() {
+    if (!native) throw new Error(PREVIEW_ONLY);
+    if (dialogueStartToken || !runtime.microphoneMuted) return;
+    if (!config.realtime) throw new Error('Включи голосовое подключение во вкладке «Агенты».');
+    if (runtime.configDirty && runtime.tasks.some(item => item.status === 'running')) throw new Error('Примени изменённые параметры после завершения текущей задачи.');
+    const cancelled = Symbol('dialogue-cancelled');
+    const token = { cancelled: false, cancel: null };
+    const cancellation = new Promise(resolve => { token.cancel = () => resolve(cancelled); });
+    dialogueStartToken = token;
+    publish({ microphoneStarting: true });
+    async function step(operation) {
+      const result = await Promise.race([operation, cancellation]);
+      if (result === cancelled || token.cancelled || destroyed) throw cancelled;
+      return result;
+    }
+    try {
+      await step(mic.stopTest());
+      await step(connect(false, true));
+      if (runtime.configDirty) throw new Error('Параметры изменились во время подключения. Примени их кнопкой переподключения.');
+      await step(waitForVoice());
+      if (runtime.configDirty) throw new Error('Параметры изменились во время подключения. Примени их кнопкой переподключения.');
+      await step(mic.start());
+    } catch (error) {
+      if (error === cancelled || token.cancelled) return;
+      await mic.stop(false).catch(() => {});
+      throw error;
+    } finally {
+      if (dialogueStartToken === token) {
+        dialogueStartToken = null;
+        publish({ microphoneStarting: false });
+      }
+    }
+  }
+
   function stopVoiceSafely() {
-    if (sessionConfig?.scenario === 'interview' || systemAudio.active || interviewStarting) {
+    cancelDialogueStart();
+    if (usesMeetingAudio(sessionConfig) || systemAudio.active || interviewStarting) {
       void stopInterview().catch(reportError);
     } else void mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
   }
@@ -365,6 +392,9 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       case 'status': {
         const stage = event.stage || 'idle';
         if (stage === 'idle' && runtime.connectionStatus === 'connecting') return;
+        if (stage !== runtime.connectionStatus || (event.detail || stage) !== runtime.connectionDetail) {
+          log({ kind: 'connection', title: 'Голосовое подключение', detail: event.detail || stage, status: stage });
+        }
         const voiceReady = stage === 'ready' && event.realtime !== false && Boolean(sessionConfig?.realtime ?? config.realtime);
         publish({ connectionStatus: stage, liveAvailable: voiceReady, connectionDetail: event.detail || stage });
         if (stage === 'voice_error') {
@@ -387,6 +417,9 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         break;
       }
       case 'agent_state':
+        if (event.stage !== runtime.agentStage || event.detail !== runtime.agentDetail) {
+          log({ kind: 'connection', title: 'Codex', detail: event.detail || '', status: event.stage || 'idle' });
+        }
         publish({ agentStage: event.stage || 'idle', agentDetail: event.detail || '',
           activeWorkspace: event.workspace, activeModel: event.model, activeEffort: event.effort });
         if (event.stage === 'error') failWaiting(event.detail || 'Не удалось подключить Codex.');
@@ -397,15 +430,17 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           modelCatalog: { status: 'ready', error: '', updatedAt: Date.now() } });
         break;
       case 'workspace_state':
+        log({ kind: 'workspace', title: event.temporary ? 'Временная рабочая область' : 'Рабочая область проекта',
+          status: event.cleanup_status || 'idle', path: event.path || '', detail: event.message || '' });
         publish({ workspaceState: workspaceState(event) });
         break;
       case 'speaker_state':
-        if (sessionConfig?.scenario === 'interview' && !interviewListeningIntent
+        if (usesMeetingAudio(sessionConfig) && !interviewListeningIntent
           && !['idle', 'error', 'unavailable'].includes(event.status)) break;
         publish({ speakerState: { status: event.status || 'unavailable', detail: event.detail || '' } });
         break;
       case 'interview_state':
-        if (sessionConfig?.scenario === 'interview' && !interviewListeningIntent
+        if (usesMeetingAudio(sessionConfig) && !interviewListeningIntent
           && !['idle', 'error', 'unavailable'].includes(event.stage)) break;
         if (interviewStarting && event.stage === 'idle') break;
         publish({ interviewState: { ...runtime.interviewState, ...event } });
@@ -432,13 +467,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         break;
       }
       case 'agent_activity': {
-        const key = event.item_id || event.title;
-        const existing = runtime.activities.findIndex(item => item.task_id === event.task_id && (item.item_id || item.title) === key);
-        if (existing >= 0) {
-          const activities = [...runtime.activities];
-          activities[existing] = { ...activities[existing], ...event };
-          publish({ activities });
-        } else log(event);
+        log(event);
         showProgress(event.task_id, event);
         break;
       }
@@ -498,19 +527,19 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         if (activeSource === 'realtime') { onTurnEnd?.({ source: 'realtime' }); activeSource = null; realtimeText = ''; }
         break;
       case 'transcript': {
-        if (sessionConfig?.scenario === 'interview' && !interviewListeningIntent) break;
+        if (usesMeetingAudio(sessionConfig) && !interviewListeningIntent) break;
         const text = String(event.text || '');
         const entry = { text, utterance_id: event.utterance_id, item_id: event.item_id,
           source: event.source || 'microphone', speaker: event.speaker || null,
           speaker_label: event.speaker_label || (event.source === 'system' ? 'Участники встречи' : 'Мой микрофон') };
-        publish({ transcript: sessionConfig?.scenario === 'interview' ? entry.speaker_label + ': ' + text : text,
+        publish({ transcript: usesMeetingAudio(sessionConfig) ? entry.speaker_label + ': ' + text : text,
           transcriptHistory: [...runtime.transcriptHistory, entry].slice(-32),
-          ...(sessionConfig?.scenario === 'interview' ? { interviewState: { ...runtime.interviewState,
+          ...(usesMeetingAudio(sessionConfig) ? { interviewState: { ...runtime.interviewState,
             source: entry.source, speaker: entry.speaker, speaker_label: entry.speaker_label } } : {}) });
         break;
       }
       case 'speaker_attribution': {
-        if ((sessionConfig?.scenario === 'interview' && !interviewListeningIntent)
+        if ((usesMeetingAudio(sessionConfig) && !interviewListeningIntent)
           || !Number.isSafeInteger(event.utterance_id)) break;
         const history = runtime.transcriptHistory.map(entry => entry.utterance_id === event.utterance_id
           && entry.source === 'system' ? { ...entry, speaker: event.speaker || null,
@@ -577,7 +606,8 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     return promise;
   }
 
-  async function disconnect(preserveInterviewStart = false) {
+  async function disconnect(preserveInterviewStart = false, preserveDialogueStart = false) {
+    if (!preserveDialogueStart) cancelDialogueStart();
     ++generation;
     connectionPromise = null;
     failWaiting('Подключение отменено.');
@@ -592,16 +622,16 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     realtimeText = '';
     taskText.clear();
     publish({ connectionStatus: native ? 'idle' : 'unavailable', connectionDetail: '', agentStage: 'idle', agentDetail: '', liveAvailable: false,
-      approvals: [], inputs: [], tasks: [], activities: [], visibleTaskId: null, voiceError: '',
-      transcript: '', transcriptHistory: [], interviewState: { stage: 'idle', detail: 'Прослушивание выключено' } });
+      approvals: [], inputs: [], tasks: [], visibleTaskId: null, voiceError: '',
+      transcript: '', transcriptHistory: [], interviewState: { stage: preserveInterviewStart ? 'starting' : 'idle', detail: preserveInterviewStart ? 'Подключаю источники' : 'Прослушивание выключено' } });
   }
 
-  function connect(preserveInterviewStart = false) {
+  function connect(preserveInterviewStart = false, preserveDialogueStart = false) {
     if (!native) return Promise.reject(new Error(PREVIEW_ONLY));
     if (connectionPromise) return connectionPromise;
     if (transport.connected && ['ready', 'running'].includes(runtime.agentStage) && !runtime.configDirty) return Promise.resolve();
     const operation = (async () => {
-      await disconnect(preserveInterviewStart);
+      await disconnect(preserveInterviewStart, preserveDialogueStart);
       const epoch = generation;
       publish({ connectionStatus: config.realtime ? 'connecting' : 'idle', agentStage: 'starting', lastError: '', voiceError: '' });
       let resolve;
@@ -640,21 +670,30 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     try {
       switch (name) {
         case 'set_microphone_muted':
-          if (config.scenario === 'interview' || sessionConfig?.scenario === 'interview' && interviewActive()) {
+          if (args.muted) cancelDialogueStart();
+          if (usesMeetingAudio(config) || interviewStarting || interviewStartToken || usesMeetingAudio(sessionConfig) && interviewActive()) {
             if (args.muted) await stopInterview(); else await startInterview();
             return { ...runtime };
           }
-          if (args.muted) await mic.stop();
-          else {
-            await mic.stopTest();
-            if (!config.realtime) throw new Error('Включи Realtime во вкладке «Агент», чтобы использовать микрофон.');
-            if (runtime.configDirty && runtime.tasks.some(item => item.status === 'running')) throw new Error('Примени изменённые параметры после завершения текущей задачи.');
-            await connect();
-            if (runtime.configDirty) throw new Error('Параметры изменились во время подключения. Примени их кнопкой переподключения.');
-            await waitForVoice();
-            await mic.start();
-          }
+          if (args.muted) { cancelDialogueStart(); await mic.stop(); }
+          else await startDialogue();
           return { ...runtime };
+        case 'clear_journal': {
+          const cleared = journal.clear();
+          publish({ activities: [] });
+          return { cleared };
+        }
+        case 'copy_journal': {
+          const entries = journal.entries();
+          if (!entries.length) return { copied: false, entries: 0 };
+          const text = formatJournal(entries);
+          if (native) await invoke('clipboard_write_text', { text });
+          else {
+            if (!globalThis.navigator?.clipboard?.writeText) throw new Error('Буфер обмена недоступен в этом браузере.');
+            await navigator.clipboard.writeText(text);
+          }
+          return { copied: true, entries: entries.length };
+        }
         case 'set_microphone_device':
           await mic.select(args.deviceId || '');
           return { ...runtime };
@@ -774,9 +813,9 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       'overlay:error': payload => reportError(payload?.message ?? payload),
       'overlay:action': payload => {
         const action = payload?.action === 'microphone'
-          ? command('set_microphone_muted', { muted: payload.muted ?? !runtime.microphoneMuted })
+          ? command('set_microphone_muted', { muted: dialogueStartToken || interviewStartToken ? true : payload.muted ?? !runtime.microphoneMuted })
           : payload?.action === 'reconnect' ? command('reconnect_session') : null;
-        void action?.catch(() => onSettings?.({ open: true, tab: payload.action === 'microphone' ? 'sources' : 'agent' }));
+        void action?.catch(() => onSettings?.({ open: true, tab: payload.action === 'microphone' ? 'audio' : 'agent' }));
       },
       'assistant:turn-start': payload => onTurnStart?.({ ...payload, format: 'tagged' }),
       'assistant:chunk': payload => onChunk?.({ ...payload, format: 'tagged' }),
@@ -813,6 +852,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     getAgentSettings: () => ({ ...config }),
     async setAgentSettings(patch) {
       const next = normalizeAgent({ ...config, ...patch });
+      validateCustomSettings(next);
       const changed = JSON.stringify(next) !== JSON.stringify(config);
       config = next;
       publish({ agentConfig: { ...config }, configDirty: runtime.configDirty || changed });

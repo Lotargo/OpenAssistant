@@ -1,3 +1,19 @@
+import { modeLabel, usesMeetingAudio } from './agent-config.js';
+
+export function modeSettings(config = {}) {
+  const custom = config.scenario === 'custom';
+  const meeting = usesMeetingAudio(config);
+  const descriptions = {
+    dialogue: 'Слушает ваш микрофон и отвечает после каждой реплики по вашей инструкции.',
+    selective: 'Учитывает микрофон и звук встречи. Подсказывает, когда помощь нужна по вашей инструкции.',
+    on_request: 'Учитывает микрофон и звук встречи. Отвечает только на вашу явную просьбу о помощи.',
+  };
+  const description = custom ? descriptions[config.custom_behavior] || descriptions.dialogue
+    : meeting ? 'Слушает ваш голос и звук встречи. Подсказывает по вопросам и задачам, обращённым к вам.'
+      : 'Слушает ваш микрофон. Ответы на ваши реплики появляются в основной панели.';
+  return { custom, meeting, label: modeLabel(config), description };
+}
+
 const effortNames = {
   none: 'Без рассуждений', minimal: 'Минимальная', low: 'Низкая', medium: 'Средняя',
   high: 'Высокая', xhigh: 'Очень высокая', max: 'Максимальная', ultra: 'Ультра',

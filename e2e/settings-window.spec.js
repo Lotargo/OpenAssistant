@@ -49,7 +49,7 @@ test('reloading the settings view stops a local check while the owner task and l
   const task = await sendTask(page, 'Задача переживает перезагрузку настроек');
   await page.locator('[data-action="settings"]').click();
   const settings = await settingsPage(page);
-  await settings.locator('#tab-sources').click();
+  await settings.locator('#tab-audio').click();
   await settings.locator('#mic-test').click();
   await expect(settings.locator('#mic-test')).toHaveAttribute('aria-pressed', 'true');
   const captureId = await page.evaluate(() => window.__nativeContract.lastCapture().id);

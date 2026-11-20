@@ -158,7 +158,7 @@ test('opening before the settings view boots replays the exact approval and all 
 
 test('a late initial snapshot cannot replace newer state or audio and levels use the lightweight callback', async t => {
   const owner = await ownerFixture();
-  await owner.host.open('sources');
+  await owner.host.open('audio');
   owner.bus.hold(packet => packet.event === 'settings:response');
   const states = [];
   const levels = [];
@@ -182,7 +182,7 @@ test('a late initial snapshot cannot replace newer state or audio and levels use
 
 test('closing and reloading settings stops only the local check and retains the main session and pending work', async t => {
   const owner = await ownerFixture();
-  await owner.host.open('sources');
+  await owner.host.open('audio');
   let closed = 0;
   const first = await owner.proxy({ onClose: () => closed++ });
   await first.command('start_microphone_test');
@@ -283,7 +283,7 @@ test('main owner replacement refreshes the existing view and rejects old calls w
 
 test('native settings hide is observed once and stops the local check without echoing a close command', async t => {
   const owner = await ownerFixture();
-  await owner.host.open('sources');
+  await owner.host.open('audio');
   const closed = [];
   const proxy = await owner.proxy({ onClose: () => closed.push(true) });
   cleanup(t, owner, proxy);
@@ -337,7 +337,7 @@ test('settings activity is scoped to its own native event and a late initial que
 
 test('microphone and system frames keep independent ordering through delayed snapshots', async t => {
   const owner = await ownerFixture();
-  await owner.host.open('sources');
+  await owner.host.open('audio');
   const frames = [];
   const proxy = await owner.proxy({ onAudioLevels: value => frames.push(value) });
   cleanup(t, owner, proxy);

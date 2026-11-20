@@ -159,7 +159,7 @@ test('scenario selection does not start listening; pending start can stop and so
   f.form.refresh();
   assert.equal(f.byId('interview-source').textContent, 'Звук встречи');
   assert.equal(f.byId('interview-state').textContent, 'Определяю, нужна ли подсказка');
-  await f.form.open('sources');
+  await f.form.open('audio');
   const prompt = f.byId('agent-prompt');
   prompt.value = 'Keep my unfinished task';
   const sourceSelect = f.byId('system-audio-device');

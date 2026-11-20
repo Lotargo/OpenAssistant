@@ -1,4 +1,5 @@
 import { createBridge } from './bridge.js';
+import { usesMeetingAudio } from './agent-config.js';
 import { createStreamParser } from './stream-parser.js';
 import { createMarkdownStream } from './markdown-stream.js';
 import { createRenderer } from './renderer.js';
@@ -48,8 +49,9 @@ function renderControls(next = runtime) {
   const lock = document.querySelector('[data-action="scroll-lock"]');
   const reconnect = document.querySelector('[data-action="reconnect"]');
   mic.setAttribute('aria-pressed', String(Boolean(runtime.microphoneMuted)));
-  const interview = runtime.agentConfig?.scenario === 'interview' || runtime.systemAudioActive;
-  mic.setAttribute('aria-label', interview
+  const interview = usesMeetingAudio(runtime.agentConfig) || runtime.systemAudioActive;
+  const starting = runtime.microphoneStarting || runtime.interviewStarting;
+  mic.setAttribute('aria-label', starting ? 'Остановить подключение микрофона' : interview
     ? runtime.microphoneMuted ? 'Начать прослушивание собеседования' : 'Остановить прослушивание собеседования'
     : runtime.microphoneMuted ? 'Включить микрофон' : 'Выключить микрофон');
   setButtonIcon(mic, runtime.microphoneMuted ? 'microphone-muted' : 'microphone');
@@ -194,9 +196,9 @@ async function start() {
     if (!button || modalOpen) return;
     const action = button.dataset.action;
     if (action === 'settings') { requestSettings({ open: true, tab: 'appearance' }); return; }
-    button.disabled = true;
+    if (action !== 'microphone') button.disabled = true;
     try {
-      if (action === 'microphone') await bridge.command('set_microphone_muted', { muted: !runtime.microphoneMuted });
+      if (action === 'microphone') await bridge.command('set_microphone_muted', { muted: Boolean(runtime.microphoneStarting || runtime.interviewStarting || !runtime.microphoneMuted) });
       if (action === 'screen') await bridge.command('set_screen_capture_enabled', { enabled: !runtime.screenCaptureEnabled });
       if (action === 'reconnect') await bridge.command('reconnect_session');
       if (action === 'scroll-lock') await bridge.command('set_scroll_locked', { locked: !runtime.scrollLocked });
@@ -205,8 +207,8 @@ async function start() {
       if (action === 'window-mode') {
         byId('announcer').textContent = 'Не удалось изменить режим окна. ' + String(error?.message ?? error);
         renderControls(bridge.getRuntimeState());
-      } else requestSettings({ open: true, tab: action === 'microphone' || action === 'screen' ? 'sources' : 'agent' });
-    } finally { button.disabled = false; }
+      } else requestSettings({ open: true, tab: action === 'microphone' ? 'audio' : action === 'screen' ? 'screen' : 'agent' });
+    } finally { if (action !== 'microphone') button.disabled = false; }
   });
 
   // Browser wheel input is handled normally. In desktop click-through mode the

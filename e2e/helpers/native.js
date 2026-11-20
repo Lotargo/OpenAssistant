@@ -143,7 +143,7 @@ export async function openNative(page, options = {}) {
     const harness = {
       calls: [], resizes: [], saves: [], agentSaves: [], windowModeSaves: [], dragStarts: [], sessionIds: [], events: [],
       messages: [], audio: [], audioStarts: [], audioStops: [], audioNoiseChanges: [], audioSaves: [], captureIds: [], pending, applyResizes: true,
-      systemAudioStarts: [], systemAudioStops: [], workspaceChoices,
+      systemAudioStarts: [], systemAudioStops: [], clipboardWrites: [], workspaceChoices,
       setModels(next) { models = structuredClone(next); },
       queueWorkspaceChoice(path) { workspaceChoices.push(path); },
       getWorkspaceState() { return structuredClone(workspaceState); },
@@ -365,6 +365,9 @@ export async function openNative(page, options = {}) {
           }
           return null;
         }
+        case 'clipboard_write_text':
+          harness.clipboardWrites.push(args.text);
+          return null;
         case 'assistant_audio':
           if (!sessions.get(args.sessionId)?.active) throw new Error('Session is closed');
           harness.audio.push({ sessionId: args.sessionId, bytes: args.audio.length, source: args.source || 'microphone' });
@@ -427,19 +430,29 @@ export async function openNative(page, options = {}) {
   await expect.poll(() => page.evaluate(() => window.__nativeContract.resizes.length)).toBeGreaterThan(0);
 }
 
-export async function openAgent(page) {
+export async function openSettingsTab(page, tab = 'appearance') {
   const record = nativeWindows.get(page);
   if (!record?.settings || !await record.settings.locator('#settings-dialog').isVisible()) {
     await record.main.locator('[data-action="settings"]').click();
   }
   const settings = await settingsPage(page);
-  await settings.getByRole('tab', { name: 'Агент', exact: true }).click();
+  await settings.locator('#tab-' + tab).click();
   return settings;
+}
+
+export async function openAgent(page) {
+  return openSettingsTab(page, 'agent');
+}
+
+export async function setPressed(button, pressed) {
+  await expect(button).toHaveAttribute('aria-pressed', /^(true|false)$/);
+  if (await button.getAttribute('aria-pressed') !== String(pressed)) await button.click();
+  await expect(button).toHaveAttribute('aria-pressed', String(pressed));
 }
 
 export async function connectAgent(page, { realtime = false } = {}) {
   const settings = await openAgent(page);
-  await settings.locator('#agent-realtime').setChecked(realtime);
+  await setPressed(settings.locator('#agent-realtime'), realtime);
   await settings.locator('#agent-connect').click();
   await expect(settings.locator('#agent-connect')).toHaveText('Переподключить');
   await expect(settings.locator('#agent-model option')).toHaveCount(3);

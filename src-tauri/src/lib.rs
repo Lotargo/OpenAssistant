@@ -1,4 +1,5 @@
 mod assistant;
+mod clipboard;
 mod audio;
 mod audio_commands;
 mod state;
@@ -298,6 +299,7 @@ pub fn run() {
         .manage(audio::AudioState::default())
         .manage(audio::SystemAudioState::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
@@ -342,6 +344,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            clipboard::clipboard_write_text,
             audio_commands::system_audio_state,
             audio_commands::system_audio_start,
             audio_commands::system_audio_stop,

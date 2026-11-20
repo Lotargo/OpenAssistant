@@ -1,13 +1,13 @@
 import { test, expect } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { openNative, settingsPage } from './helpers/native.js';
+import { openNative, settingsPage, setPressed } from './helpers/native.js';
 
-async function openSources(page) {
+async function openAudio(page) {
   await page.locator('[data-action="settings"]').click();
   const settings = await settingsPage(page);
-  await settings.locator('#tab-sources').click();
-  await expect(settings.locator('#section-sources')).toBeVisible();
+  await settings.locator('#tab-audio').click();
+  await expect(settings.locator('#section-audio')).toBeVisible();
   return settings;
 }
 
@@ -19,9 +19,16 @@ async function captureScreenshot(page, testInfo, name) {
 
 async function assertStableTabs(page, testInfo, screenshots = false) {
   let first;
-  for (const tab of ['appearance', 'behavior', 'sources', 'agent', 'appearance']) {
+  await expect(page.locator('[role="tab"]')).toHaveCount(8);
+  const controls = { modes: '#agent-scenario', agent: '#agent-model', workspace: '#agent-workspace-mode',
+    audio: '#mic-device', screen: '#screen-window-mode', behavior: '#setting-scroll-lock', journal: '#journal-copy' };
+  for (const [tab, control] of Object.entries(controls)) {
+    await expect(page.locator('#section-' + tab).locator(control)).toHaveCount(1);
+  }
+  for (const tab of ['appearance', 'modes', 'agent', 'workspace', 'audio', 'screen', 'behavior', 'journal', 'appearance']) {
     await page.locator('#tab-' + tab).click();
     await expect(page.locator('#section-' + tab)).toBeVisible();
+    await expect(page.locator('[role="tabpanel"]:visible')).toHaveCount(1);
     const rect = await page.locator('#settings-dialog').boundingBox();
     if (!first) first = rect;
     for (const key of ['x', 'y', 'width', 'height']) expect(Math.abs(rect[key] - first[key]), tab + ' ' + key).toBeLessThan(.5);
@@ -65,7 +72,7 @@ test('settings keep one native rectangle across tabs and the settings icon is ce
   await expect(settings.locator('#overlay')).toHaveCount(0);
   expect(await settings.locator('body').evaluate(node => getComputedStyle(node).backgroundColor)).toBe('rgb(24, 24, 27)');
   expect(await settings.locator('#settings-dialog').evaluate(node => getComputedStyle(node).backgroundColor)).toBe('rgb(24, 24, 27)');
-  await settings.locator('#tab-agent').click();
+  await settings.locator('#tab-audio').click();
   expect(await settings.locator('.settings-main').evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
   await settings.keyboard.press('Escape');
   await expect(settings.locator('#settings-dialog')).toBeHidden();
@@ -85,15 +92,26 @@ test('settings preserve their bounds and remain usable on a narrow viewport', as
   expect(bounds.y).toBeGreaterThanOrEqual(0);
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
   expect(bounds.y + bounds.height).toBeLessThanOrEqual(600);
-  await page.locator('#tab-sources').click();
+  await page.locator('#tab-audio').click();
   await captureScreenshot(page, testInfo, 'settings-narrow');
+});
+
+test('all eight tabs fit a narrow independent settings window', async ({ page }, testInfo) => {
+  await openNative(page);
+  const mainBounds = await page.locator('#overlay').boundingBox();
+  await page.locator('[data-action="settings"]').click();
+  const settings = await settingsPage(page);
+  await settings.setViewportSize({ width: 390, height: 690 });
+  const bounds = await assertStableTabs(settings, testInfo, true);
+  expect(bounds).toEqual({ x: 0, y: 0, width: 390, height: 690 });
+  expect(await page.locator('#overlay').boundingBox()).toEqual(mainBounds);
 });
 
 test('local microphone check renders the same real levels without refreshing agent controls or opening Codex', async ({ page }, testInfo) => {
   await openNative(page);
   const idleWaves = await page.locator('.toolbar-audio-wave').evaluateAll(paths => paths.map(node => node.getAttribute('d')));
-  const settings = await openSources(page);
-  await expect(settings.locator('#mic-noise-suppression')).not.toBeChecked();
+  const settings = await openAudio(page);
+  await expect(settings.locator('#mic-noise-suppression')).toHaveAttribute('aria-pressed', 'false');
   await expect(settings.locator('#mic-device option')).toHaveCount(3);
   await settings.locator('#mic-test').click();
   await expect(settings.locator('#mic-test')).toHaveAttribute('aria-pressed', 'true');
@@ -143,12 +161,12 @@ test('local microphone check renders the same real levels without refreshing age
   await expect(page.locator('.toolbar-audio[data-clipped="true"]')).toHaveCount(2);
 
   const initialCapture = await page.evaluate(() => window.__nativeContract.lastCapture());
-  await settings.locator('#mic-noise-suppression').check();
+  await setPressed(settings.locator('#mic-noise-suppression'), true);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioNoiseChanges.at(-1))).toEqual({ captureId: initialCapture.id, enabled: true });
   expect(await page.evaluate(() => window.__nativeContract.captureIds)).toEqual([initialCapture.id]);
   await settings.locator('#mic-device').selectOption('fixture-usb');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioStarts.at(-1)?.deviceId)).toBe('fixture-usb');
-  await expect.poll(() => page.evaluate(() => window.__nativeContract.audioSaves.at(-1))).toEqual({ deviceId: 'fixture-usb', noiseSuppression: true });
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.audioSaves.at(-1))).toEqual({ deviceId: 'fixture-usb', noiseSuppression: true, systemDeviceId: '' });
   await settings.locator('#tab-behavior').click();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture()?.active)).toBe(false);
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('data-audio-active', 'false');
@@ -160,7 +178,7 @@ test('local microphone check renders the same real levels without refreshing age
 
 test('closing settings cancels a microphone check while native start is still pending', async ({ page }) => {
   await openNative(page);
-  const settings = await openSources(page);
+  const settings = await openAudio(page);
   await page.evaluate(() => window.__nativeContract.delayNext('audio_start'));
   await settings.locator('#mic-test').click();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.filter(item => item.name === 'audio_start').length)).toBe(1);
@@ -169,7 +187,7 @@ test('closing settings cancels a microphone check while native start is still pe
   await expect(settings.locator('#settings-dialog')).toBeHidden();
   await page.evaluate(() => window.__nativeContract.release('audio_start'));
   await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture()?.active)).toBe(false);
-  await openSources(page);
+  await openAudio(page);
   await expect(settings.locator('#mic-test')).toHaveAttribute('aria-pressed', 'false');
   await expect(settings.locator('#mic-test')).toBeEnabled();
   expect(await page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(0);
@@ -180,13 +198,13 @@ test('closing settings and losing focus keep live dictation running, but local t
   await page.locator('[data-action="microphone"]').click();
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-pressed', 'false');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioStarts.at(-1)?.mode)).toBe('stream');
-  const settings = await openSources(page);
+  const settings = await openAudio(page);
   await expect(settings.locator('#mic-test')).toBeDisabled();
   await expect(settings.locator('#mic-test-status')).toHaveText('Уровень текущего голосового ввода.');
   const initialCapture = await page.evaluate(() => window.__nativeContract.lastCapture());
   await settings.locator('#mic-device').selectOption('fixture-default');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioSaves.at(-1)?.deviceId)).toBe('fixture-default');
-  await settings.locator('#mic-noise-suppression').check();
+  await setPressed(settings.locator('#mic-noise-suppression'), true);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioNoiseChanges.at(-1))).toEqual({ captureId: initialCapture.id, enabled: true });
   expect(await page.evaluate(() => window.__nativeContract.lastCapture())).toMatchObject({
     id: initialCapture.id, channelId: initialCapture.channelId, active: true, noiseSuppression: true,
@@ -205,7 +223,7 @@ test('closing settings and losing focus keep live dictation running, but local t
 
 test('a missing selected microphone stays explicit and another device can be selected', async ({ page }) => {
   await openNative(page);
-  const settings = await openSources(page);
+  const settings = await openAudio(page);
   await settings.locator('#mic-device').selectOption('fixture-usb');
   await page.evaluate(() => window.__nativeContract.setAudioDevices([
     { id: 'fixture-default', name: 'Fixture Microphone', is_default: true },
@@ -223,7 +241,7 @@ test('a missing selected microphone stays explicit and another device can be sel
 
 test('meters clear frozen audio before capture times out without stopping the microphone', async ({ page }) => {
   await openNative(page);
-  const settings = await openSources(page);
+  const settings = await openAudio(page);
   await settings.locator('#mic-test').click();
   await expect(settings.locator('#mic-test-status')).toContainText('Говорите обычным голосом');
   await page.evaluate(() => {
@@ -250,36 +268,36 @@ test('meters clear frozen audio before capture times out without stopping the mi
 
 test('noise toggle preserves pending intent through native latency and reverts on rejection', async ({ page }) => {
   await openNative(page);
-  const settings = await openSources(page);
+  const settings = await openAudio(page);
   await settings.locator('#mic-test').click();
   await expect(settings.locator('#mic-test-status')).toContainText('Говорите обычным голосом');
   const noise = settings.locator('#mic-noise-suppression');
   const initialCapture = await page.evaluate(() => window.__nativeContract.lastCapture());
   await page.evaluate(() => window.__nativeContract.delayNext('audio_set_noise_suppression'));
-  await noise.check();
+  await setPressed(noise, true);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.filter(item => item.name === 'audio_set_noise_suppression').length)).toBe(1);
-  await expect(noise).toBeChecked();
+  await expect(noise).toHaveAttribute('aria-pressed', 'true');
   await expect(noise).toBeDisabled();
   // An unrelated native state update runs the same full settings refresh.
   await page.evaluate(() => window.__nativeContract.pushState({ scrollLocked: true }));
-  await expect(noise).toBeChecked();
+  await expect(noise).toHaveAttribute('aria-pressed', 'true');
   await page.evaluate(() => window.__nativeContract.release('audio_set_noise_suppression'));
   await expect(noise).toBeEnabled();
-  await expect(noise).toBeChecked();
+  await expect(noise).toHaveAttribute('aria-pressed', 'true');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioSaves.at(-1)?.noiseSuppression)).toBe(true);
 
   await page.evaluate(() => {
     window.__nativeContract.failNext('audio_set_noise_suppression', 'Fixture noise update rejected');
     window.__nativeContract.delayNext('audio_set_noise_suppression');
   });
-  await noise.uncheck();
-  await expect(noise).not.toBeChecked();
+  await setPressed(noise, false);
+  await expect(noise).toHaveAttribute('aria-pressed', 'false');
   await expect(noise).toBeDisabled();
   await page.evaluate(() => window.__nativeContract.pushState({ scrollLocked: false }));
-  await expect(noise).not.toBeChecked();
+  await expect(noise).toHaveAttribute('aria-pressed', 'false');
   await page.evaluate(() => window.__nativeContract.release('audio_set_noise_suppression'));
   await expect(noise).toBeEnabled();
-  await expect(noise).toBeChecked(); // Confirmed true is restored; rejected false is not persisted.
+  await expect(noise).toHaveAttribute('aria-pressed', 'true'); // Confirmed true is restored; rejected false is not persisted.
   await expect(settings.locator('#mic-error')).toContainText('Fixture noise update rejected');
   expect(await page.evaluate(() => window.__nativeContract.audioSaves.at(-1)?.noiseSuppression)).toBe(true);
   expect(await page.evaluate(() => window.__nativeContract.lastCapture())).toMatchObject({
