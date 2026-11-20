@@ -160,11 +160,12 @@ export async function createSettingsWindowHost({
 
 /** A lightweight remote view: no transport, microphone capture or Store instance. */
 export async function createSettingsProxy({
-  onState, onAppearance, onAudioLevels, onOpen, onClose, events = EVENTS,
+  onState, onAppearance, onAudioLevels, onOpen, onClose, onWindowActivity, events = EVENTS,
   nativeInvoke = invoke, requestTimeout = 75_000, readyTimeout = 2_000, readyAttempts = 5,
 } = {}) {
   const clientId = newId();
   let requestId = 0;
+  let activityVersion = 0;
   let hostId = null;
   let stateSequence = -1;
   let audioSequence = -1;
@@ -265,6 +266,17 @@ export async function createSettingsProxy({
         onState?.(copy(runtime));
       });
     }));
+    const activity = payload => {
+      if (destroyed || typeof payload?.active !== 'boolean') return;
+      activityVersion++;
+      onWindowActivity?.({ active: payload.active });
+    };
+    unlisteners.push(await events.listen('overlay:window-activity', ({ payload }) => activity(payload)));
+    const initialActivityVersion = activityVersion;
+    try {
+      const initial = await nativeInvoke('get_window_activity');
+      if (activityVersion === initialActivityVersion) activity(initial);
+    } catch { /* Native activity events still handle subsequent transitions. */ }
     for (let attempt = 0; ; attempt++) {
       try { await request('snapshot', [], readyTimeout); break; }
       catch (error) { if (attempt + 1 >= readyAttempts) throw error; }

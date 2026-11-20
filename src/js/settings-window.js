@@ -2,12 +2,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { createSettingsProxy } from './settings-window-bridge.js';
 import { createSettingsModal } from './settings-modal.js';
 import { createWindowInteraction } from './window-interaction.js';
-import { DEFAULT_SETTINGS, normalizeSettings } from './settings.js';
+import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
 
 const byId = id => document.getElementById(id);
 let proxy;
 let form;
 let interaction;
+let nativeWindowActive = true;
 let shuttingDown = false;
 let settings = { ...DEFAULT_SETTINGS };
 let authoritativeSettings = settings;
@@ -36,6 +37,7 @@ async function saveAppearance(next) {
   const version = ++appearanceVersion;
   pendingAppearance = version;
   settings = normalizeSettings(next);
+  applyTheme(settings);
   try {
     const confirmed = await proxy.saveSettings(settings);
     if (version === appearanceVersion) {
@@ -49,7 +51,10 @@ async function saveAppearance(next) {
     }
     throw error;
   } finally {
-    if (version === appearanceVersion && !shuttingDown) form?.refresh();
+    if (version === appearanceVersion && !shuttingDown) {
+      applyTheme(settings);
+      form?.refresh();
+    }
   }
 }
 
@@ -69,15 +74,23 @@ async function start() {
       authoritativeSettings = normalizeSettings(next);
       // Do not replace a locally edited slider with an older runtime snapshot
       // while its save request is still travelling to the main window.
-      if (pendingAppearance === null) settings = authoritativeSettings;
+      if (pendingAppearance === null) {
+        settings = authoritativeSettings;
+        applyTheme(settings);
+      }
       if (!shuttingDown) form?.refresh();
     },
     onAudioLevels(levels) { if (!shuttingDown) form?.updateAudioLevels(levels); },
     onOpen: openForm,
     onClose: closeForm,
+    onWindowActivity({ active }) {
+      nativeWindowActive = active;
+      interaction?.setActive(active);
+    },
   });
   settings = normalizeSettings(await proxy.loadSettings());
   authoritativeSettings = settings;
+  applyTheme(settings);
   form = createSettingsModal({
     standalone: true,
     bridge: proxy,
@@ -90,6 +103,7 @@ async function start() {
     startDrag: () => proxy.command('start_window_drag'),
     onError: report,
   });
+  interaction.setActive(nativeWindowActive);
   byId('settings-window-status').hidden = true;
   byId('settings-root').hidden = false;
   const request = proxy.getOpenRequest();

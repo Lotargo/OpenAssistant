@@ -151,3 +151,78 @@ test('zero-layout overlay scrollbars exclude both edges from dragging and supply
   f.panel.style.overflow = 'hidden';
   assert.deepEqual(getScrollbarRects(f.panel), []);
 });
+
+for (const lifecycle of ['blur', 'hidden']) {
+  test(lifecycle + ' releases a pending native drag and an old completion cannot clear the new gesture', async t => {
+    const pending = [];
+    const f = fixture(t, () => new Promise((resolve, reject) => { pending.push({ resolve, reject }); }));
+    const drag = () => {
+      f.pointer('pointerdown');
+      f.pointer('pointermove', f.panel, { clientX: 20 });
+    };
+    drag();
+    assert.equal(pending.length, 1);
+    if (lifecycle === 'hidden') {
+      Object.defineProperty(f.doc, 'hidden', { configurable: true, value: true });
+      f.doc.dispatchEvent(new f.doc.defaultView.Event('visibilitychange'));
+    } else f.doc.defaultView.dispatchEvent(new f.doc.defaultView.Event('blur'));
+    assert.equal(f.doc.documentElement.classList.contains('window-dragging'), false);
+    Object.defineProperty(f.doc, 'hidden', { configurable: true, value: false });
+    f.doc.dispatchEvent(new f.doc.defaultView.Event('visibilitychange'));
+    f.doc.defaultView.dispatchEvent(new f.doc.defaultView.Event('focus'));
+    drag();
+    assert.equal(pending.length, 2, 'restored window accepts a fresh gesture despite an unresolved old IPC');
+    pending[0].resolve();
+    await tick();
+    assert.equal(f.doc.documentElement.classList.contains('window-dragging'), true, 'old finally must not clear the current drag');
+    // A second gesture is still blocked until the current native call completes.
+    drag();
+    assert.equal(pending.length, 2);
+    pending[1].resolve();
+    await tick();
+    assert.equal(f.doc.documentElement.classList.contains('window-dragging'), false);
+    assert.deepEqual(f.errors, []);
+  });
+}
+
+test('only explicitly inert audio decorations leave their background available for window dragging', t => {
+  const f = fixture(t);
+  const decoration = f.doc.createElement('span');
+  f.panel.append(decoration);
+  box(decoration, { x: 0, y: 80, width: 90, height: 20 });
+  const isBlank = () => getBackgroundDragRects(f.panel).some(rect =>
+    10 >= rect.x && 10 < rect.x + rect.width && 90 >= rect.y && 90 < rect.y + rect.height);
+  decoration.style.pointerEvents = 'none';
+  assert.equal(isBlank(), false, 'unmarked child content remains excluded');
+  decoration.dataset.windowDragIgnore = '';
+  assert.equal(isBlank(), true, 'explicit non-interactive meter can decorate draggable free space');
+  decoration.style.pointerEvents = 'auto';
+  assert.equal(isBlank(), false, 'an interactive child must remain excluded even if marked');
+});
+
+test('native activity releases a blocked drag without DOM events and ignores the obsolete rejection', async t => {
+  const pending = [];
+  const f = fixture(t, () => new Promise((resolve, reject) => { pending.push({ resolve, reject }); }));
+  const drag = () => {
+    f.pointer('pointerdown');
+    f.pointer('pointermove', f.panel, { clientX: 20 });
+  };
+  assert.equal(f.doc.hidden, false);
+  drag();
+  assert.equal(pending.length, 1);
+  f.controller.setActive(false);
+  assert.equal(f.doc.documentElement.classList.contains('window-dragging'), false);
+  drag();
+  assert.equal(pending.length, 1, 'inactive native window must ignore a stale pointer gesture');
+  f.controller.setActive(true);
+  drag();
+  assert.equal(pending.length, 2);
+  pending[0].reject(new Error('Obsolete pre-minimize IPC'));
+  await tick();
+  assert.deepEqual(f.errors, []);
+  assert.equal(f.doc.documentElement.classList.contains('window-dragging'), true);
+  assert.equal(f.doc.hidden, false, 'the entire transition came from native state, not DOM visibility');
+  pending[1].resolve();
+  await tick();
+  assert.equal(f.doc.documentElement.classList.contains('window-dragging'), false);
+});

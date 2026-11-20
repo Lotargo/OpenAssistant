@@ -75,3 +75,45 @@ test('reloading the settings view stops a local check while the owner task and l
   expect(await page.evaluate(() => window.__nativeContract.captureIds)).toEqual([captureId]);
   expect(await page.evaluate(() => window.__nativeContract.audio)).toEqual([]);
 });
+
+test('accent picker persists through the separate window and owner reload while rounded settings stay opaque', async ({ page }) => {
+  await openNative(page);
+  await page.locator('[data-action="settings"]').click();
+  const settings = await settingsPage(page);
+  const accentTarget = settings.locator('[data-color-target="accentColor"]');
+  await accentTarget.click();
+  await settings.locator('#picker-hex').fill('#2e8b57');
+  await settings.locator('#picker-hex').press('Tab');
+  await expect(settings.locator('#picker-hex')).toHaveValue('#2E8B57');
+  for (const view of [page, settings]) {
+    await expect.poll(() => view.locator('html').evaluate(node => node.style.getPropertyValue('--settings-accent'))).toBe('#2E8B57');
+  }
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.saves.at(-1)?.accentColor)).toBe('#2E8B57');
+  expect(await page.evaluate(() => ({
+    panelColor: window.__nativeContract.saves.at(-1)?.panelColor,
+    textColor: window.__nativeContract.saves.at(-1)?.textColor,
+  }))).toEqual({ panelColor: '#202329', textColor: '#F5F7FA' });
+  expect(await settings.locator('#settings-dialog').evaluate(node => ({
+    background: getComputedStyle(node).backgroundColor,
+    radius: getComputedStyle(node).borderTopLeftRadius,
+    opacity: getComputedStyle(node).opacity,
+  }))).toEqual({ background: 'rgb(24, 24, 27)', radius: '8px', opacity: '1' });
+
+  await settings.reload();
+  await expect(settings.locator('html')).toHaveAttribute('data-ready', 'true');
+  await accentTarget.click();
+  await expect(settings.locator('#picker-hex')).toHaveValue('#2E8B57');
+  await settings.keyboard.press('Escape');
+  await expect(settings.locator('#settings-dialog')).toBeHidden();
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-ready', 'true');
+  await expect.poll(() => page.locator('html').evaluate(node => node.style.getPropertyValue('--settings-accent'))).toBe('#2E8B57');
+  await page.locator('[data-action="settings"]').click();
+  await expect(settings.locator('#settings-dialog')).toBeVisible();
+  await accentTarget.click();
+  await expect(settings.locator('#picker-hex')).toHaveValue('#2E8B57');
+  await expect.poll(() => settings.locator('html').evaluate(node => node.style.getPropertyValue('--settings-accent'))).toBe('#2E8B57');
+  expect(await page.evaluate(() => ({
+    sessions: window.__nativeContract.sessionIds.length, captures: window.__nativeContract.captureIds.length,
+  }))).toEqual({ sessions: 0, captures: 0 });
+});

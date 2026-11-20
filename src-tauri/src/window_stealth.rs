@@ -7,6 +7,73 @@ use tauri::{
 
 pub const SETTINGS_LABEL: &str = "settings";
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WindowActivity {
+    pub active: bool,
+}
+
+pub fn window_activity(window: &WebviewWindow) -> Result<WindowActivity, String> {
+    if !matches!(window.label(), "main" | SETTINGS_LABEL) {
+        return Err("Window activity is unavailable".into());
+    }
+    Ok(WindowActivity {
+        active: window.is_visible().map_err(|e| e.to_string())?
+            && !window.is_minimized().map_err(|e| e.to_string())?,
+    })
+}
+
+fn record_window_activity(app: &AppHandle, label: &str, active: bool) {
+    if app
+        .state::<OverlayState>()
+        .observe_window_activity(label, active)
+    {
+        // A window-scoped event must not suspend its sibling WebView.
+        let _ = app.emit_to(label, "overlay:window-activity", WindowActivity { active });
+    }
+}
+
+pub fn on_window_activity_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if !matches!(window.label(), "main" | SETTINGS_LABEL) {
+        return;
+    }
+    if matches!(event, tauri::WindowEvent::Destroyed) {
+        window
+            .state::<OverlayState>()
+            .forget_window_activity(window.label());
+    } else if matches!(
+        event,
+        tauri::WindowEvent::Resized(_)
+            | tauri::WindowEvent::Focused(_)
+            | tauri::WindowEvent::ScaleFactorChanged { .. }
+    ) {
+        // Windows emits native Resized for WM_SIZE even when WebView2 emits no
+        // DOM visibility/focus events. IsWindowVisible alone includes iconic windows.
+        if let (Ok(visible), Ok(minimized)) = (window.is_visible(), window.is_minimized()) {
+            record_window_activity(window.app_handle(), window.label(), visible && !minimized);
+        }
+    }
+}
+
+fn refresh_window_activity(window: &WebviewWindow) {
+    let app = window.app_handle().clone();
+    let label = window.label().to_owned();
+    // Keep observation and notification on the UI thread after queued show/hide.
+    // Look up the current instance instead of retaining an old settings HWND.
+    let _ = window.run_on_main_thread(move || {
+        if let Some(current) = app.get_webview_window(&label) {
+            if let Ok(activity) = window_activity(&current) {
+                record_window_activity(&app, &label, activity.active);
+            }
+        }
+    });
+}
+
+fn hide(window: &WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())?;
+    refresh_window_activity(window);
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowPolicy {
     protected: bool,
@@ -220,6 +287,7 @@ fn apply_window_mode(
 pub fn show(window: &WebviewWindow) -> Result<(), String> {
     protect(window)?;
     window.show().map_err(|e| e.to_string())?;
+    refresh_window_activity(window);
     protect(window)?;
     if window.label() == SETTINGS_LABEL
         || window.state::<OverlayState>().snapshot()?.window_mode == WindowMode::Standard
@@ -231,7 +299,7 @@ pub fn show(window: &WebviewWindow) -> Result<(), String> {
 
 pub fn toggle_visibility(window: &WebviewWindow) -> Result<(), String> {
     if window.is_visible().map_err(|e| e.to_string())? {
-        window.hide().map_err(|e| e.to_string())?;
+        hide(window)?;
         protect(window)
     } else {
         show(window)
@@ -327,6 +395,9 @@ fn ensure_settings_window(app: &AppHandle, state: &OverlayState) -> Result<Webvi
             .build()
             .map_err(|e| e.to_string())?;
     state.update(|data| data.settings_generation = data.settings_generation.wrapping_add(1))?;
+    #[cfg(windows)]
+    windows::round_settings_corners(&window);
+    refresh_window_activity(&window);
     window
         .set_size(PhysicalSize::new(rect.width, rect.height))
         .map_err(|e| e.to_string())?;
@@ -396,11 +467,7 @@ fn set_settings_visibility(
                 // A failed focus/protection step after show must not leave a new
                 // visible popup behind a rejected opening request. An already
                 // visible settings window is left in place.
-                let rollback = if !was_visible {
-                    window.hide().map_err(|e| e.to_string())
-                } else {
-                    Ok(())
-                };
+                let rollback = if !was_visible { hide(&window) } else { Ok(()) };
                 let visible = window
                     .is_visible()
                     .unwrap_or(was_visible || rollback.is_err());
@@ -447,7 +514,7 @@ fn set_settings_visibility(
                 // Check ownership before hide, which may itself change foreground.
                 restore_external_focus(own, previous);
             }
-            window.hide().map_err(|e| e.to_string())?;
+            hide(&window)?;
         }
     }
     if runtime.settings_open == open {
@@ -535,17 +602,43 @@ pub fn close_settings_from_native(app: &AppHandle, destroyed: bool) -> Result<()
     Ok(())
 }
 
-pub fn drag_window(window: &WebviewWindow, state: &OverlayState) -> Result<(), String> {
+pub async fn drag_window(window: &WebviewWindow, state: &OverlayState) -> Result<(), String> {
     if !matches!(window.label(), "main" | SETTINGS_LABEL) {
         return Err("Window dragging is unavailable".into());
     }
-    if window.label() == "main" {
-        state.update(|data| data.pointer_generation = data.pointer_generation.wrapping_add(1))?;
-    }
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let target = window.clone();
+    let state = state.clone();
+    // An IPC request can outlive the gesture when its WebView is minimized.
+    // Check on the UI thread immediately before dispatching into Tao, whose
+    // Windows drag latch is cleared only after a native WM_EXITSIZEMOVE.
     window
-        .set_ignore_cursor_events(false)
+        .run_on_main_thread(move || {
+            let result = (|| {
+                if !target.is_visible().map_err(|e| e.to_string())?
+                    || target.is_minimized().map_err(|e| e.to_string())?
+                {
+                    return Ok(());
+                }
+                #[cfg(windows)]
+                if !windows::primary_button_down() {
+                    return Ok(());
+                }
+                // A live pointer gesture already owns interactive input. Do not
+                // rewrite styles here: cancelled requests must have no side effects.
+                if target.label() == "main" {
+                    state.update(|data| {
+                        data.pointer_generation = data.pointer_generation.wrapping_add(1)
+                    })?;
+                }
+                target.start_dragging().map_err(|e| e.to_string())
+            })();
+            let _ = result_tx.send(result);
+        })
         .map_err(|e| e.to_string())?;
-    window.start_dragging().map_err(|e| e.to_string())
+    result_rx
+        .await
+        .map_err(|_| "Window closed before the drag could start".to_owned())?
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -628,6 +721,7 @@ pub fn initialize(window: &WebviewWindow) -> Result<(), String> {
             }
         }
     }
+    refresh_window_activity(window);
     // Other platforms use ordinary DOM wheel/interaction until their native routing is implemented.
     Ok(())
 }
@@ -649,13 +743,81 @@ mod windows {
     use windows_sys::Win32::{
         Foundation::{LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
-        UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+        UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON},
         UI::WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetAncestor, GetMessageW, SetWindowsHookExW,
-            TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG, MSLLHOOKSTRUCT,
-            WH_MOUSE_LL, WM_MOUSEWHEEL,
+            CallNextHookEx, DispatchMessageW, GetAncestor, GetMessageW, GetSystemMetrics,
+            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT,
+            MSG, MSLLHOOKSTRUCT, SM_SWAPBUTTON, WH_MOUSE_LL, WM_MOUSEWHEEL,
         },
     };
+
+    pub fn round_settings_corners(window: &WebviewWindow) {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        };
+        if window.label() != SETTINGS_LABEL {
+            return;
+        }
+        if let Ok(hwnd) = window.hwnd() {
+            let preference = DWMWCP_ROUND;
+            // Windows 11 opt-in for a custom frame. Unsupported systems may
+            // reject this cosmetic hint; keep the opaque working window intact.
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    hwnd.0,
+                    DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                    (&preference as *const i32).cast(),
+                    std::mem::size_of_val(&preference) as u32,
+                );
+            }
+        }
+    }
+
+    pub fn primary_button_down() -> bool {
+        // DOM button=0 follows Windows' primary-button preference.
+        let key = unsafe {
+            if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+                VK_RBUTTON
+            } else {
+                VK_LBUTTON
+            }
+        };
+        unsafe { GetAsyncKeyState(key as i32) < 0 }
+    }
+
+    #[derive(Default)]
+    struct PointerRoutingState {
+        active: bool,
+        last_ignore: Option<bool>,
+        last_generation: Option<u64>,
+        left_was_down: bool,
+        pointer_drag: bool,
+    }
+    impl PointerRoutingState {
+        fn visibility(&mut self, active: bool, button_down: bool) {
+            if !active || self.active != active {
+                self.last_ignore = None;
+                self.last_generation = None;
+                self.left_was_down = button_down;
+                self.pointer_drag = false;
+            }
+            self.active = active;
+        }
+        fn interactive(&mut self, button_down: bool, over_interactive: bool) -> bool {
+            if button_down && !self.left_was_down {
+                self.pointer_drag = over_interactive;
+            }
+            if !button_down {
+                self.pointer_drag = false;
+            }
+            self.left_was_down = button_down;
+            if button_down {
+                self.pointer_drag
+            } else {
+                over_interactive
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct PointerSnapshot {
@@ -712,6 +874,35 @@ mod windows {
             }
         }
         CallNextHookEx(null_mut(), code, wparam, lparam)
+    }
+
+    fn apply_pointer_ignore(
+        window: &WebviewWindow,
+        state: &OverlayState,
+        generation: u64,
+        ignore: bool,
+    ) -> Result<bool, String> {
+        let (sender, receiver) = sync_channel(1);
+        let target = window.clone();
+        let state = state.clone();
+        window
+            .run_on_main_thread(move || {
+                // These getters and the style setter execute synchronously on the
+                // same UI thread. A queued request must not modify Tao's cached flags
+                // if a minimize/hide or a newer policy overtook it.
+                let applied = state.0.lock().ok().is_some_and(|data| {
+                    data.pointer_generation == generation
+                        && target.is_visible().unwrap_or(false)
+                        && !target.is_minimized().unwrap_or(true)
+                        && target.set_ignore_cursor_events(ignore).is_ok()
+                });
+                let _ = sender.send(applied);
+            })
+            .map_err(|error| error.to_string())?;
+        // The routing worker owns no OverlayState or pointer lock while waiting.
+        receiver
+            .recv()
+            .map_err(|_| "Window closed during pointer routing".to_owned())
     }
 
     pub fn start(window: WebviewWindow, state: OverlayState) -> Result<(), String> {
@@ -772,14 +963,28 @@ mod windows {
         thread::Builder::new()
             .name("overlay-pointer-routing".into())
             .spawn(move || {
-                let mut last_ignore = None;
-                let mut last_generation = None;
-                let mut left_was_down = false;
-                let mut pointer_drag = false;
+                let mut routing = PointerRoutingState::default();
                 loop {
                     let Ok(visible) = window.is_visible() else {
                         break;
                     };
+                    let Ok(minimized) = window.is_minimized() else {
+                        break;
+                    };
+                    let button_down = primary_button_down();
+                    let active = visible && !minimized;
+                    routing.visibility(active, button_down);
+                    if !active {
+                        // IsWindowVisible remains true for an iconic window. Do
+                        // not mutate Tao's cached pointer styles while minimized:
+                        // its Windows backend deliberately skips the actual style
+                        // write then. Ignore off-screen iconic coordinates too.
+                        if let Ok(mut pointer) = pointer.lock() {
+                            pointer.intercept = false;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
                     let snapshot = state.0.lock().ok().map(|data| {
                         (
                             data.runtime.clone(),
@@ -788,9 +993,9 @@ mod windows {
                         )
                     });
                     if let Some((runtime, rects, generation)) = snapshot {
-                        if last_generation != Some(generation) {
-                            last_ignore = None;
-                            last_generation = Some(generation);
+                        if routing.last_generation != Some(generation) {
+                            routing.last_ignore = None;
+                            routing.last_generation = Some(generation);
                         }
                         if let (Ok(cursor), Ok(origin), Ok(scale)) = (
                             window.cursor_position(),
@@ -803,24 +1008,12 @@ mod windows {
                             let over_interactive = runtime.window_mode == WindowMode::Standard
                                 || rects.toolbar.is_none()
                                 || rects.interactive_at(x, y);
-                            let left_down = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0;
-                            if left_down && !left_was_down {
-                                pointer_drag = over_interactive;
-                            }
-                            if !left_down {
-                                pointer_drag = false;
-                            }
-                            left_was_down = left_down;
-                            // A scrollbar drag remains interactive until release, even
-                            // after the cursor leaves its narrow track. A drag begun in
-                            // the application underneath must remain click-through.
-                            let interactive = if runtime.window_mode == WindowMode::Standard {
-                                true
-                            } else if left_down {
-                                pointer_drag
-                            } else {
-                                over_interactive
-                            };
+                            // A suspended press cannot become a fresh drag merely
+                            // because the window was restored underneath it.
+                            let held_interactive =
+                                routing.interactive(button_down, over_interactive);
+                            let interactive =
+                                runtime.window_mode == WindowMode::Standard || held_interactive;
                             let ignore = visible && !interactive;
                             // Do not intercept wheel messages over the independent settings
                             // WebView, including its child HWNDs. Main input stays active.
@@ -840,15 +1033,29 @@ mod windows {
                             } else {
                                 false
                             };
-                            // Only publish the snapshot while its native policy is current.
-                            // Mode transitions hold this same lock while changing OS flags.
+                            if routing.last_ignore != Some(ignore) {
+                                match apply_pointer_ignore(&window, &state, generation, ignore) {
+                                    Ok(true) => routing.last_ignore = Some(ignore),
+                                    Ok(false) => {
+                                        routing.last_ignore = None;
+                                        if let Ok(mut pointer) = pointer.lock() {
+                                            pointer.intercept = false;
+                                        }
+                                        thread::sleep(Duration::from_millis(20));
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        if let Ok(mut pointer) = pointer.lock() {
+                                            pointer.intercept = false;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            // Cache only acknowledged native changes, then verify
+                            // that the policy is still current before publishing.
                             if let Ok(data) = state.0.lock() {
                                 if data.pointer_generation == generation {
-                                    if last_ignore != Some(ignore)
-                                        && window.set_ignore_cursor_events(ignore).is_ok()
-                                    {
-                                        last_ignore = Some(ignore);
-                                    }
                                     if let Ok(mut pointer) = pointer.lock() {
                                         *pointer = PointerSnapshot {
                                             rects,
@@ -870,6 +1077,44 @@ mod windows {
             })
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod routing_tests {
+        use super::PointerRoutingState;
+
+        #[test]
+        fn restore_clears_cached_routing_without_claiming_a_suspended_press() {
+            let mut routing = PointerRoutingState::default();
+            routing.visibility(true, false);
+            assert!(routing.interactive(true, true));
+            routing.last_ignore = Some(false);
+            routing.last_generation = Some(4);
+            // Minimize/hide while a press is in progress.
+            routing.visibility(false, true);
+            assert!(!routing.pointer_drag);
+            assert!(routing.last_ignore.is_none() && routing.last_generation.is_none());
+            routing.visibility(true, true);
+            assert!(!routing.interactive(true, true));
+            // After release, a new press over a handle is accepted normally.
+            assert!(routing.interactive(false, true));
+            assert!(routing.interactive(true, true));
+            // Preserve ordinary drag capture until release outside the handle.
+            assert!(routing.interactive(true, false));
+            assert!(!routing.interactive(false, false));
+        }
+
+        #[test]
+        fn hidden_button_release_does_not_leave_a_stale_drag_on_restore() {
+            let mut routing = PointerRoutingState::default();
+            routing.visibility(true, false);
+            assert!(routing.interactive(true, true));
+            routing.visibility(false, true);
+            routing.visibility(false, false);
+            routing.visibility(true, false);
+            assert!(!routing.interactive(false, false));
+            assert!(routing.interactive(true, true));
+        }
     }
 }
 

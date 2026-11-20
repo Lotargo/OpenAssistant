@@ -39,7 +39,7 @@ function readStored(key, fallback) {
 }
 
 /** Native IPC carries only safe status, events and user input. OAuth stays in Rust. */
-export async function createBridge({ onState, onScroll, onSettings, onError, onTurnStart, onChunk, onTurnEnd, onAudioLevels } = {}) {
+export async function createBridge({ onState, onScroll, onSettings, onError, onTurnStart, onChunk, onTurnEnd, onAudioLevels, onWindowActivity } = {}) {
   const native = isTauri();
   let storePromise;
   const getStore = () => storePromise ??= load('settings.json', { autoSave: false, defaults: {} });
@@ -48,6 +48,12 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let lastAudioState = '';
   const unlisten = [];
   let initialError = '';
+  let activityVersion = 0;
+  function receiveWindowActivity(payload) {
+    if (typeof payload?.active !== 'boolean') return;
+    activityVersion++;
+    onWindowActivity?.({ active: payload.active });
+  }
   let storedAgent;
   try { storedAgent = native ? await (await getStore()).get('agent') : readStored(AGENT_KEY, DEFAULT_AGENT); }
   catch (error) { initialError = 'Не удалось прочитать параметры агента: ' + String(error); }
@@ -540,6 +546,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   if (native) {
     const handlers = {
       'overlay:state': publishNative,
+      'overlay:window-activity': receiveWindowActivity,
       'overlay:scroll': payload => onScroll?.(payload),
       'overlay:settings': payload => onSettings?.({ tab: 'appearance', ...payload }),
       'overlay:error': payload => reportError(payload?.message ?? payload),
@@ -556,6 +563,11 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     for (const [event, handler] of Object.entries(handlers)) {
       unlisten.push(await listen(event, ({ payload }) => handler(payload)));
     }
+    const initialActivityVersion = activityVersion;
+    try {
+      const activity = await invoke('get_window_activity');
+      if (activityVersion === initialActivityVersion) receiveWindowActivity(activity);
+    } catch { /* Activity events and native input guards remain available. */ }
     try { publishNative(await invoke('get_runtime_state')); }
     catch (error) { reportError(error); }
     if (validWindowMode(storedWindowMode) && storedWindowMode !== runtime.windowMode) {

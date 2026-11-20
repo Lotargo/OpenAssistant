@@ -23,16 +23,20 @@ function visibleRect(element) {
 
 export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }) {
   let stopped = false;
+  let windowActive = true;
   let timer;
   let rectFrame;
   let lastSize = '';
   let lastRects = '';
+  let rectEpoch = 0;
+  let rectSequence = 0;
   let resizing = false;
   let resizeAgain = false;
   const byId = id => document.getElementById(id);
 
   async function syncRects() {
-    if (stopped || !bridge.native) return;
+    if (stopped || !windowActive || !bridge.native || document.hidden || window.innerWidth <= 0 || window.innerHeight <= 0) return;
+    const epoch = rectEpoch;
     const rects = {
       toolbar: visibleRect(byId('toolbar')),
       drag: visibleRect(byId('drag-region')),
@@ -48,23 +52,24 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     };
     const signature = JSON.stringify(rects);
     if (signature === lastRects) return;
+    const sequence = ++rectSequence;
     try {
       await bridge.updateHitRects(rects);
-      lastRects = signature;
+      if (!stopped && epoch === rectEpoch && sequence === rectSequence) lastRects = signature;
     } catch (error) {
-      bridge.reportError(error);
+      if (!stopped && epoch === rectEpoch) bridge.reportError(error);
     }
   }
 
   function requestRects() {
-    if (!rectFrame && !stopped) rectFrame = requestAnimationFrame(() => {
+    if (!rectFrame && !stopped && windowActive && !document.hidden) rectFrame = requestAnimationFrame(() => {
       rectFrame = null;
       void syncRects();
     });
   }
 
   async function resize() {
-    if (stopped) return;
+    if (stopped || !windowActive || document.hidden || window.innerWidth <= 0 || window.innerHeight <= 0) return;
     if (resizing) { resizeAgain = true; return; }
     const modalOpen = !bridge.native && isModalOpen();
     const split = overlay.dataset.mode === 'code';
@@ -74,7 +79,7 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     const toolbarHeight = byId('toolbar')?.getBoundingClientRect().height || 56;
     // scrollHeight includes the pane's padding; use the content's natural height,
     // never the current window height, to avoid a resize feedback loop.
-    const textHeight = byId('text-content')?.scrollHeight || 64;
+    const textHeight = byId('text-content')?.scrollHeight ?? 0;
     const codeHeight = byId('code-content')?.querySelector('pre')?.scrollHeight || 64;
     const notesHeight = byId('notes-content')?.scrollHeight || 64;
     const verticalPadding = element => {
@@ -116,8 +121,19 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
 
   function schedule() {
     clearTimeout(timer);
+    if (stopped || !windowActive || document.hidden) return;
     timer = setTimeout(() => void resize(), 90);
     requestRects();
+  }
+
+  function refreshViewport() {
+    if (stopped) return;
+    rectEpoch++;
+    lastRects = '';
+    cancelAnimationFrame(rectFrame);
+    rectFrame = null;
+    // Keep lastSize: restoring input regions must not overwrite a user's window size.
+    schedule();
   }
 
   const observer = new ResizeObserver(schedule);
@@ -127,18 +143,29 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
   }
   const scrollSources = ['text-panel', 'code-panel', 'notes-panel'].map(byId).filter(Boolean);
   for (const panel of scrollSources) panel.addEventListener('scroll', requestRects, { passive: true });
-  window.addEventListener('resize', schedule);
+  window.addEventListener('resize', refreshViewport);
+  window.addEventListener('focus', refreshViewport);
+  window.addEventListener('pageshow', refreshViewport);
+  document.addEventListener('visibilitychange', refreshViewport);
   overlay.addEventListener('transitionend', requestRects);
   schedule();
   return {
     schedule,
+    setActive(active) {
+      windowActive = active !== false;
+      refreshViewport();
+    },
     destroy() {
       stopped = true;
+      rectEpoch++;
       observer.disconnect();
       clearTimeout(timer);
       cancelAnimationFrame(rectFrame);
       for (const panel of scrollSources) panel.removeEventListener('scroll', requestRects);
-      window.removeEventListener('resize', schedule);
+      window.removeEventListener('resize', refreshViewport);
+      window.removeEventListener('focus', refreshViewport);
+      window.removeEventListener('pageshow', refreshViewport);
+      document.removeEventListener('visibilitychange', refreshViewport);
       overlay.removeEventListener('transitionend', requestRects);
     },
   };

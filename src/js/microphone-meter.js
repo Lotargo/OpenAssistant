@@ -119,3 +119,27 @@ export function createMicrophoneIndicator(button) {
     indicator.firstElementChild.style.transform = 'scaleX(' + (view.percent / 100).toFixed(3) + ')';
   }, button.ownerDocument);
 }
+
+
+/** Two decorative views of the same real capture, outside the toolbar controls.
+ * They share one stale-frame timer and never create audio or an animation loop.
+ */
+export function createToolbarAudioIndicator(toolbar) {
+  const sides = [...toolbar.querySelectorAll('[data-toolbar-audio]')].map(panel => ({
+    panel, wave: panel.querySelector('.toolbar-audio-wave'), level: panel.querySelector('.toolbar-audio-level'),
+  }));
+  return createAudioDisplay(view => {
+    const signal = view.active && view.percent > 0;
+    const strength = signal ? view.percent / 100 : 0;
+    const path = signal ? view.path : 'M0 32H480';
+    for (const { panel, wave, level } of sides) {
+      panel.dataset.active = String(signal);
+      panel.dataset.clipped = String(signal && view.clipped);
+      panel.style.opacity = signal ? (0.25 + 0.45 * Math.sqrt(strength)).toFixed(3) : '0';
+      wave.setAttribute('d', path);
+      // Reduced-motion mode shows a quiet level segment instead of oscillations.
+      level.setAttribute('x1', (240 - strength * 228).toFixed(1));
+      level.setAttribute('x2', (240 + strength * 228).toFixed(1));
+    }
+  }, toolbar.ownerDocument);
+}

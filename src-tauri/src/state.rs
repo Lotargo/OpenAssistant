@@ -158,10 +158,56 @@ pub struct OverlayData {
     pub before_standard_focus: Option<isize>,
 }
 
+#[derive(Default)]
+struct WindowActivities {
+    main: Option<bool>,
+    settings: Option<bool>,
+}
+
+impl WindowActivities {
+    fn slot(&mut self, label: &str) -> Option<&mut Option<bool>> {
+        match label {
+            "main" => Some(&mut self.main),
+            "settings" => Some(&mut self.settings),
+            _ => None,
+        }
+    }
+
+    fn observe(&mut self, label: &str, active: bool) -> bool {
+        self.slot(label)
+            .and_then(|slot| slot.replace(active))
+            .is_some_and(|previous| previous != active)
+    }
+
+    fn forget(&mut self, label: &str) {
+        if let Some(slot) = self.slot(label) {
+            *slot = None;
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct OverlayState(pub Arc<Mutex<OverlayData>>, Arc<tokio::sync::Mutex<()>>);
+pub struct OverlayState(
+    pub Arc<Mutex<OverlayData>>,
+    Arc<tokio::sync::Mutex<()>>,
+    // Native window events may arrive while a policy update holds OverlayData.
+    // Their activity cache must not share that lock or mutate runtime revisions.
+    Arc<Mutex<WindowActivities>>,
+);
 
 impl OverlayState {
+    pub fn observe_window_activity(&self, label: &str, active: bool) -> bool {
+        self.2
+            .lock()
+            .is_ok_and(|mut activities| activities.observe(label, active))
+    }
+
+    pub fn forget_window_activity(&self, label: &str) {
+        if let Ok(mut activities) = self.2.lock() {
+            activities.forget(label);
+        }
+    }
+
     /// Serializes creation/visibility/mode changes without blocking the UI thread.
     pub async fn window_operation(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.1.lock().await
@@ -185,6 +231,23 @@ impl OverlayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_transitions_are_independent_and_do_not_change_runtime() {
+        let state = OverlayState::default();
+        assert!(!state.observe_window_activity("main", true));
+        assert!(!state.observe_window_activity("settings", false));
+        assert!(state.observe_window_activity("main", false));
+        assert!(!state.observe_window_activity("main", false));
+        assert!(state.observe_window_activity("settings", true));
+        assert!(!state.observe_window_activity("settings", true));
+        assert!(state.observe_window_activity("main", true));
+        state.forget_window_activity("settings");
+        assert!(!state.observe_window_activity("settings", false));
+        assert!(state.observe_window_activity("settings", true));
+        assert!(!state.observe_window_activity("unrelated", true));
+        assert_eq!(state.snapshot().unwrap().revision, 0);
+    }
 
     #[test]
     fn revisions_order_concurrent_updates_without_mutating_snapshots() {

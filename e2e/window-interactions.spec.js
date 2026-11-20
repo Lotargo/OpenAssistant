@@ -97,6 +97,14 @@ test('native drag ignores controls, selectable content, scrollbars, inputs and t
   await openNative(page);
   await page.evaluate(() => document.addEventListener('contextmenu', event => event.preventDefault()));
   await pointerDrag(page, await pointIn(page.locator('#drag-region'), 40, 5), { button: 'right' });
+  // A real answer remains selectable even though the initial panel is empty.
+  await page.evaluate(() => {
+    const harness = window.__nativeContract;
+    harness.emit('assistant:turn-start', {});
+    harness.emit('assistant:chunk', { text: '<mode>text</mode><text>Ответ для проверки выделения текста.</text>' });
+    harness.emit('assistant:turn-end', {});
+  });
+  await expect(page.locator('#text-content p')).toHaveCount(1);
   await pointerDrag(page, await pointIn(page.locator('#text-content'), 10, 10));
   await page.evaluate(() => getSelection()?.removeAllRanges());
   const screen = await page.locator('[data-action="screen"]').boundingBox();
@@ -143,4 +151,87 @@ test('native drag ignores controls, selectable content, scrollbars, inputs and t
   await pointerDrag(settings, { x: close.x + close.width / 2, y: close.y + close.height / 2 }, { dx: -65, dy: 25 });
   expect(await dragCount(page)).toBe(0);
   await expect(settings.locator('#settings-dialog')).toBeVisible();
+});
+
+test('restore republishes unchanged native hit areas without changing the user window size', async ({ page }) => {
+  await openNative(page);
+  await expect.poll(() => page.evaluate(() => Boolean(window.__nativeContract.hitRects?.drag))).toBe(true);
+  await page.evaluate(() => { window.__nativeContract.applyResizes = false; });
+  await page.setViewportSize({ width: 760, height: 280 });
+  await page.waitForTimeout(150);
+  const initial = await page.evaluate(() => ({
+    resizes: window.__nativeContract.resizes.length,
+    publishes: window.__nativeContract.calls.filter(call => call.name === 'update_hit_rects').length,
+  }));
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('blur'));
+    window.__nativeContract.hitRects = null;
+  });
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+  });
+  await expect.poll(() => page.evaluate(() => Boolean(window.__nativeContract.hitRects?.drag))).toBe(true);
+  const resumed = await page.evaluate(() => ({
+    resizes: window.__nativeContract.resizes.length,
+    publishes: window.__nativeContract.calls.filter(call => call.name === 'update_hit_rects').length,
+    rects: window.__nativeContract.hitRects,
+  }));
+  expect(resumed.publishes).toBeGreaterThan(initial.publishes);
+  expect(resumed.resizes).toBe(initial.resizes);
+  expect(page.viewportSize()).toEqual({ width: 760, height: 280 });
+  expect(resumed.rects.toolbar).toEqual(await page.locator('#toolbar').boundingBox());
+  expect(resumed.rects.drag.width).toBeGreaterThan(0);
+});
+
+test('scoped native activity restores both window gestures and main hit areas without DOM lifecycle events', async ({ page }) => {
+  await openNative(page);
+  await page.locator('[data-action="settings"]').click();
+  const settings = await settingsPage(page);
+  const before = await page.evaluate(() => ({
+    resizes: window.__nativeContract.resizes.length, width: innerWidth, height: innerHeight,
+  }));
+  for (const [label, view, selector] of [['main', page, '#drag-region'], ['settings', settings, '.settings-header']]) {
+    await view.evaluate(() => {
+      window.__fixtureLifecycle = [];
+      document.addEventListener('visibilitychange', () => window.__fixtureLifecycle.push('visibilitychange'));
+      for (const event of ['blur', 'focus', 'pageshow']) window.addEventListener(event, () => window.__fixtureLifecycle.push(event));
+    });
+    const gesture = () => view.evaluate(selector => {
+      const surface = document.querySelector(selector);
+      const rect = surface.getBoundingClientRect();
+      const pointer = { bubbles: true, cancelable: true, pointerId: 17, pointerType: 'mouse', isPrimary: true,
+        button: 0, buttons: 1, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 };
+      surface.dispatchEvent(new PointerEvent('pointerdown', pointer));
+      surface.dispatchEvent(new PointerEvent('pointermove', { ...pointer, clientX: pointer.clientX + 10 }));
+    }, selector);
+    const callCount = await page.evaluate(() => window.__nativeContract.dragStarts.length);
+    await page.evaluate(() => window.__nativeContract.delayNext('start_window_drag'));
+    await gesture();
+    await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.filter(item => item.name === 'start_window_drag').length)).toBe(1);
+    await expect(view.locator('html')).toHaveClass(/window-dragging/);
+    await view.evaluate(() => window.__receiveNativeEvent('overlay:window-activity', { active: false }));
+    await expect(view.locator('html')).not.toHaveClass(/window-dragging/);
+    await gesture();
+    expect(await page.evaluate(() => window.__nativeContract.dragStarts.length)).toBe(callCount + 1);
+    if (label === 'main') await page.evaluate(() => { window.__nativeContract.hitRects = null; });
+    await view.evaluate(() => window.__receiveNativeEvent('overlay:window-activity', { active: true }));
+    if (label === 'main') await expect.poll(() => page.evaluate(() => Boolean(window.__nativeContract.hitRects?.drag))).toBe(true);
+
+    await page.evaluate(() => window.__nativeContract.delayNext('start_window_drag'));
+    await gesture();
+    await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.filter(item => item.name === 'start_window_drag').length)).toBe(2);
+    expect(await page.evaluate(() => window.__nativeContract.dragStarts.at(-1)?.windowLabel)).toBe(label);
+    await page.evaluate(() => window.__nativeContract.release('start_window_drag'));
+    await expect(view.locator('html')).toHaveClass(/window-dragging/);
+    await page.evaluate(() => window.__nativeContract.release('start_window_drag'));
+    await expect(view.locator('html')).not.toHaveClass(/window-dragging/);
+    expect(await view.evaluate(() => ({ events: window.__fixtureLifecycle, hidden: document.hidden }))).toEqual({ events: [], hidden: false });
+  }
+  expect(await page.evaluate(() => ({
+    resizes: window.__nativeContract.resizes.length, width: innerWidth, height: innerHeight,
+  }))).toEqual(before);
 });

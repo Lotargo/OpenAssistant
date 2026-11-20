@@ -18,11 +18,8 @@ async function installSettingsWindow(page, record) {
   await page.exposeFunction('__settingsNativeInvoke', async ({ name, args }) => {
     if (record.main.isClosed()) throw new Error('Main owner is closed');
     return record.main.evaluate(({ name, args }) => {
-      const harness = window.__nativeContract;
-      if (name === 'start_window_drag') {
-        harness.calls.push({ name, args, windowLabel: 'settings' });
-        harness.dragStarts.push({ windowLabel: 'settings', windowMode: harness.getState().windowMode, settingsOpen: harness.getState().settingsOpen });
-        return null;
+      if (['start_window_drag', 'get_window_activity'].includes(name)) {
+        return window.__TAURI_INTERNALS__.invoke(name, args, 'settings');
       }
       if (name === 'set_settings_open') return window.__TAURI_INTERNALS__.invoke(name, args);
       throw new Error('Unexpected direct native command from settings: ' + name);
@@ -219,7 +216,7 @@ export async function openNative(page, options = {}) {
     window.__nativeContract = harness;
     window.__receiveNativeEvent = harness.emit;
 
-    async function execute(name, args) {
+    async function execute(name, args, windowLabel = 'main') {
       const recorded = { ...args };
       delete recorded.onEvent;
       harness.calls.push({ name, args: recorded });
@@ -240,12 +237,13 @@ export async function openNative(page, options = {}) {
           listeners.set(args.event, (listeners.get(args.event) || []).filter(id => id !== args.eventId));
           return null;
         case 'get_runtime_state': return { ...state };
+        case 'get_window_activity': return { active: true };
         case 'set_scroll_locked': return harness.pushState({ scrollLocked: args.locked });
         case 'set_window_mode':
           if (!['overlay', 'standard'].includes(args.mode)) throw new Error('Invalid window mode');
           return harness.pushState({ windowMode: args.mode });
         case 'start_window_drag':
-          harness.dragStarts.push({ windowLabel: 'main', windowMode: state.windowMode, settingsOpen: state.settingsOpen });
+          harness.dragStarts.push({ windowLabel, windowMode: state.windowMode, settingsOpen: state.settingsOpen });
           return null;
         case 'set_microphone_muted': return harness.pushState({ microphoneMuted: args.muted });
         case 'sync_audio_state': return harness.pushState({ microphoneMuted: args.muted, audioAvailable: args.available });
@@ -368,12 +366,12 @@ export async function openNative(page, options = {}) {
         return id;
       },
       unregisterCallback(id) { callbacks.delete(id); },
-      async invoke(name, args = {}) {
+      async invoke(name, args = {}, windowLabel = 'main') {
         const hold = (delayed.get(name) || 0) > 0;
         if (hold) delayed.set(name, delayed.get(name) - 1);
         let value;
         let failure;
-        try { value = await execute(name, args); }
+        try { value = await execute(name, args, windowLabel); }
         catch (error) { failure = error; }
         if (hold) return new Promise((resolve, reject) => pending.push({ name, value, failure, resolve, reject }));
         if (failure) throw failure;

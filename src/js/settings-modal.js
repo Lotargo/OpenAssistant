@@ -39,6 +39,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
               <div class="color-targets" role="group" aria-label="Изменяемый цвет">
                 <button class="color-target" type="button" data-color-target="panelColor" aria-pressed="true"><span class="color-target-dot" data-swatch="panelColor"></span>Цвет панели</button>
                 <button class="color-target" type="button" data-color-target="textColor" aria-pressed="false"><span class="color-target-dot" data-swatch="textColor"></span>Цвет текста</button>
+                <button class="color-target" type="button" data-color-target="accentColor" aria-pressed="false"><span class="color-target-dot" data-swatch="accentColor"></span>Акцентный цвет</button>
               </div>
               <div id="appearance-color-picker" class="color-picker"></div>
               <div class="settings-row">

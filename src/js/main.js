@@ -6,7 +6,7 @@ import { createSettingsModal } from './settings-modal.js';
 import { createSettingsWindowHost } from './settings-window-bridge.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
 import { setButtonIcon } from './icons.js';
-import { createMicrophoneIndicator } from './microphone-meter.js';
+import { createMicrophoneIndicator, createToolbarAudioIndicator } from './microphone-meter.js';
 import { createGeometrySync } from './geometry.js';
 import { createWindowInteraction } from './window-interaction.js';
 import { playDemo } from './demo.js';
@@ -18,12 +18,14 @@ let bridge;
 let modal;
 let geometry;
 let windowInteraction;
+let nativeWindowActive = true;
 let modalOpen = false;
 let pendingSettingsRequest = null;
 let saveTimer;
 let runtime = {};
 const demoAbort = new AbortController();
 const microphoneIndicator = createMicrophoneIndicator(document.querySelector('[data-action="microphone"]'));
+const toolbarAudioIndicator = createToolbarAudioIndicator(byId('toolbar'));
 
 function persist() {
   clearTimeout(saveTimer);
@@ -54,6 +56,7 @@ function renderControls(next = runtime) {
   setButtonIcon(settingsButton, 'settings');
   if (bridge?.native) settingsButton.setAttribute('aria-expanded', String(Boolean(runtime.settingsOpen)));
   microphoneIndicator.update(runtime.microphoneLevels, runtime);
+  toolbarAudioIndicator.update(runtime.microphoneLevels, runtime);
   screenButton.setAttribute('aria-pressed', String(Boolean(runtime.screenCaptureEnabled)));
   screenButton.dataset.state = runtime.screenCaptureEnabled ? 'active' : 'idle';
   lock.setAttribute('aria-pressed', String(Boolean(runtime.scrollLocked)));
@@ -116,9 +119,17 @@ async function applySettings(next) {
 async function start() {
   bridge = await createBridge({
     onState: renderControls,
+    onWindowActivity({ active }) {
+      nativeWindowActive = active;
+      windowInteraction?.setActive(active);
+      geometry?.setActive(active);
+      microphoneIndicator.setVisible(active);
+      toolbarAudioIndicator.setVisible(active);
+    },
     onAudioLevels(levels) {
       runtime = { ...runtime, microphoneLevels: levels };
       microphoneIndicator.update(levels, runtime);
+      toolbarAudioIndicator.update(levels, runtime);
       modal?.updateAudioLevels(levels);
     },
     onScroll: scrollPanel,
@@ -162,6 +173,8 @@ async function start() {
     startDrag: () => bridge.native ? bridge.command('start_window_drag') : undefined,
     onError: error => bridge.reportError(error),
   });
+  windowInteraction.setActive(nativeWindowActive);
+  geometry.setActive(nativeWindowActive);
   await bridge.command('set_scroll_locked', { locked: settings.scrollLocked });
   renderControls(bridge.getRuntimeState());
   if (pendingSettingsRequest) {
@@ -206,8 +219,6 @@ async function start() {
     });
   }
 
-  parser.feed('<mode>text</mode><text>Здесь появится ответ ассистента.</text>');
-  parser.finish();
   const demo = new URLSearchParams(location.search).get('demo');
   if (['text', 'code', 'settings', 'stream'].includes(demo)) {
     await playDemo(parser, demo, { signal: demoAbort.signal });
@@ -221,6 +232,7 @@ window.addEventListener('pagehide', () => {
   clearTimeout(saveTimer);
   demoAbort.abort();
   microphoneIndicator.destroy();
+  toolbarAudioIndicator.destroy();
   windowInteraction?.destroy();
   geometry?.destroy();
   renderer.destroy();

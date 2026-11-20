@@ -115,7 +115,10 @@ async function ownerFixture() {
     setGeneration(next) { generation = next; },
     async proxy(options = {}) {
       return createSettingsProxy({
-        events: bus.events('settings'), nativeInvoke: async name => { calls.push({ directNative: name }); },
+        events: bus.events('settings'), nativeInvoke: async name => {
+          if (name === 'get_window_activity') return { active: true };
+          calls.push({ directNative: name });
+        },
         readyTimeout: 1000, requestTimeout: 1000, ...options,
       });
     },
@@ -297,4 +300,36 @@ test('native settings hide is observed once and stops the local check without ec
   assert.equal(proxy.getOpenRequest().tab, 'agent');
   assert.deepEqual(proxy.getOpenRequest().request, { kind: 'approval', id: 'approval-1' });
   assert.equal(closed.length, 1);
+});
+
+test('settings activity is scoped to its own native event and a late initial query cannot overwrite it', async t => {
+  const owner = await ownerFixture();
+  let resolveActivity;
+  const activity = [];
+  const opening = owner.proxy({
+    onWindowActivity: ({ active }) => activity.push(active),
+    nativeInvoke: name => {
+      assert.equal(name, 'get_window_activity');
+      return new Promise(resolve => { resolveActivity = resolve; });
+    },
+  });
+  await until(() => typeof resolveActivity === 'function');
+  const native = owner.bus.events('native');
+  await native.emitTo('main', 'overlay:window-activity', { active: true });
+  await turn();
+  assert.deepEqual(activity, [], 'main-window activity must not affect the settings view');
+  await native.emitTo('settings', 'overlay:window-activity', { active: false });
+  await until(() => activity.length === 1);
+  resolveActivity({ active: true });
+  const proxy = await opening;
+  cleanup(t, owner, proxy);
+  await turn();
+  assert.deepEqual(activity, [false], 'a late initial active snapshot loses to the native transition');
+  await native.emitTo('settings', 'overlay:window-activity', { active: true });
+  await until(() => activity.length === 2);
+  assert.deepEqual(activity, [false, true]);
+  proxy.destroy();
+  await native.emitTo('settings', 'overlay:window-activity', { active: false });
+  await turn();
+  assert.deepEqual(activity, [false, true], 'disposing the secondary view removes the native listener');
 });

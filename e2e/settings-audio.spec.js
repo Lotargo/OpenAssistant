@@ -91,6 +91,7 @@ test('settings preserve their bounds and remain usable on a narrow viewport', as
 
 test('local microphone check renders the same real levels without refreshing agent controls or opening Codex', async ({ page }, testInfo) => {
   await openNative(page);
+  const idleWaves = await page.locator('.toolbar-audio-wave').evaluateAll(paths => paths.map(node => node.getAttribute('d')));
   const settings = await openSources(page);
   await expect(settings.locator('#mic-noise-suppression')).not.toBeChecked();
   await expect(settings.locator('#mic-device option')).toHaveCount(3);
@@ -108,19 +109,30 @@ test('local microphone check renders the same real levels without refreshing age
   await page.evaluate(() => {
     const harness = window.__nativeContract;
     const id = harness.lastCapture().id;
-    for (let frame = 0; frame < 12; frame++) harness.emitAudio(id, {
+    const levels = {
       type: 'levels', rms: .1, raw_rms: .125, peak: .5, input_peak: .6, clipped_ratio: 0,
       waveform: [0, .35, -.25, .5, -.6, .1, 0],
-    });
+    };
+    for (let frame = 0; frame < 12; frame++) harness.emitAudio(id, levels);
+    // Keep synthetic capture frames arriving while both webviews are photographed.
+    // The separate stale-frame scenario intentionally sends a single frame.
+    window.__fixtureLevelTimer = setInterval(() => harness.emitAudio(id, levels), 33);
   });
   await expect(settings.locator('#mic-level')).toHaveAttribute('aria-valuenow', '-18');
   await expect(settings.locator('#mic-level-label')).toHaveText('Входящий звук');
   await expect(settings.locator('#mic-wave-path')).not.toHaveAttribute('d', 'M0 32H480');
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('data-audio-active', 'true');
+  await expect(page.locator('.toolbar-audio[data-active="true"]')).toHaveCount(2);
+  const activeWaves = await page.locator('.toolbar-audio-wave').evaluateAll(paths => paths.map(node => node.getAttribute('d')));
+  expect(activeWaves).toHaveLength(2);
+  activeWaves.forEach((wave, index) => { expect(wave).toBeTruthy(); expect(wave).not.toBe(idleWaves[index]); });
   expect(await settings.evaluate(() => window.__agentMutations)).toBe(0);
+  await captureScreenshot(page, testInfo, 'toolbar-microphone-active');
   await captureScreenshot(settings, testInfo, 'settings-microphone-active');
   await settings.evaluate(() => window.__agentObserver.disconnect());
   await page.evaluate(() => {
+    clearInterval(window.__fixtureLevelTimer);
+    delete window.__fixtureLevelTimer;
     const harness = window.__nativeContract;
     harness.emitAudio(harness.lastCapture().id, {
       type: 'levels', rms: .3, raw_rms: .5, peak: .6, input_peak: 1, clipped_ratio: .02, waveform: [0, 1, -.99, 0],
@@ -128,6 +140,7 @@ test('local microphone check renders the same real levels without refreshing age
   });
   await expect(settings.locator('#mic-level-label')).toHaveText('Слишком громко');
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('data-audio-clipped', 'true');
+  await expect(page.locator('.toolbar-audio[data-clipped="true"]')).toHaveCount(2);
 
   const initialCapture = await page.evaluate(() => window.__nativeContract.lastCapture());
   await settings.locator('#mic-noise-suppression').check();
@@ -226,6 +239,7 @@ test('meters clear frozen audio before capture times out without stopping the mi
   await expect(settings.locator('#mic-wave-path')).toHaveAttribute('d', 'M0 32H480');
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('data-audio-active', 'false');
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('data-audio-clipped', 'false');
+  await expect(page.locator('.toolbar-audio[data-active="false"][data-clipped="false"]')).toHaveCount(2);
   // A later lifecycle refresh with the same levels must leave the display empty.
   await page.waitForTimeout(300);
   await expect(settings.locator('#mic-level-label')).toHaveText('Нет сигнала');
@@ -272,4 +286,53 @@ test('noise toggle preserves pending intent through native latency and reverts o
     id: initialCapture.id, channelId: initialCapture.channelId, active: true, noiseSuppression: true,
   });
   await settings.keyboard.press('Escape');
+});
+
+test('startup remains empty and two audio decorations use the free toolbar edges around six centered controls', async ({ page }) => {
+  await openNative(page);
+  await expect(page.locator('#text-content')).toHaveText('');
+  await expect(page.locator('#notes-content')).toHaveText('');
+  await expect(page.locator('#code-content')).toHaveText('');
+  const indicators = page.locator('.toolbar-audio');
+  await expect(indicators).toHaveCount(2);
+  for (const side of ['left', 'right']) {
+    const indicator = page.locator('[data-toolbar-audio="' + side + '"]');
+    await expect(indicator).toHaveAttribute('aria-hidden', 'true');
+    await expect(indicator).toHaveAttribute('data-active', 'false');
+    expect(await indicator.evaluate(node => getComputedStyle(node).pointerEvents)).toBe('none');
+  }
+  for (const width of [900, 320]) {
+    await page.evaluate(() => { window.__nativeContract.applyResizes = false; });
+    await page.setViewportSize({ width, height: 180 });
+    const bounds = await page.evaluate(() => {
+      const box = selector => {
+        const { x, y, width, height } = document.querySelector(selector).getBoundingClientRect();
+        return { x, y, width, height };
+      };
+      return {
+        toolbar: box('#toolbar'), first: box('#toolbar > button:first-of-type'),
+        last: box('#toolbar > button:last-of-type'),
+        left: box('[data-toolbar-audio="left"]'), right: box('[data-toolbar-audio="right"]'),
+      };
+    });
+    expect(Math.abs((bounds.first.x + bounds.last.x + bounds.last.width) / 2 - width / 2)).toBeLessThan(1);
+    if (width > 360) {
+      expect(bounds.left.width).toBeGreaterThan(0);
+      expect(bounds.right.width).toBeGreaterThan(0);
+      expect(bounds.left.x).toBeGreaterThanOrEqual(bounds.toolbar.x);
+      expect(bounds.left.x + bounds.left.width).toBeLessThanOrEqual(bounds.first.x);
+      expect(bounds.right.x).toBeGreaterThanOrEqual(bounds.last.x + bounds.last.width);
+      expect(bounds.right.x + bounds.right.width).toBeLessThanOrEqual(bounds.toolbar.x + bounds.toolbar.width);
+    } else {
+      // Narrow windows reserve the available width for all six controls.
+      expect(bounds.left.width).toBe(0);
+      expect(bounds.right.width).toBe(0);
+      expect(bounds.first.x).toBeGreaterThanOrEqual(0);
+      expect(bounds.last.x + bounds.last.width).toBeLessThanOrEqual(width);
+    }
+  }
+  expect(await page.evaluate(() => ({
+    sessions: window.__nativeContract.sessionIds.length,
+    captures: window.__nativeContract.captureIds.length,
+  }))).toEqual({ sessions: 0, captures: 0 });
 });

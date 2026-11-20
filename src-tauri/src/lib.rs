@@ -32,6 +32,11 @@ fn get_runtime_state(state: State<'_, OverlayState>) -> Result<RuntimeState, Str
 }
 
 #[tauri::command]
+fn get_window_activity(window: WebviewWindow) -> Result<window_stealth::WindowActivity, String> {
+    window_stealth::window_activity(&window)
+}
+
+#[tauri::command]
 fn set_microphone_muted(
     app: AppHandle,
     state: State<'_, OverlayState>,
@@ -125,8 +130,11 @@ async fn set_window_mode(
 }
 
 #[tauri::command]
-fn start_window_drag(window: WebviewWindow, state: State<'_, OverlayState>) -> Result<(), String> {
-    window_stealth::drag_window(&window, &state)
+async fn start_window_drag(
+    window: WebviewWindow,
+    state: State<'_, OverlayState>,
+) -> Result<(), String> {
+    window_stealth::drag_window(&window, &state).await
 }
 
 #[tauri::command]
@@ -298,6 +306,7 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
+            window_stealth::on_window_activity_event(window, event);
             if window.label() == "main" {
                 if matches!(event, tauri::WindowEvent::Destroyed) {
                     retire_webview_session(window.app_handle());
@@ -340,6 +349,7 @@ pub fn run() {
             assistant::assistant_audio,
             assistant::assistant_disconnect,
             get_runtime_state,
+            get_window_activity,
             set_microphone_muted,
             sync_audio_state,
             set_screen_capture_enabled,

@@ -77,6 +77,8 @@ export function getBackgroundDragRects(element) {
   let areas = [box];
   for (const child of element.children) {
     if (!child.getClientRects().length) continue;
+    if (child.hasAttribute('data-window-drag-ignore')
+      && element.ownerDocument.defaultView.getComputedStyle(child).pointerEvents === 'none') continue;
     const rect = child.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) continue;
     areas = areas.flatMap(area => subtract(area, rect));
@@ -115,68 +117,84 @@ function dragSurface(event, doc) {
 export function createWindowInteraction({ document: doc = document, startDrag, onError } = {}) {
   const view = doc.defaultView;
   let candidate = null;
-  let dragging = false;
+  let activeDrag = null;
+  let windowActive = true;
   let destroyed = false;
 
-  function cancel() { candidate = null; }
+  function cancelCandidate() { candidate = null; }
+  function resetGesture() {
+    candidate = null;
+    activeDrag = null;
+    doc.documentElement.classList.remove('window-dragging');
+  }
   function pointerDown(event) {
-    cancel();
-    if (destroyed || dragging || event.defaultPrevented || event.button !== 0 || event.buttons !== 1
+    cancelCandidate();
+    if (destroyed || !windowActive || activeDrag || event.defaultPrevented || event.button !== 0 || event.buttons !== 1
       || event.isPrimary === false || (event.pointerType && event.pointerType !== 'mouse')
       || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     const surface = dragSurface(event, doc);
     if (!surface) return;
     candidate = { surface, pointerId: event.pointerId, x: event.clientX, y: event.clientY };
-    // Prevent starting a text selection from a padding area or the settings title.
-    // A short click still performs no window action.
     event.preventDefault();
   }
   function pointerMove(event) {
     if (!candidate || event.pointerId !== candidate.pointerId) return;
     if (event.buttons !== 1 || event.isPrimary === false || hasSelection(doc)
       || !candidate.surface.isConnected || candidate.surface.closest('[hidden], [inert]')) {
-      cancel();
+      cancelCandidate();
       return;
     }
     const dx = event.clientX - candidate.x;
     const dy = event.clientY - candidate.y;
     if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
-    cancel();
+    const operation = { pointerId: candidate.pointerId };
+    cancelCandidate();
     event.preventDefault();
-    dragging = true;
+    activeDrag = operation;
     doc.documentElement.classList.add('window-dragging');
     let result;
     try { result = startDrag?.(); }
     catch (error) { result = Promise.reject(error); }
     void Promise.resolve(result).catch(error => {
-      if (!destroyed) onError?.(error);
+      if (!destroyed && activeDrag === operation) onError?.(error);
     }).finally(() => {
-      dragging = false;
-      doc.documentElement.classList.remove('window-dragging');
+      // A reply from before minimize/blur must not unlock or overwrite a newer gesture.
+      if (activeDrag === operation) {
+        activeDrag = null;
+        doc.documentElement.classList.remove('window-dragging');
+      }
     });
   }
   function pointerEnd(event) {
-    if (candidate && event.pointerId === candidate.pointerId) cancel();
+    if (candidate?.pointerId === event.pointerId) cancelCandidate();
+    if (activeDrag?.pointerId === event.pointerId) resetGesture();
   }
-  function visibilityChange() { if (doc.hidden) cancel(); }
 
   doc.addEventListener('pointerdown', pointerDown, true);
   doc.addEventListener('pointermove', pointerMove, { capture: true, passive: false });
   doc.addEventListener('pointerup', pointerEnd, true);
   doc.addEventListener('pointercancel', pointerEnd, true);
-  doc.addEventListener('visibilitychange', visibilityChange);
-  view?.addEventListener('blur', cancel);
+  doc.addEventListener('lostpointercapture', pointerEnd, true);
+  doc.addEventListener('visibilitychange', resetGesture);
+  view?.addEventListener('blur', resetGesture);
+  view?.addEventListener('pageshow', resetGesture);
   return {
+    setActive(active) {
+      if (destroyed) return;
+      windowActive = active !== false;
+      resetGesture();
+    },
     destroy() {
       destroyed = true;
-      cancel();
-      doc.documentElement.classList.remove('window-dragging');
+      resetGesture();
       doc.removeEventListener('pointerdown', pointerDown, true);
       doc.removeEventListener('pointermove', pointerMove, true);
       doc.removeEventListener('pointerup', pointerEnd, true);
       doc.removeEventListener('pointercancel', pointerEnd, true);
-      doc.removeEventListener('visibilitychange', visibilityChange);
-      view?.removeEventListener('blur', cancel);
+      doc.removeEventListener('lostpointercapture', pointerEnd, true);
+      doc.removeEventListener('visibilitychange', resetGesture);
+      view?.removeEventListener('blur', resetGesture);
+      view?.removeEventListener('pageshow', resetGesture);
     },
   };
 }

@@ -1,7 +1,7 @@
-.color-targets { display: flex; gap: 6px; margin: 0 0 12px; }
+.color-targets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
 .color-target { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-radius: 7px; border: 1px solid rgba(255,255,255,.14); background: transparent; color: #c3ccd9; font-size: 12px; cursor: pointer; }
 .color-target[aria-pressed="true"] { background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.35); color: #fff; }
-.color-target-dot { width: 12px; height: 12px; border: 1px solid rgba(255,255,255,.28); border-radius: 3px; }
+.color-target-dot { flex: 0 0 12px; width: 12px; height: 12px; border: 1px solid rgba(255,255,255,.28); border-radius: 3px; }
 .color-picker { margin-bottom: 18px; }
 .color-picker-square-row { display: flex; gap: 8px; height: 122px; }
 .color-preview { flex: 0 0 74px; border-radius: 9px; border: 1px solid rgba(255,255,255,.14); }
