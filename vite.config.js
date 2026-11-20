@@ -18,6 +18,7 @@ export default defineConfig({
       input: {
         main: resolve(import.meta.dirname, 'src/index.html'),
         settings: resolve(import.meta.dirname, 'src/settings.html'),
+        notification: resolve(import.meta.dirname, 'src/notification.html'),
       },
     },
   },

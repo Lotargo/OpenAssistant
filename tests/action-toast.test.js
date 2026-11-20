@@ -3,64 +3,88 @@ import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { createActionToast } from '../src/js/action-toast.js';
 
-function fixture(t) {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const dom = new JSDOM('<main id="overlay"><div id="toast" hidden><span class="action-toast-message"></span></div><footer id="toolbar"></footer></main><div id="announcer"></div>');
-  const doc = dom.window.document;
-  const overlay = doc.querySelector('#overlay');
-  const toolbar = doc.querySelector('#toolbar');
-  const element = doc.querySelector('#toast');
-  const announcer = doc.querySelector('#announcer');
-  overlay.getBoundingClientRect = () => ({ height: 200 });
-  toolbar.getBoundingClientRect = () => ({ height: 88 });
+const turn = () => new Promise(resolve => setImmediate(resolve));
+const initialTheme = { panelColor: '#102030', textColor: '#E1E2E3', accentColor: '#C0392B', opacity: 24, fontSize: 17 };
+
+function fixture(t, { native = true } = {}) {
+  const dom = new JSDOM('<main id="overlay"></main><div id="announcer"></div>', { pretendToBeVisual: true });
   let enabled = true;
-  let disconnects = 0;
-  dom.window.ResizeObserver = class {
-    observe() {}
-    disconnect() { disconnects++; }
-  };
-  const toast = createActionToast({ element, overlay, toolbar, announcer, isEnabled: () => enabled });
+  let settings = { ...initialTheme, actionNotifications: true, autoScroll: false };
+  const calls = [];
+  const handlers = new Map();
+  const bridge = { native, async command(name, args) {
+    calls.push({ name, args: structuredClone(args) });
+    if (handlers.has(name)) return handlers.get(name)(args);
+  } };
+  const announcer = dom.window.document.querySelector('#announcer');
+  const toast = createActionToast({
+    announcer, document: dom.window.document, getBridge: () => bridge,
+    isEnabled: () => enabled, getTheme: () => settings,
+  });
   t.after(() => { toast.destroy(); dom.window.close(); });
-  return { element, announcer, toast, setEnabled(value) { enabled = value; }, disconnects: () => disconnects };
+  return { dom, toast, calls, handlers, announcer, setEnabled(value) { enabled = value; }, setTheme(patch) { settings = { ...settings, ...patch }; } };
 }
 
-test('a newer action message keeps its own deadline and renders model text as plain text', t => {
+test('native notifications forward only the latest queued payload and stay independent of main activity', async t => {
   const f = fixture(t);
-  assert.equal(f.toast.show('First action'), true);
-  t.mock.timers.tick(2000);
-  assert.equal(f.toast.show('  Finished\n<img src=x onerror=alert(1)>  ', { kind: 'farewell', timeout: 4500 }), true);
-  assert.equal(f.element.querySelector('.action-toast-message').textContent, 'Finished <img src=x onerror=alert(1)>');
-  assert.equal(f.element.querySelector('img'), null);
-  assert.equal(f.element.style.bottom, '94px');
-  assert.equal(f.element.dataset.kind, 'farewell');
-  t.mock.timers.tick(800); // The first message's old deadline must not hide its replacement.
-  assert.equal(f.element.hidden, false);
-  t.mock.timers.tick(3699);
-  assert.equal(f.element.hidden, false);
-  t.mock.timers.tick(1);
-  assert.equal(f.element.hidden, true);
-  assert.equal(f.element.dataset.visible, 'false');
+  assert.equal(f.toast.show('Obsolete queued message'), true);
+  assert.equal(f.toast.show('  Current\n<img src=x onerror=alert(1)>  ', { kind: 'error', timeout: 4500 }), true);
+  await turn();
+  assert.equal(f.calls.length, 1);
+  const payload = f.calls[0];
+  assert.equal(payload.name, 'notification_show');
+  assert.match(payload.args.notification.id, /^notice-.+/);
+  assert.deepEqual({ ...payload.args.notification, id: 'id' }, {
+    id: 'id', message: 'Current <img src=x onerror=alert(1)>', kind: 'error', timeout: 4500, theme: initialTheme,
+  });
+  assert.equal(f.dom.window.document.querySelector('#action-toast'), null);
+  f.toast.setVisible(false); // Main minimize / settings focus cannot hide the native popup.
+  assert.equal(f.toast.show('While the main panel is inactive'), true);
+  await turn();
+  assert.equal(f.calls.filter(call => call.name === 'notification_hide').length, 0);
+  assert.notEqual(f.calls[1].args.notification.id, payload.args.notification.id);
+  f.setTheme({ opacity: 0, fontSize: 19 });
+  f.toast.updateTheme();
+  await turn();
+  assert.deepEqual(f.calls.at(-1), { name: 'notification_theme', args: { theme: { ...initialTheme, opacity: 0, fontSize: 19 } } });
 });
 
-test('disabled, hidden and destroyed notifications never revive a dismissed message', t => {
+test('turning notifications off discards queued shows and a failed command cannot revive them or block later messages', async t => {
   const f = fixture(t);
-  f.toast.show('Pending action');
+  let rejectFirst;
+  f.handlers.set('notification_show', () => new Promise((_, reject) => { rejectFirst = reject; }));
+  f.toast.show('In-flight message');
+  await turn();
+  f.toast.show('Queued replacement');
   f.setEnabled(false);
   f.toast.dismiss();
-  assert.equal(f.toast.show('Disabled action'), false);
-  t.mock.timers.tick(5000);
-  assert.equal(f.element.hidden, true);
-  assert.equal(f.announcer.textContent, 'Pending action');
+  assert.equal(f.toast.show('Disabled message'), false);
+  rejectFirst(new Error('Fixture native rejection'));
+  await turn();
+  assert.deepEqual(f.calls.map(call => call.name), ['notification_show', 'notification_hide']);
+  assert.deepEqual(f.calls.at(-1).args, {});
+  f.handlers.delete('notification_show');
   f.setEnabled(true);
-  f.toast.setVisible(false);
-  assert.equal(f.toast.show('Hidden action'), false);
-  f.toast.setVisible(true);
-  assert.equal(f.element.hidden, true);
-  assert.equal(f.toast.show('Fresh action'), true);
+  assert.equal(f.toast.show('Fresh message after recovery'), true);
+  await turn();
+  assert.equal(f.calls.at(-1).args.notification.message, 'Fresh message after recovery');
   f.toast.destroy();
-  assert.equal(f.element.hidden, true);
+  await turn();
+  assert.equal(f.calls.at(-1).name, 'notification_hide');
   assert.equal(f.toast.show('After destroy'), false);
-  assert.equal(f.disconnects(), 1);
-  t.mock.timers.tick(10000);
-  assert.equal(f.element.hidden, true);
+});
+
+test('browser preview places its plain-text notification outside the overlay without native commands', async t => {
+  const f = fixture(t, { native: false });
+  assert.equal(f.toast.show('Preview <b>text</b>'), true);
+  await turn();
+  const card = f.dom.window.document.querySelector('#action-toast');
+  assert.ok(card);
+  assert.equal(card.parentElement, f.dom.window.document.body);
+  assert.equal(card.closest('#overlay'), null);
+  assert.equal(card.querySelector('b'), null);
+  assert.equal(card.textContent, 'Preview <b>text</b>');
+  assert.deepEqual(f.calls, []);
+  f.toast.destroy();
+  assert.equal(f.dom.window.document.querySelector('#action-toast'), null);
 });

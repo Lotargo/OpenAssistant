@@ -80,6 +80,7 @@ struct WindowPolicy {
     always_on_top: bool,
     skip_taskbar: bool,
     focusable: bool,
+    ignore_cursor_events: bool,
 }
 impl WindowPolicy {
     fn new(mode: WindowMode, settings_window: bool) -> Self {
@@ -89,8 +90,31 @@ impl WindowPolicy {
             always_on_top: overlay,
             skip_taskbar: overlay,
             focusable: !overlay || settings_window,
+            ignore_cursor_events: false,
         }
     }
+}
+
+fn policy_for_window(mode: WindowMode, label: &str) -> WindowPolicy {
+    if label == crate::notifications::LABEL {
+        WindowPolicy {
+            protected: mode == WindowMode::Overlay,
+            always_on_top: true,
+            skip_taskbar: true,
+            focusable: false,
+            ignore_cursor_events: true,
+        }
+    } else {
+        WindowPolicy::new(mode, label == SETTINGS_LABEL)
+    }
+}
+
+pub(crate) fn apply_notification_policy(
+    window: &WebviewWindow,
+    mode: WindowMode,
+) -> Result<(), String> {
+    // Explicit mode: callers may already own OverlayData during a mode transaction.
+    apply_policy(window, policy_for_window(mode, crate::notifications::LABEL))
 }
 
 fn content_protection(window: &WebviewWindow, protected: bool) -> Result<(), String> {
@@ -121,7 +145,7 @@ fn apply_policy(window: &WebviewWindow, policy: WindowPolicy) -> Result<(), Stri
         .set_focusable(policy.focusable)
         .map_err(|e| e.to_string())?;
     window
-        .set_ignore_cursor_events(false)
+        .set_ignore_cursor_events(policy.ignore_cursor_events)
         .map_err(|e| e.to_string())?;
     if !policy.protected {
         content_protection(window, false)?;
@@ -180,6 +204,7 @@ fn apply_window_mode(
     let settings = app.get_webview_window(SETTINGS_LABEL);
     let windows: Vec<_> = std::iter::once(main.clone())
         .chain(settings.clone())
+        .chain(app.get_webview_window(crate::notifications::LABEL))
         .collect();
     // All getters happen outside the state mutex. They may wait for the UI thread.
     let main_visible = main.is_visible().map_err(|e| e.to_string())?;
@@ -208,10 +233,7 @@ fn apply_window_mode(
     };
     let applied = (|| {
         for window in &windows {
-            apply_policy(
-                window,
-                WindowPolicy::new(mode, window.label() == SETTINGS_LABEL),
-            )?;
+            apply_policy(window, policy_for_window(mode, window.label()))?;
         }
         if mode == WindowMode::Standard {
             #[cfg(windows)]
@@ -239,11 +261,7 @@ fn apply_window_mode(
         let rollback: Vec<_> = windows
             .iter()
             .filter_map(|window| {
-                apply_policy(
-                    window,
-                    WindowPolicy::new(previous_mode, window.label() == SETTINGS_LABEL),
-                )
-                .err()
+                apply_policy(window, policy_for_window(previous_mode, window.label())).err()
             })
             .collect();
         return if rollback.is_empty() {
@@ -325,7 +343,7 @@ fn clamp_to_work_area(mut rect: WindowRect, area: WindowRect) -> WindowRect {
     rect
 }
 
-fn current_work_area(window: &WebviewWindow) -> Result<Option<WindowRect>, String> {
+pub(crate) fn current_work_area(window: &WebviewWindow) -> Result<Option<WindowRect>, String> {
     let monitor = window
         .current_monitor()
         .map_err(|e| e.to_string())?
@@ -1129,6 +1147,7 @@ mod tests {
             always_on_top: false,
             skip_taskbar: false,
             focusable: true,
+            ignore_cursor_events: false,
         };
         assert_eq!(WindowPolicy::new(WindowMode::Standard, false), standard);
         assert_eq!(WindowPolicy::new(WindowMode::Standard, true), standard);
@@ -1142,6 +1161,21 @@ mod tests {
                 ..overlay
             }
         );
+    }
+
+    #[test]
+    fn notification_is_noninteractive_and_topmost_in_both_modes_but_protection_tracks_main() {
+        for mode in [WindowMode::Overlay, WindowMode::Standard] {
+            let policy = policy_for_window(mode, crate::notifications::LABEL);
+            assert!(policy.always_on_top && policy.skip_taskbar && policy.ignore_cursor_events);
+            assert!(!policy.focusable);
+            assert_eq!(policy.protected, mode == WindowMode::Overlay);
+            assert!(!policy_for_window(mode, "main").ignore_cursor_events);
+            assert_eq!(
+                policy_for_window(mode, SETTINGS_LABEL),
+                WindowPolicy::new(mode, true)
+            );
+        }
     }
 
     #[test]

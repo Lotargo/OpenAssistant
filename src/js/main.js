@@ -6,7 +6,7 @@ import { createRenderer } from './renderer.js';
 import { createSettingsModal } from './settings-modal.js';
 import { createSettingsWindowHost } from './settings-window-bridge.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
-import { setButtonIcon } from './icons.js';
+import { setButtonIcon, setModeButtonIcon } from './icons.js';
 import { createMicrophoneIndicator, createToolbarAudioIndicator, selectToolbarAudio } from './microphone-meter.js';
 import { createGeometrySync } from './geometry.js';
 import { createWindowInteraction } from './window-interaction.js';
@@ -35,15 +35,50 @@ const microphoneIndicator = createMicrophoneIndicator(document.querySelector('[d
 const toolbar = byId('toolbar');
 const toolbarAudioIndicator = createToolbarAudioIndicator(toolbar);
 const actionToast = createActionToast({
-  element: byId('action-toast'), overlay, toolbar, announcer: byId('announcer'),
-  isEnabled: () => settings.actionNotifications,
+  announcer: byId('announcer'), isEnabled: () => settings.actionNotifications,
+  getBridge: () => bridge, getTheme: () => settings,
 });
+let notificationPreference = null;
+const toolbarTooltip = byId('toolbar-tooltip');
+let hintedButton = null;
+function hideToolbarHint() {
+  hintedButton = null;
+  toolbarTooltip.hidden = true;
+}
+function showToolbarHint(button) {
+  const label = button?.dataset.tooltip || button?.getAttribute('aria-label');
+  if (!label || !nativeWindowActive) { hideToolbarHint(); return; }
+  hintedButton = button;
+  toolbarTooltip.textContent = label;
+  const panel = overlay.getBoundingClientRect(), bar = toolbar.getBoundingClientRect(), control = button.getBoundingClientRect();
+  toolbarTooltip.style.bottom = (bar.height + 5) + 'px';
+  toolbarTooltip.style.setProperty('--tooltip-lines', panel.height - bar.height >= 48 ? '2' : '1');
+  toolbarTooltip.hidden = false;
+  const width = toolbarTooltip.getBoundingClientRect().width;
+  const center = control.left + control.width / 2 - panel.left;
+  toolbarTooltip.style.left = Math.max(width / 2 + 8, Math.min(panel.width - width / 2 - 8, center)) + 'px';
+}
+toolbar.addEventListener('pointerover', event => {
+  const button = event.target.closest('button');
+  if (button && button !== hintedButton) showToolbarHint(button);
+});
+toolbar.addEventListener('pointerout', event => {
+  if (!event.relatedTarget || !toolbar.contains(event.relatedTarget)) hideToolbarHint();
+  else if (hintedButton && !hintedButton.contains(event.relatedTarget)) hideToolbarHint();
+});
+toolbar.addEventListener('focusin', event => {
+  const button = event.target.closest('button');
+  if (button?.matches(':focus-visible')) showToolbarHint(button);
+});
+toolbar.addEventListener('focusout', hideToolbarHint);
+toolbar.addEventListener('pointerdown', hideToolbarHint);
 function syncToolbarLayout() {
-  const anchor = toolbar.querySelector(window.matchMedia('(max-width: 760px)').matches ? '.toolbar-actions' : '.toolbar-controls');
+  const anchor = toolbar.querySelector(window.matchMedia('(max-width: 600px)').matches ? '.toolbar-actions' : '.toolbar-controls');
   const bar = toolbar.getBoundingClientRect(), content = anchor.getBoundingClientRect();
   if (bar.width <= 0 || content.width <= 0) return;
   toolbar.style.setProperty('--toolbar-wave-span', content.width + 'px');
   toolbar.style.setProperty('--toolbar-audio-top', (content.top - bar.top + content.height / 2) + 'px');
+  if (hintedButton) showToolbarHint(hintedButton);
 }
 const toolbarLayoutObserver = new ResizeObserver(syncToolbarLayout);
 for (const element of [toolbar, toolbar.querySelector('.toolbar-controls'), toolbar.querySelector('.toolbar-actions')]) toolbarLayoutObserver.observe(element);
@@ -59,7 +94,9 @@ function renderNotificationControl() {
   button.setAttribute('aria-pressed', String(settings.actionNotifications));
   button.setAttribute('aria-label', settings.actionNotifications ? 'Выключить всплывающие уведомления' : 'Включить всплывающие уведомления');
   setButtonIcon(button, settings.actionNotifications ? 'notifications' : 'notifications-off');
-  if (!settings.actionNotifications) actionToast.dismiss();
+  button.dataset.tooltip = button.getAttribute('aria-label');
+  if (!settings.actionNotifications && notificationPreference !== false) actionToast.dismiss();
+  notificationPreference = settings.actionNotifications;
 }
 function observeBroadcast(state = {}) {
   const stage = state.stage || 'idle';
@@ -108,10 +145,14 @@ function renderControls(next = runtime) {
   broadcastButton.setAttribute('aria-label', stage === 'starting' ? 'Остановить подключение эфира'
     : stage === 'stopping' ? 'Эфир завершается' : active ? 'Завершить эфир' : 'Включить эфир');
   broadcastButton.disabled = !runtime.nativeWindow || stage === 'stopping' || broadcastOperation?.kind === 'stop';
-  for (const button of byId('mode-switcher').querySelectorAll('[data-scenario]')) {
-    button.setAttribute('aria-pressed', String(button.dataset.scenario === (runtime.agentConfig?.scenario || 'assistant')));
-    button.disabled = modeChanging || stage === 'stopping';
-  }
+  setButtonIcon(broadcastButton, active ? 'stop' : 'broadcast');
+  const scenario = ['assistant', 'interview', 'custom'].includes(runtime.agentConfig?.scenario) ? runtime.agentConfig.scenario : 'assistant';
+  const nextScenario = { assistant: 'interview', interview: 'custom', custom: 'assistant' }[scenario];
+  const modeButton = byId('mode-btn');
+  modeButton.dataset.currentScenario = scenario;
+  modeButton.setAttribute('aria-label', 'Режим: ' + modeLabels[scenario] + '. Переключить: ' + modeLabels[nextScenario]);
+  modeButton.disabled = modeChanging || stage === 'stopping';
+  setModeButtonIcon(modeButton, { assistant: 'mode-assistant', interview: 'mode-meeting', custom: 'mode-custom' }[scenario]);
   renderNotificationControl();
   observeBroadcast(broadcast);
   setButtonIcon(mic, runtime.microphoneMuted ? 'microphone-muted' : 'microphone');
@@ -143,6 +184,11 @@ function renderControls(next = runtime) {
     if (bridge) persist();
   }
   overlay.dataset.scrollLocked = String(settings.scrollLocked);
+  for (const button of toolbar.querySelectorAll('button')) {
+    button.dataset.tooltip = button.getAttribute('aria-label') || '';
+    button.removeAttribute('title');
+  }
+  if (hintedButton) showToolbarHint(hintedButton);
   modal?.refresh();
 }
 
@@ -173,6 +219,7 @@ async function applySettings(next) {
   const previousLock = settings.scrollLocked;
   settings = normalizeSettings(next);
   applyTheme(settings);
+  actionToast.updateTheme();
   renderNotificationControl();
   overlay.dataset.scrollLocked = String(settings.scrollLocked);
   geometry?.schedule();
@@ -192,7 +239,7 @@ async function start() {
       geometry?.setActive(active);
       microphoneIndicator.setVisible(active);
       toolbarAudioIndicator.setVisible(active);
-      actionToast.setVisible(active);
+      if (!active) hideToolbarHint();
     },
     onAudioLevels(levels) {
       if (levels?.source === 'system') runtime = { ...runtime, systemAudioLevels: levels };
@@ -216,6 +263,7 @@ async function start() {
   document.body.classList.toggle('browser-preview', !bridge.native);
   settings = normalizeSettings(await bridge.loadSettings());
   applyTheme(settings);
+  actionToast.updateTheme();
 
   if (bridge.native) {
     modal = await createSettingsWindowHost({
@@ -276,10 +324,12 @@ async function start() {
 
   toolbar.addEventListener('click', async event => {
     if (modalOpen) return;
-    const scenarioButton = event.target.closest('button[data-scenario]');
-    if (scenarioButton) {
-      const scenario = scenarioButton.dataset.scenario;
-      if (scenarioButton.disabled || modeChanging || scenario === runtime.agentConfig?.scenario) return;
+    const button = event.target.closest('button[data-action]');
+    if (!button || button.disabled) return;
+    const action = button.dataset.action;
+    if (action === 'mode') {
+      if (modeChanging) return;
+      const scenario = { assistant: 'interview', interview: 'custom', custom: 'assistant' }[runtime.agentConfig?.scenario || 'assistant'];
       modeChanging = true;
       renderControls();
       try {
@@ -289,9 +339,6 @@ async function start() {
       finally { modeChanging = false; renderControls(bridge.getRuntimeState()); }
       return;
     }
-    const button = event.target.closest('button[data-action]');
-    if (!button || button.disabled) return;
-    const action = button.dataset.action;
     if (action === 'settings') {
       if (await requestSettings({ open: true, tab: 'appearance' })) actionToast.show('Настройки открыты');
       return;

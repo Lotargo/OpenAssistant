@@ -56,7 +56,7 @@ for (const change of ['stop-connect', 'mode-stop', 'instructions']) {
     await openNative(page, { autoReady: false, autoVoiceReady: false });
     const settings = await openSettingsTab(page, 'modes');
     await settings.locator('#agent-scenario').selectOption('custom');
-    await expect(page.locator('#mode-switcher [data-scenario="custom"]')).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('#mode-btn')).toHaveAttribute('data-current-scenario', 'custom');
     if (change === 'stop-connect') await page.evaluate(() => window.__nativeContract.delayNext('assistant_connect'));
     await settings.locator('#voice-start').click();
     await expect.poll(() => page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(1);

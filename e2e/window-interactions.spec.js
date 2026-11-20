@@ -50,7 +50,8 @@ test('window mode makes the native roundtrip, survives reload and keeps all broa
     if (index) expect(boxes[index - 1].x + boxes[index - 1].width).toBeLessThanOrEqual(box.x);
   }
   expect(Math.abs((boxes[0].x + boxes.at(-1).x + boxes.at(-1).width) / 2 - 160)).toBeLessThan(1);
-  await expect(page.locator('#mode-switcher button')).toHaveCount(3);
+  await expect(page.locator('#mode-btn')).toHaveCount(1);
+  await expect(page.locator('#toolbar button')).toHaveCount(9);
   for (const control of await page.locator('.toolbar-session button').all()) {
     const box = await control.boundingBox();
     expect(box.x).toBeGreaterThanOrEqual(0);

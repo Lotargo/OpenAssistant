@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "assistant-notification",
+  "description": "The notification child only listens for scoped presentation events; native commands validate its role.",
+  "windows": ["notification"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

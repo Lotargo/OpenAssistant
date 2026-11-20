@@ -7,7 +7,7 @@ async function openDemo(page, mode) {
   await expect(page.locator('html')).toHaveAttribute('data-ready', 'true');
 }
 
-test('text uses rendered Markdown and a centered mode and broadcast strip with seven icon controls', async ({ page }) => {
+test('text uses rendered Markdown and a centered toolbar with nine accessible icon-only controls', async ({ page }) => {
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await openDemo(page, 'text');
@@ -22,18 +22,20 @@ test('text uses rendered Markdown and a centered mode and broadcast strip with s
   await expect(controls).toHaveCount(7);
   expect(await controls.evaluateAll((buttons) => buttons.map((button) => button.dataset.action)))
     .toEqual(['screen', 'microphone', 'reconnect', 'settings', 'scroll-lock', 'window-mode', 'notifications']);
-  for (const button of await controls.all()) {
-    await expect(button.locator('svg')).toHaveCount(1);
+  for (const button of await page.locator('#toolbar button').all()) {
+    await expect(button.locator('svg')).toHaveCount(await button.getAttribute('id') === 'mode-btn' ? 2 : 1);
     expect((await button.innerText()).trim()).toBe('');
     expect(await button.getAttribute('title')).toBeNull();
+    await expect(button).toHaveAccessibleName(/\S/);
+    await expect(button).toHaveAttribute('data-tooltip', /\S/);
     const box = await button.boundingBox();
     expect(box.width).toBeGreaterThanOrEqual(36);
     expect(box.height).toBeGreaterThanOrEqual(36);
   }
   const overlay = await page.locator('#overlay').boundingBox();
   const toolbar = await page.locator('#toolbar').boundingBox();
-  await expect(page.locator('#mode-switcher button')).toHaveCount(3);
-  await expect(page.locator('#mode-switcher [aria-pressed="true"]')).toHaveCount(1);
+  await expect(page.locator('#toolbar button')).toHaveCount(9);
+  await expect(page.locator('#mode-btn')).toHaveAttribute('data-current-scenario', 'assistant');
   const strip = await page.locator('.toolbar-controls').boundingBox();
   expect(Math.abs(strip.x + strip.width / 2 - (overlay.x + overlay.width / 2))).toBeLessThan(2);
   expect(Math.abs(toolbar.y + toolbar.height - (overlay.y + overlay.height - 1))).toBeLessThan(2);

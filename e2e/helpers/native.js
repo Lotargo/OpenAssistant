@@ -5,7 +5,7 @@ const nativeWindows = new WeakMap();
 async function routeWindowEvent(record, { target, event, payload }) {
   // Tauri emit_to visits every WebView: Any listeners also receive sibling
   // window events. The registered listener target, not its owner, filters them.
-  await Promise.all([record.main, record.settings].filter(view => view && !view.isClosed()).map(view =>
+  await Promise.all([record.main, record.settings, record.notification].filter(view => view && !view.isClosed()).map(view =>
     view.evaluate(packet => window.__receiveNativeEvent?.(packet.event, packet.payload, packet.target),
       { target, event, payload })));
 
@@ -71,6 +71,70 @@ async function installSettingsWindow(page, record) {
   });
 }
 
+
+async function installNotificationWindow(page, record) {
+  await page.setViewportSize({ width: 420, height: 200 });
+  await page.exposeFunction('__notificationNativeInvoke', async ({ name, args }) => {
+    if (record.main.isClosed()) throw new Error('Main owner is closed');
+    if (!['notification_ready', 'notification_present', 'notification_dismissed'].includes(name)) {
+      throw new Error('Unexpected native command from notification: ' + name);
+    }
+    return record.main.evaluate(({ name, args }) => window.__TAURI_INTERNALS__.invoke(name, args, 'notification'), { name, args });
+  });
+  await page.addInitScript(() => {
+    window.isTauri = true;
+    const callbacks = new Map();
+    const listeners = new Map();
+    let nextCallback = 1;
+    window.__notificationNativeCalls = [];
+    document.addEventListener('DOMContentLoaded', () => { document.documentElement.dataset.nativeVisible = 'false'; }, { once: true });
+    window.__receiveNativeEvent = (event, payload, target = { kind: 'Any' }) => {
+      const emitted = typeof target === 'string' ? { kind: 'AnyLabel', label: target } : target;
+      for (const listener of listeners.get(event) || []) {
+        const registered = listener.target;
+        const matches = emitted.kind === 'Any' || registered.kind === 'Any'
+          || emitted.kind === 'AnyLabel' && emitted.label === registered.label
+          || emitted.kind === registered.kind && emitted.label === registered.label;
+        if (matches) callbacks.get(listener.id)?.({ event, id: listener.id, payload });
+      }
+    };
+    window.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'notification' }, currentWebview: { label: 'notification' } },
+      transformCallback(callback, once = false) {
+        const id = nextCallback++;
+        callbacks.set(id, payload => { if (once) callbacks.delete(id); callback(payload); });
+        return id;
+      },
+      unregisterCallback(id) { callbacks.delete(id); },
+      async invoke(name, args = {}) {
+        window.__notificationNativeCalls.push({ name, args: { ...args } });
+        if (name === 'plugin:event|listen') {
+          const ids = listeners.get(args.event) || [];
+          ids.push({ id: args.handler, target: args.target || { kind: 'Any' } });
+          listeners.set(args.event, ids);
+          return args.handler;
+        }
+        if (name === 'plugin:event|unlisten') {
+          listeners.set(args.event, (listeners.get(args.event) || []).filter(listener => listener.id !== args.eventId));
+          return null;
+        }
+        return window.__notificationNativeInvoke({ name, args });
+      },
+    };
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(_event, id) { callbacks.delete(id); } };
+  });
+}
+
+/** Return the separate, non-interactive notification view; no native input is used. */
+export async function notificationPage(page) {
+  const record = nativeWindows.get(page);
+  if (!record) throw new Error('openNative must be called first');
+  await expect.poll(() => Boolean(record.notification)).toBe(true);
+  if (record.notificationPromise) await record.notificationPromise;
+  await expect(record.notification.locator('html')).toHaveAttribute('data-ready', 'true');
+  return record.notification;
+}
+
 /** Return the independent settings webview created by the native open command. */
 export async function settingsPage(page) {
   const record = nativeWindows.get(page);
@@ -88,7 +152,7 @@ export async function settingsPage(page) {
  * No Codex process, network provider or physical microphone is used.
  */
 export async function openNative(page, options = {}) {
-  const record = { main: page, settings: null, settingsPromise: null };
+  const record = { main: page, settings: null, settingsPromise: null, notification: null, notificationPromise: null };
   nativeWindows.set(page, record);
   await page.exposeFunction('__routeNativeEvent', packet => routeWindowEvent(record, packet));
   await page.exposeFunction('__setSettingsNativeOpen', async open => {
@@ -110,6 +174,25 @@ export async function openNative(page, options = {}) {
         await routeWindowEvent(record, { target: 'settings', event: 'overlay:window-activity', payload: { active: open } });
       }
     }
+  });
+  await page.exposeFunction('__ensureNotificationWindow', async () => {
+    if (!record.notification || record.notification.isClosed()) {
+      record.notificationPromise = (async () => {
+        const child = await page.context().newPage();
+        record.notification = child;
+        nativeWindows.set(child, record);
+        await installNotificationWindow(child, record);
+        await child.goto('/notification.html');
+        return child;
+      })();
+    }
+    if (record.notificationPromise) await record.notificationPromise;
+  });
+  await page.exposeFunction('__setNotificationVisible', async ({ visible, height }) => {
+    const child = record.notification;
+    if (!child || child.isClosed()) return;
+    if (visible && height) await child.setViewportSize({ width: 420, height });
+    await child.evaluate(value => { document.documentElement.dataset.nativeVisible = String(value); }, visible);
   });
   await page.exposeFunction('__applyNativeSize', async ({ width, height }) => {
     await page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
@@ -151,6 +234,9 @@ export async function openNative(page, options = {}) {
     const sessions = new Map();
     const tasks = new Map();
     const captures = new Map();
+    let notification = null;
+    let notificationWanted = false;
+    let notificationVisible = false;
     function stopBoundCaptures(sessionId, broadcastId) {
       for (const capture of captures.values()) {
         if (capture.active && capture.mode !== 'test' && capture.sessionId === sessionId && capture.broadcastId === broadcastId) {
@@ -179,6 +265,8 @@ export async function openNative(page, options = {}) {
       messages: [], audio: [], audioStarts: [], audioStops: [], audioNoiseChanges: [], audioSaves: [], captureIds: [], pending, applyResizes: true,
       systemAudioStarts: [], systemAudioStops: [], clipboardWrites: [], workspaceChoices,
       broadcastStarts: [], broadcastStops: [], voiceOpens: [], voiceCloses: [], pendingExecution,
+      notificationShows: [], notificationHides: [], notificationThemes: [], notificationPresentations: [], notificationDismissals: [],
+      getNotification() { return { notification: notification ? structuredClone(notification) : null, wanted: notificationWanted, visible: notificationVisible }; },
       setModels(next) { models = structuredClone(next); },
       queueWorkspaceChoice(path) { workspaceChoices.push(path); },
       getWorkspaceState() { return structuredClone(workspaceState); },
@@ -330,6 +418,56 @@ export async function openNative(page, options = {}) {
         case 'plugin:event|unlisten':
           listeners.set(args.event, (listeners.get(args.event) || []).filter(listener => listener.id !== args.eventId));
           return null;
+        case 'notification_show': {
+          if (windowLabel !== 'main') throw new Error('Only the main view may show a notification');
+          notification = structuredClone(args.notification);
+          notificationWanted = true;
+          harness.notificationShows.push(structuredClone(notification));
+          const id = notification.id;
+          await window.__ensureNotificationWindow();
+          if (notificationWanted && notification?.id === id) await harness.emitTo('notification', 'notification:update', structuredClone(notification));
+          return null;
+        }
+        case 'notification_hide': {
+          if (windowLabel !== 'main') throw new Error('Only the main view may hide a notification');
+          harness.notificationHides.push({ ...args });
+          if (!notification || args.id != null && args.id !== notification.id) return null;
+          notificationWanted = false;
+          await harness.emitTo('notification', 'notification:hide', { id: notification.id });
+          return null;
+        }
+        case 'notification_theme':
+          if (windowLabel !== 'main') throw new Error('Only the main view may change the notification theme');
+          harness.notificationThemes.push(structuredClone(args.theme));
+          if (notification) notification.theme = structuredClone(args.theme);
+          await harness.emitTo('notification', 'notification:theme', { theme: structuredClone(args.theme) });
+          return null;
+        case 'notification_ready':
+          if (windowLabel !== 'notification') throw new Error('Only the notification view may request its payload');
+          return { notification: notificationWanted ? structuredClone(notification) : null };
+        case 'notification_present': {
+          if (windowLabel !== 'notification') throw new Error('Only the notification view may present itself');
+          const shown = notificationWanted && notification?.id === args.id;
+          const height = Math.max(64, Math.min(200, Math.ceil(Number(args.height) || 100)));
+          harness.notificationPresentations.push({ id: args.id, shown, width: 420, height });
+          if (shown) {
+            notificationVisible = true;
+            await window.__setNotificationVisible({ visible: true, height });
+          }
+          return { shown, width: 420, height };
+        }
+        case 'notification_dismissed': {
+          if (windowLabel !== 'notification') throw new Error('Only the notification view may finish dismissal');
+          const dismissed = notification?.id === args.id;
+          harness.notificationDismissals.push({ id: args.id, dismissed });
+          if (dismissed) {
+            notification = null;
+            notificationWanted = false;
+            notificationVisible = false;
+            await window.__setNotificationVisible({ visible: false });
+          }
+          return dismissed;
+        }
         case 'get_runtime_state': return { ...state };
         case 'get_window_activity': return { active: true };
         case 'set_scroll_locked': return harness.pushState({ scrollLocked: args.locked });
@@ -580,8 +718,23 @@ export async function connectAgent(page, { realtime = false } = {}) {
   return page.evaluate(() => window.__nativeContract.sessionIds.at(-1));
 }
 
+
+export async function setScenario(page, scenario) {
+  const cycle = ['assistant', 'interview', 'custom'];
+  if (!cycle.includes(scenario)) throw new Error('Unknown fixture scenario ' + scenario);
+  const button = page.locator('#mode-btn');
+  for (let step = 0; step < cycle.length; step++) {
+    const current = await button.getAttribute('data-current-scenario');
+    if (current === scenario) return;
+    const next = cycle[(cycle.indexOf(current) + 1) % cycle.length];
+    await button.click();
+    await expect(button).toHaveAttribute('data-current-scenario', next);
+  }
+  await expect(button).toHaveAttribute('data-current-scenario', scenario);
+}
+
 export async function startBroadcast(page, { scenario } = {}) {
-  if (scenario) await setPressed(page.locator('#mode-switcher [data-scenario="' + scenario + '"]'), true);
+  if (scenario) await setScenario(page, scenario);
   await page.locator('#broadcast-btn').click();
   await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'live');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture()?.active)).toBe(true);

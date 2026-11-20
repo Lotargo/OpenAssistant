@@ -821,6 +821,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   async function command(name, args = {}) {
     try {
       switch (name) {
+        case 'notification_show':
+        case 'notification_hide':
+        case 'notification_theme':
+          return native ? await invoke(name, args) : { delivered: false };
         case 'start_broadcast':
           await startBroadcast();
           return { ...runtime };

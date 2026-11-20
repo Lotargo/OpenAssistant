@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { openNative, openSettingsTab, connectAgent, sendTask, emitSession, setPressed, startBroadcast } from './helpers/native.js';
+import { openNative, openSettingsTab, connectAgent, sendTask, emitSession, setPressed, startBroadcast, setScenario, notificationPage } from './helpers/native.js';
 
 test('text connection stays silent and microphone mute does not stop a meeting broadcast', async ({ page }) => {
   await openNative(page);
@@ -8,7 +8,7 @@ test('text connection stays silent and microphone mute does not stop a meeting b
   expect(await page.evaluate(() => ({
     voices: window.__nativeContract.voiceOpens.length, captures: window.__nativeContract.captureIds.length,
   }))).toEqual({ voices: 0, captures: 0 });
-  await setPressed(page.locator('#mode-switcher [data-scenario="interview"]'), true);
+  await setScenario(page, 'interview');
   expect(await page.evaluate(() => window.__nativeContract.broadcastStarts)).toEqual([]);
   const broadcast = await startBroadcast(page);
   expect(await page.evaluate(() => window.__nativeContract.voiceOpens.at(-1))).toMatchObject({
@@ -90,7 +90,7 @@ test('native stream start rejected after Stop cannot reopen a capture or leak an
 test('mode switch stops the old broadcast and stale end events cannot close a fresh broadcast', async ({ page }) => {
   await openNative(page);
   const old = await startBroadcast(page);
-  await setPressed(page.locator('#mode-switcher [data-scenario="interview"]'), true);
+  await setScenario(page, 'interview');
   await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
   expect(await page.evaluate(() => ({ starts: window.__nativeContract.broadcastStarts.length, active: window.__nativeContract.lastCapture().active })))
     .toEqual({ starts: 1, active: false });
@@ -118,11 +118,15 @@ for (const reason of ['silence', 'agent']) {
     if (reason === 'agent') await setPressed(page.locator('#notifications-btn'), false);
     await page.evaluate(({ id, reason, farewell }) => window.__nativeContract.finishBroadcast(id, reason, farewell), { id: broadcast.sessionId, reason, farewell });
     await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
-    if (reason === 'agent') await expect(page.locator('#action-toast')).toBeHidden();
-    else {
-      await expect(page.locator('#action-toast')).toHaveAttribute('data-visible', 'true');
-      await expect(page.locator('.action-toast-message')).toContainText(farewell);
+    const notification = await notificationPage(page);
+    if (reason === 'agent') {
+      await expect(notification.locator('#notification-card')).toBeHidden();
+      await expect.poll(() => page.evaluate(() => window.__nativeContract.getNotification().visible)).toBe(false);
+    } else {
+      await expect(notification.locator('#notification-card')).toHaveAttribute('data-phase', 'visible');
+      await expect(notification.locator('#notification-message')).toContainText(farewell);
     }
+    await expect(page.locator('#action-toast')).toHaveCount(0);
     await expect(page.locator('#text-content')).toContainText(farewell);
     await expect(page.locator('[data-action="microphone"]')).toBeDisabled();
     expect(await page.evaluate(() => ({
@@ -136,28 +140,30 @@ for (const reason of ['silence', 'agent']) {
 test('notification dismissal keeps capture running and shares the panel appearance and capture mode', async ({ page }) => {
   await openNative(page);
   await startBroadcast(page);
+  const notification = await notificationPage(page);
   const settings = await openSettingsTab(page, 'appearance');
+  await page.locator('#window-mode-btn').click();
+  await expect(page.locator('#overlay')).toHaveAttribute('data-window-mode', 'standard');
+  await expect(notification.locator('#notification-card')).toHaveAttribute('data-phase', 'visible');
+  const noticeId = await notification.locator('#notification-card').getAttribute('data-id');
   await settings.locator('#setting-opacity').evaluate(node => {
     node.value = '24'; node.dispatchEvent(new Event('input', { bubbles: true })); node.dispatchEvent(new Event('change', { bubbles: true }));
   });
   await expect.poll(() => page.evaluate(() => window.__nativeContract.saves.at(-1)?.opacity)).toBe(24);
-  await page.locator('#window-mode-btn').click();
-  await expect(page.locator('#overlay')).toHaveAttribute('data-window-mode', 'standard');
-  await expect(page.locator('#action-toast')).toHaveAttribute('data-visible', 'true');
-  const style = await page.evaluate(() => {
-    const toast = document.querySelector('#action-toast');
-    return { inside: Boolean(toast.closest('#overlay')), pointer: getComputedStyle(toast).pointerEvents,
-      toast: getComputedStyle(toast).backgroundColor, panel: getComputedStyle(document.querySelector('#overlay')).backgroundColor };
-  });
-  expect(style.inside).toBe(true);
-  expect(style.pointer).toBe('none');
-  expect(style.toast).toBe(style.panel);
-  await expect(page.locator('#action-toast')).toHaveAttribute('data-window-drag-ignore', '');
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.notificationThemes.at(-1)?.opacity)).toBe(24);
+  await expect(notification.locator('#notification-card')).toHaveAttribute('data-id', noticeId);
+  const panelBackground = await page.locator('#overlay').evaluate(node => getComputedStyle(node).backgroundColor);
+  expect(await notification.locator('#notification-card').evaluate(node => getComputedStyle(node).backgroundColor)).toBe(panelBackground);
+  await expect(page.locator('#action-toast')).toHaveCount(0);
+  expect(await notification.locator('body').evaluate(node => getComputedStyle(node).pointerEvents)).toBe('none');
   const before = await page.evaluate(() => ({ capture: window.__nativeContract.lastCapture(), closes: window.__nativeContract.voiceCloses.length }));
   await setPressed(page.locator('#notifications-btn'), false);
-  await expect(page.locator('#action-toast')).toBeHidden();
+  await expect(notification.locator('#notification-card')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.getNotification().visible)).toBe(false);
+  const shownBefore = await page.evaluate(() => window.__nativeContract.notificationShows.length);
   await page.locator('[data-action="scroll-lock"]').click();
-  await expect(page.locator('#action-toast')).toBeHidden();
+  await expect(notification.locator('#notification-card')).toBeHidden();
+  expect(await page.evaluate(() => window.__nativeContract.notificationShows.length)).toBe(shownBefore);
   await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'live');
   expect(await page.evaluate(() => ({ capture: window.__nativeContract.lastCapture(), closes: window.__nativeContract.voiceCloses.length }))).toEqual(before);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.saves.at(-1)?.actionNotifications)).toBe(false);
@@ -167,7 +173,7 @@ test('notification dismissal keeps capture running and shares the panel appearan
   await expect(page.locator('html')).toHaveAttribute('data-ready', 'true');
   await expect(page.locator('#notifications-btn')).toHaveAttribute('aria-pressed', 'false');
   await page.locator('[data-action="scroll-lock"]').click();
-  await expect(page.locator('#action-toast')).toBeHidden();
+  expect(await page.evaluate(() => window.__nativeContract.notificationShows)).toEqual([]);
 });
 
 test('silence and semantic-end preferences persist without starting a broadcast', async ({ page }) => {
@@ -219,12 +225,13 @@ test('mode change awaiting Stop preserves a concurrent configuration edit and ne
   const settings = await openSettingsTab(page, 'agent');
   await expect(settings.locator('#agent-web-search')).toHaveAttribute('aria-pressed', 'true');
   await page.evaluate(() => window.__nativeContract.delayNext('assistant_send:broadcast_stop'));
-  await page.locator('#mode-switcher [data-scenario="interview"]').click();
+  await page.locator('#mode-btn').click();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.some(item => item.name === 'assistant_send:broadcast_stop'))).toBe(true);
+  await expect(page.locator('#mode-btn')).toBeDisabled();
   await setPressed(settings.locator('#agent-web-search'), false);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.agentSaves.at(-1)?.web_search)).toBe(false);
   await page.evaluate(() => window.__nativeContract.release('assistant_send:broadcast_stop'));
-  await expect(page.locator('#mode-switcher [data-scenario="interview"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#mode-btn')).toHaveAttribute('data-current-scenario', 'interview');
   await expect(settings.locator('#agent-web-search')).toHaveAttribute('aria-pressed', 'false');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.agentSaves.at(-1))).toMatchObject({ scenario: 'interview', web_search: false });
   await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');

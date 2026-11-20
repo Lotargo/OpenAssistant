@@ -1,7 +1,8 @@
 mod assistant;
-mod clipboard;
 mod audio;
 mod audio_commands;
+mod clipboard;
+mod notifications;
 mod state;
 mod window_stealth;
 
@@ -295,6 +296,7 @@ fn setup_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(OverlayState::default())
+        .manage(notifications::Notifications::default())
         .manage(assistant::AssistantState::default())
         .manage(audio::AudioState::default())
         .manage(audio::SystemAudioState::default())
@@ -307,6 +309,8 @@ pub fn run() {
                     retire_webview_session(webview.app_handle());
                 } else if webview.label() == window_stealth::SETTINGS_LABEL {
                     webview.state::<audio::AudioState>().invalidate_test();
+                } else if webview.label() == notifications::LABEL {
+                    notifications::page_started(webview.app_handle());
                 }
             }
         })
@@ -341,9 +345,26 @@ pub fn run() {
                         report_error(window.app_handle(), error);
                     }
                 }
+            } else if window.label() == notifications::LABEL {
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        notifications::closed_from_native(window.app_handle());
+                    }
+                    tauri::WindowEvent::Destroyed => {
+                        notifications::closed_from_native(window.app_handle())
+                    }
+                    _ => {}
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
+            notifications::notification_show,
+            notifications::notification_hide,
+            notifications::notification_theme,
+            notifications::notification_ready,
+            notifications::notification_present,
+            notifications::notification_dismissed,
             clipboard::clipboard_write_text,
             audio_commands::system_audio_state,
             audio_commands::system_audio_start,
@@ -384,6 +405,9 @@ pub fn run() {
                 .get_webview_window("main")
                 .ok_or("Overlay window was not created")?;
             window_stealth::initialize(&window).map_err(std::io::Error::other)?;
+            if let Err(error) = notifications::initialize(app.handle()) {
+                report_error(app.handle(), error);
+            }
             setup_tray(app)?;
             #[cfg(desktop)]
             setup_shortcuts(app.handle())?;
@@ -393,6 +417,7 @@ pub fn run() {
         .expect("could not start OpenAssistant");
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            handle.state::<notifications::Notifications>().shutdown();
             let audio = handle.state::<audio::AudioState>();
             audio.invalidate();
             let _ = audio.stop(None);
