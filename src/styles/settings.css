@@ -228,3 +228,19 @@
 @media (prefers-reduced-motion: reduce) {
   .mic-level-fill, .microphone-indicator > span { transition: none; }
 }
+
+
+/* The native settings page is an opaque, independent window. Its reused form
+   fills the client area; there is no backdrop surrounding the main overlay. */
+html.settings-window-document, body.settings-window { width: 100%; height: 100%; min-height: 100%; background: #18181b; color: #eeedeb; }
+body.settings-window { height: 100dvh; overflow: hidden; }
+.settings-window #settings-root { width: 100%; height: 100%; }
+.settings-window .settings-backdrop { inset: 0; padding: 0; align-items: stretch; justify-content: stretch; background: #18181b; }
+.settings-window .settings-dialog { width: 100%; height: 100%; max-width: none; max-height: none; border: 0; border-radius: 0; box-shadow: none; background: #18181b; }
+.settings-window-status { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 32px; text-align: center; background: #18181b; }
+.settings-window-status h1 { margin: 0; font-size: 20px; font-weight: 600; }
+.settings-window-status p { max-width: 560px; margin: 0; color: #a19f9e; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.settings-window-actions { display: flex; gap: 10px; }
+.settings-window-actions .action-button { padding: 8px 16px; border: 1px solid #514542; border-radius: 8px; background: #3b2e2b; color: #f3e8e4; cursor: pointer; }
+.settings-window-actions .secondary { border-color: #343438; background: #222225; }
+.settings-window-actions .action-button:disabled { opacity: .5; cursor: default; }

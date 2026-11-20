@@ -9,6 +9,8 @@ const paths = {
   settings: '<path d="M4 6h2m4 0h10M4 12h10m4 0h2M4 18h4m4 0h8"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/>',
   lock: '<rect x="5" y="10" width="14" height="12" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/>',
   unlock: '<rect x="5" y="10" width="14" height="12" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0"/>',
+  'window-standard': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/>',
+  'window-overlay': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18m-9 2-3 1v2.5c0 1.5 1.2 2.8 3 3.5 1.8-.7 3-2 3-3.5V12Z"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
   appearance: '<path d="M12 3a9 9 0 1 0 0 18h1a2 2 0 0 0 0-4h-.4a1.5 1.5 0 0 1 0-3H16a5 5 0 0 0 5-5c0-3.3-4-6-9-6Z"/><path d="M7 9h.01M10 6h.01M15 7h.01M6 13h.01"/>',
   behavior: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M12 8h6M12 12h4"/>',

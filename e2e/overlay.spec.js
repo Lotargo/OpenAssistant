@@ -7,7 +7,7 @@ async function openDemo(page, mode) {
   await expect(page.locator('html')).toHaveAttribute('data-ready', 'true');
 }
 
-test('text uses rendered Markdown and exactly five centered bottom controls', async ({ page }) => {
+test('text uses rendered Markdown and exactly six centered bottom controls', async ({ page }) => {
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await openDemo(page, 'text');
@@ -19,9 +19,9 @@ test('text uses rendered Markdown and exactly five centered bottom controls', as
   expect(await text.innerText()).not.toContain('##');
 
   const controls = page.locator('#toolbar > button');
-  await expect(controls).toHaveCount(5);
+  await expect(controls).toHaveCount(6);
   expect(await controls.evaluateAll((buttons) => buttons.map((button) => button.dataset.action)))
-    .toEqual(['screen', 'microphone', 'reconnect', 'settings', 'scroll-lock']);
+    .toEqual(['screen', 'microphone', 'reconnect', 'settings', 'scroll-lock', 'window-mode']);
   for (const button of await controls.all()) {
     await expect(button.locator('svg')).toHaveCount(1);
     expect((await button.innerText()).trim()).toBe('');

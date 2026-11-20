@@ -1,11 +1,106 @@
 import { expect } from '@playwright/test';
 
+const nativeWindows = new WeakMap();
+
+async function routeWindowEvent(record, { target, event, payload }) {
+  const label = typeof target === 'string' ? target : target?.label;
+  const recipient = label === 'main' ? record.main : label === 'settings' ? record.settings : null;
+  if (!recipient || recipient.isClosed()) return;
+  await recipient.evaluate(({ event, payload }) => window.__receiveNativeEvent?.(event, payload), { event, payload });
+}
+
+async function installSettingsWindow(page, record) {
+  await page.setViewportSize({ width: 860, height: 690 });
+  // Tauri PageLoadEvent::Started invalidates only a local check on child reload.
+  await page.exposeFunction('__settingsPageStarted', () => record.main.isClosed() ? undefined
+    : record.main.evaluate(() => window.__nativeContract.invalidateAudioTest()));
+  await page.exposeFunction('__routeNativeEvent', packet => routeWindowEvent(record, packet));
+  await page.exposeFunction('__settingsNativeInvoke', async ({ name, args }) => {
+    if (record.main.isClosed()) throw new Error('Main owner is closed');
+    return record.main.evaluate(({ name, args }) => {
+      const harness = window.__nativeContract;
+      if (name === 'start_window_drag') {
+        harness.calls.push({ name, args, windowLabel: 'settings' });
+        harness.dragStarts.push({ windowLabel: 'settings', windowMode: harness.getState().windowMode, settingsOpen: harness.getState().settingsOpen });
+        return null;
+      }
+      if (name === 'set_settings_open') return window.__TAURI_INTERNALS__.invoke(name, args);
+      throw new Error('Unexpected direct native command from settings: ' + name);
+    }, { name, args });
+  });
+  await page.addInitScript(() => {
+    window.isTauri = true;
+    void window.__settingsPageStarted();
+    const callbacks = new Map();
+    const listeners = new Map();
+    let nextCallback = 1;
+    window.__settingsNativeCalls = [];
+    window.__receiveNativeEvent = (event, payload) => {
+      for (const id of listeners.get(event) || []) callbacks.get(id)?.({ event, id, payload });
+    };
+    window.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'settings' }, currentWebview: { label: 'settings' } },
+      transformCallback(callback, once = false) {
+        const id = nextCallback++;
+        callbacks.set(id, payload => { if (once) callbacks.delete(id); callback(payload); });
+        return id;
+      },
+      unregisterCallback(id) { callbacks.delete(id); },
+      async invoke(name, args = {}) {
+        window.__settingsNativeCalls.push({ name, args: { ...args } });
+        if (name === 'plugin:event|listen') {
+          const ids = listeners.get(args.event) || [];
+          ids.push(args.handler); listeners.set(args.event, ids);
+          return args.handler;
+        }
+        if (name === 'plugin:event|unlisten') {
+          listeners.set(args.event, (listeners.get(args.event) || []).filter(id => id !== args.eventId));
+          return null;
+        }
+        if (name === 'plugin:event|emit_to') return window.__routeNativeEvent(args);
+        return window.__settingsNativeInvoke({ name, args });
+      },
+    };
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(_event, id) { callbacks.delete(id); } };
+  });
+}
+
+/** Return the independent settings webview created by the native open command. */
+export async function settingsPage(page) {
+  const record = nativeWindows.get(page);
+  if (!record) throw new Error('openNative must be called first');
+  await expect.poll(() => Boolean(record.settings)).toBe(true);
+  if (record.settingsPromise) await record.settingsPromise;
+  await expect(record.settings.locator('html')).toHaveAttribute('data-ready', 'true');
+  return record.settings;
+}
+
+
 /**
  * Offline Tauri IPC fixture. Production bridge, Channel, settings and geometry run
  * unchanged. This verifies transport/UI contracts, not Windows focus or hooks.
  * No Codex process, network provider or physical microphone is used.
  */
 export async function openNative(page, options = {}) {
+  const record = { main: page, settings: null, settingsPromise: null };
+  nativeWindows.set(page, record);
+  await page.exposeFunction('__routeNativeEvent', packet => routeWindowEvent(record, packet));
+  await page.exposeFunction('__setSettingsNativeOpen', async open => {
+    if (open && !record.settings) {
+      record.settingsPromise = (async () => {
+        const child = await page.context().newPage();
+        record.settings = child;
+        nativeWindows.set(child, record);
+        await installSettingsWindow(child, record);
+        await child.goto('/settings.html');
+        return child;
+      })();
+      await record.settingsPromise;
+    }
+    if (record.settings && !record.settings.isClosed()) {
+      await record.settings.evaluate(visible => { document.documentElement.dataset.nativeVisible = String(visible); }, open);
+    }
+  });
   await page.exposeFunction('__applyNativeSize', async ({ width, height }) => {
     await page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
   });
@@ -23,7 +118,7 @@ export async function openNative(page, options = {}) {
     ];
     let state = {
       revision: 1, microphoneMuted: true, screenCaptureEnabled: false,
-      scrollLocked: false, settingsOpen: false, connectionStatus: 'idle',
+      scrollLocked: false, settingsOpen: false, windowMode: 'overlay', connectionStatus: 'idle',
       audioAvailable: false, screenCaptureAvailable: false, liveAvailable: false,
       nativeWindow: true, nativeWheelRouting: true, platform: 'windows', lastError: '',
     };
@@ -32,7 +127,9 @@ export async function openNative(page, options = {}) {
     const delayed = new Map();
     const failures = new Map();
     const pending = [];
-    const values = new Map();
+    const storeKey = 'openassistant.native-contract.store';
+    const persisted = sessionStorage.getItem(storeKey);
+    const values = new Map(persisted ? JSON.parse(persisted) : Object.entries(options.storeValues || {}));
     const sessions = new Map();
     const tasks = new Map();
     const captures = new Map();
@@ -41,8 +138,22 @@ export async function openNative(page, options = {}) {
       { id: 'fixture-codex-small', display_name: 'Fixture Small', is_default: false, reasoning_efforts: ['low', 'medium'] },
     ];
     const harness = {
-      calls: [], resizes: [], saves: [], agentSaves: [], sessionIds: [], events: [],
+      calls: [], resizes: [], saves: [], agentSaves: [], windowModeSaves: [], dragStarts: [], sessionIds: [], events: [],
       messages: [], audio: [], audioStarts: [], audioStops: [], audioNoiseChanges: [], audioSaves: [], captureIds: [], pending, applyResizes: true,
+      getState() { return { ...state }; },
+      invalidateAudioTest() {
+        for (const capture of captures.values()) {
+          if (capture.active && capture.mode === 'test') {
+            capture.active = false;
+            harness.emitAudio(capture.id, { type: 'stopped', reason: 'invalidated' });
+          }
+        }
+      },
+      async closeSettingsWindow() {
+        harness.invalidateAudioTest();
+        harness.pushState({ settingsOpen: false });
+        await window.__setSettingsNativeOpen(false);
+      },
       setAudioDevices(devices) { audioDevices = structuredClone(devices); },
       emitAudio(captureId, event) {
         const capture = captures.get(captureId);
@@ -106,6 +217,7 @@ export async function openNative(page, options = {}) {
       },
     };
     window.__nativeContract = harness;
+    window.__receiveNativeEvent = harness.emit;
 
     async function execute(name, args) {
       const recorded = { ...args };
@@ -123,14 +235,25 @@ export async function openNative(page, options = {}) {
           listeners.set(args.event, ids);
           return args.handler;
         }
+        case 'plugin:event|emit_to': return window.__routeNativeEvent(args);
         case 'plugin:event|unlisten':
           listeners.set(args.event, (listeners.get(args.event) || []).filter(id => id !== args.eventId));
           return null;
         case 'get_runtime_state': return { ...state };
         case 'set_scroll_locked': return harness.pushState({ scrollLocked: args.locked });
+        case 'set_window_mode':
+          if (!['overlay', 'standard'].includes(args.mode)) throw new Error('Invalid window mode');
+          return harness.pushState({ windowMode: args.mode });
+        case 'start_window_drag':
+          harness.dragStarts.push({ windowLabel: 'main', windowMode: state.windowMode, settingsOpen: state.settingsOpen });
+          return null;
         case 'set_microphone_muted': return harness.pushState({ microphoneMuted: args.muted });
         case 'sync_audio_state': return harness.pushState({ microphoneMuted: args.muted, audioAvailable: args.available });
-        case 'set_settings_open': return harness.pushState({ settingsOpen: args.open });
+        case 'set_settings_open': {
+          const next = harness.pushState({ settingsOpen: args.open });
+          await window.__setSettingsNativeOpen(args.open);
+          return next;
+        }
         case 'resize_overlay':
           harness.resizes.push({ width: args.width, height: args.height });
           if (harness.applyResizes) await window.__applyNativeSize(args);
@@ -227,12 +350,15 @@ export async function openNative(page, options = {}) {
           harness.saves.push(structuredClone(values.get('appearance')));
           harness.agentSaves.push(structuredClone(values.get('agent')));
           harness.audioSaves.push(structuredClone(values.get('audio')));
+          harness.windowModeSaves.push(structuredClone(values.get('windowMode')));
+          sessionStorage.setItem(storeKey, JSON.stringify([...values]));
           return null;
         default: throw new Error('Unexpected native command in contract test: ' + name);
       }
     }
 
     window.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
       transformCallback(callback, once = false) {
         const id = nextCallback++;
         callbacks.set(id, payload => {
@@ -265,24 +391,29 @@ export async function openNative(page, options = {}) {
 }
 
 export async function openAgent(page) {
-  if (!await page.locator('#settings-dialog').isVisible()) await page.locator('[data-action="settings"]').click();
-  await page.getByRole('tab', { name: 'Агент', exact: true }).click();
+  const record = nativeWindows.get(page);
+  if (!record?.settings || !await record.settings.locator('#settings-dialog').isVisible()) {
+    await record.main.locator('[data-action="settings"]').click();
+  }
+  const settings = await settingsPage(page);
+  await settings.getByRole('tab', { name: 'Агент', exact: true }).click();
+  return settings;
 }
 
 export async function connectAgent(page, { realtime = false } = {}) {
-  await openAgent(page);
-  await page.locator('#agent-realtime').setChecked(realtime);
-  await page.locator('#agent-connect').click();
-  await expect(page.locator('#agent-connect')).toHaveText('Переподключить');
-  await expect(page.locator('#agent-model option')).toHaveCount(3);
+  const settings = await openAgent(page);
+  await settings.locator('#agent-realtime').setChecked(realtime);
+  await settings.locator('#agent-connect').click();
+  await expect(settings.locator('#agent-connect')).toHaveText('Переподключить');
+  await expect(settings.locator('#agent-model option')).toHaveCount(3);
   return page.evaluate(() => window.__nativeContract.sessionIds.at(-1));
 }
 
 export async function sendTask(page, text) {
-  await openAgent(page);
-  await page.locator('#agent-prompt').fill(text);
-  await page.locator('#agent-send').click();
-  await expect(page.locator('#settings-dialog')).toBeHidden();
+  const settings = await openAgent(page);
+  await settings.locator('#agent-prompt').fill(text);
+  await settings.locator('#agent-send').click();
+  await expect(settings.locator('#settings-dialog')).toBeHidden();
   return page.evaluate(() => window.__nativeContract.lastTask());
 }
 

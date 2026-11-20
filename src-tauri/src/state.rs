@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowMode {
+    #[default]
+    Overlay,
+    Standard,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeState {
@@ -9,6 +17,7 @@ pub struct RuntimeState {
     pub screen_capture_enabled: bool,
     pub scroll_locked: bool,
     pub settings_open: bool,
+    pub window_mode: WindowMode,
     pub connection_status: &'static str,
     pub platform: &'static str,
     pub native_window: bool,
@@ -26,6 +35,7 @@ impl Default for RuntimeState {
             screen_capture_enabled: false,
             scroll_locked: false,
             settings_open: false,
+            window_mode: WindowMode::Overlay,
             connection_status: "unavailable",
             platform: std::env::consts::OS,
             native_window: true,
@@ -75,11 +85,15 @@ pub struct HitRects {
     pub notes: Option<Rect>,
     pub modal: Option<Rect>,
     pub drag: Option<Rect>,
+    pub drag_areas: Vec<Rect>,
     pub scrollbars: Vec<Rect>,
 }
 
 impl HitRects {
     pub fn validate(&self) -> Result<(), String> {
+        if self.drag_areas.len() > 24 {
+            return Err("At most 24 empty drag rectangles are supported".into());
+        }
         if self.scrollbars.len() > 6 {
             return Err("At most six scrollbar rectangles are supported".into());
         }
@@ -94,6 +108,7 @@ impl HitRects {
         .into_iter()
         .flatten()
         .chain(self.scrollbars.iter().copied())
+        .chain(self.drag_areas.iter().copied())
         .all(|rect| rect.valid())
         {
             Ok(())
@@ -107,6 +122,7 @@ impl HitRects {
             .into_iter()
             .flatten()
             .chain(self.scrollbars.iter().copied())
+            .chain(self.drag_areas.iter().copied())
             .any(|rect| rect.contains(x, y))
     }
 
@@ -122,7 +138,7 @@ impl HitRects {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowRect {
     pub x: i32,
     pub y: i32,
@@ -134,15 +150,23 @@ pub struct WindowRect {
 pub struct OverlayData {
     pub runtime: RuntimeState,
     pub rects: HitRects,
-    pub before_settings: Option<WindowRect>,
+    pub pointer_generation: u64,
+    pub settings_generation: u64,
     #[cfg(windows)]
     pub previous_focus: Option<isize>,
+    #[cfg(windows)]
+    pub before_standard_focus: Option<isize>,
 }
 
 #[derive(Clone, Default)]
-pub struct OverlayState(pub Arc<Mutex<OverlayData>>);
+pub struct OverlayState(pub Arc<Mutex<OverlayData>>, Arc<tokio::sync::Mutex<()>>);
 
 impl OverlayState {
+    /// Serializes creation/visibility/mode changes without blocking the UI thread.
+    pub async fn window_operation(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.1.lock().await
+    }
+
     pub fn snapshot(&self) -> Result<RuntimeState, String> {
         self.0
             .lock()
@@ -253,6 +277,52 @@ mod tests {
         rects.scrollbars = vec![Rect {
             width: f64::INFINITY,
             ..Default::default()
+        }];
+        assert!(rects.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod window_mode_tests {
+    use super::*;
+
+    #[test]
+    fn window_mode_serialization_is_explicit_and_defaults_to_protected_overlay() {
+        let value = serde_json::to_value(RuntimeState::default()).unwrap();
+        assert_eq!(value["windowMode"], "overlay");
+        assert_eq!(
+            serde_json::from_str::<WindowMode>("\"standard\"").unwrap(),
+            WindowMode::Standard
+        );
+        assert!(serde_json::from_str::<WindowMode>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn empty_drag_areas_receive_input_without_making_text_interactive() {
+        let padding = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 12.0,
+            height: 200.0,
+        };
+        let mut rects = HitRects {
+            text: Some(Rect {
+                x: 12.0,
+                y: 0.0,
+                width: 300.0,
+                height: 200.0,
+            }),
+            drag_areas: vec![padding],
+            ..Default::default()
+        };
+        assert!(rects.validate().is_ok());
+        assert!(rects.interactive_at(6.0, 80.0));
+        assert!(!rects.interactive_at(120.0, 80.0));
+        rects.drag_areas = vec![padding; 25];
+        assert!(rects.validate().is_err());
+        rects.drag_areas = vec![Rect {
+            y: f64::NAN,
+            ..padding
         }];
         assert!(rects.validate().is_err());
     }

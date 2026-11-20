@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru" class="settings-window-document">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Настройки — OpenAssistant</title>
+    <style>html,body{margin:0;background:#18181b;color:#eeedeb}</style>
+    <link rel="stylesheet" href="./styles/main.css" />
+    <link rel="stylesheet" href="./styles/color-picker.css" />
+    <link rel="stylesheet" href="./styles/agent.css" />
+    <link rel="stylesheet" href="./styles/settings.css" />
+  </head>
+  <body class="settings-window">
+    <div id="settings-window-status" class="settings-window-status">
+      <h1>Настройки</h1>
+      <p id="settings-window-message" role="status">Подключение к основной панели…</p>
+      <div class="settings-window-actions">
+        <button id="settings-window-retry" class="action-button" type="button" hidden>Повторить</button>
+        <button id="settings-window-close" class="action-button secondary" type="button">Закрыть</button>
+      </div>
+    </div>
+    <div id="settings-root" hidden></div>
+    <div id="announcer" class="sr-only" role="status" aria-live="polite"></div>
+    <script type="module" src="./js/settings-window.js"></script>
+  </body>
+</html>

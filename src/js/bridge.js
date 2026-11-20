@@ -7,6 +7,8 @@ import { createAssistantTransport } from './session-transport.js';
 const APPEARANCE_KEY = 'openassistant.settings.v1';
 const AGENT_KEY = 'openassistant.agent.v1';
 const AUDIO_KEY = 'openassistant.audio.v1';
+const WINDOW_MODE_KEY = 'openassistant.window-mode.v1';
+const validWindowMode = mode => mode === 'overlay' || mode === 'standard';
 const PREVIEW_ONLY = 'Codex доступен в приложении OpenAssistant. Браузер открыт только для просмотра интерфейса.';
 const DEFAULT_AGENT = Object.freeze({
   workspace: '', model: '', effort: '', web_search: true, parallel: true,
@@ -52,6 +54,9 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let storedAudio;
   try { storedAudio = native ? await (await getStore()).get('audio') : readStored(AUDIO_KEY, {}); }
   catch (error) { initialError = 'Не удалось прочитать параметры микрофона: ' + String(error); }
+  let storedWindowMode;
+  try { storedWindowMode = native ? await (await getStore()).get('windowMode') : readStored(WINDOW_MODE_KEY, 'overlay'); }
+  catch (error) { initialError = 'Не удалось прочитать режим окна: ' + String(error); }
   let audioConfig = normalizeAudio(storedAudio);
   let config = normalizeAgent(storedAgent);
   let generation = 0;
@@ -71,6 +76,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     microphoneNoiseSuppression: audioConfig.noiseSuppression, microphoneTesting: false,
     microphoneBusy: false, microphoneError: '', microphoneStatus: '', microphoneLevels: null,
     screenCaptureEnabled: false, scrollLocked: false, settingsOpen: false,
+    windowMode: !native && validWindowMode(storedWindowMode) ? storedWindowMode : 'overlay',
     connectionStatus: native ? 'idle' : 'unavailable', agentStage: 'idle', agentDetail: '',
     audioAvailable: false,
     screenCaptureAvailable: false, liveAvailable: false, nativeWindow: native,
@@ -86,7 +92,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   function publishNative(state = {}) {
     if (Number.isSafeInteger(state.revision) && state.revision < (runtime.revision ?? -1)) return { ...runtime };
     const patch = {};
-    for (const key of ['revision', 'scrollLocked', 'settingsOpen', 'nativeWindow', 'nativeWheelRouting', 'platform']) {
+    for (const key of ['revision', 'scrollLocked', 'settingsOpen', 'windowMode', 'nativeWindow', 'nativeWheelRouting', 'platform']) {
       if (key in state) patch[key] = state[key];
     }
     // Capturing and model connections have their own lifecycle, not native preferences.
@@ -469,6 +475,18 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         case 'set_microphone_noise_suppression':
           await mic.setNoiseSuppression(Boolean(args.enabled));
           return { ...runtime };
+        case 'set_window_mode': {
+          if (!validWindowMode(args.mode)) throw new Error('Неизвестный режим окна.');
+          if (native) publishNative(await invoke(name, { mode: args.mode }));
+          else publish({ windowMode: args.mode });
+          // Native revisions are authoritative, including a newer state that may
+          // arrive while an older command response is still in transit.
+          await saveValue('windowMode', WINDOW_MODE_KEY, runtime.windowMode);
+          return { ...runtime };
+        }
+        case 'start_window_drag':
+          if (native) await invoke(name);
+          return { ...runtime };
         case 'set_scroll_locked':
           return native ? publishNative(await invoke(name, args)) : publish({ scrollLocked: Boolean(args.locked) });
         case 'set_settings_open':
@@ -538,12 +556,17 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     for (const [event, handler] of Object.entries(handlers)) {
       unlisten.push(await listen(event, ({ payload }) => handler(payload)));
     }
+    try { publishNative(await invoke('get_runtime_state')); }
+    catch (error) { reportError(error); }
+    if (validWindowMode(storedWindowMode) && storedWindowMode !== runtime.windowMode) {
+      try { publishNative(await invoke('set_window_mode', { mode: storedWindowMode })); }
+      catch (error) { reportError('Не удалось восстановить режим окна: ' + String(error)); }
+    }
     try {
-      publishNative(await invoke('get_runtime_state'));
       const status = await invoke('assistant_status');
       if (!config.workspace && typeof status.workspace === 'string') config.workspace = status.workspace;
       publish({ agentConfig: { ...config }, mode: status.mode || 'real',
-        codexAvailable: status.codex_available === true, auth: status.oauth, lastError: status.message || initialError });
+        codexAvailable: status.codex_available === true, auth: status.oauth, lastError: status.message || runtime.lastError || initialError });
     } catch (error) { reportError(error); }
     await mic.refresh();
   } else publish({ agentDetail: PREVIEW_ONLY });
@@ -551,6 +574,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   return {
     native,
     getRuntimeState: () => ({ ...runtime }),
+    getSessionGeneration: () => generation,
     getAgentSettings: () => ({ ...config }),
     async setAgentSettings(patch) {
       const next = normalizeAgent({ ...config, ...patch });

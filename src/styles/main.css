@@ -50,6 +50,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: roun
 body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; max-height: min(var(--overlay-max-height, 100vh), 100vh); }
 
 .drag-region { position: absolute; z-index: 2; top: 0; left: 22px; right: 22px; height: 12px; user-select: none; }
+[data-window-drag] { cursor: grab; }
+[data-window-drag="handle"] { user-select: none; }
+[data-window-drag="background"] > .markdown-content,
+[data-window-drag="background"] > .code-card { cursor: auto; }
+.window-dragging [data-window-drag] { cursor: grabbing; }
 .scroll-panel { min-width: 0; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: rgba(202, 207, 215, .34) rgba(255, 255, 255, .035); overscroll-behavior: contain; }
 .overlay[data-scroll-locked="true"] .scroll-panel { overflow: hidden; }
 .scroll-panel::-webkit-scrollbar, .settings-dialog::-webkit-scrollbar, .settings-main::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -161,6 +166,7 @@ body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; ma
   .settings-control input[type="range"] { width: 108px; }
 }
 @media (max-width: 460px) {
+  .toolbar { gap: clamp(4px, 1.5vw, 8px); padding-inline: 8px; }
   .settings-row { flex-wrap: wrap; gap: 9px; }
   .settings-row > .field-copy { flex-basis: calc(100% - 60px); }
   .settings-control { flex-basis: 100%; }

@@ -1,3 +1,5 @@
+import { getBackgroundDragRects, getScrollbarRects } from './window-interaction.js';
+
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 
 /** Pure sizing policy. Values use logical pixels, matching DOM rects and Tauri IPC. */
@@ -19,26 +21,6 @@ function visibleRect(element) {
   return width > 0 && height > 0 ? { x, y, width, height } : null;
 }
 
-function scrollbarRects(element) {
-  if (!element || !visibleRect(element)) return [];
-  const rect = element.getBoundingClientRect();
-  const style = getComputedStyle(element);
-  const left = parseFloat(style.borderLeftWidth) || 0;
-  const right = parseFloat(style.borderRightWidth) || 0;
-  const top = parseFloat(style.borderTopWidth) || 0;
-  const bottom = parseFloat(style.borderBottomWidth) || 0;
-  const vertical = element.offsetWidth - element.clientWidth - left - right;
-  const horizontal = element.offsetHeight - element.clientHeight - top - bottom;
-  const result = [];
-  if (style.overflowY !== 'hidden' && vertical > 0 && element.scrollHeight > element.clientHeight) {
-    result.push({ x: rect.right - right - vertical, y: rect.top + top, width: vertical, height: element.clientHeight });
-  }
-  if (style.overflowX !== 'hidden' && horizontal > 0 && element.scrollWidth > element.clientWidth) {
-    result.push({ x: rect.left + left, y: rect.bottom - bottom - horizontal, width: element.clientWidth, height: horizontal });
-  }
-  return result;
-}
-
 export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }) {
   let stopped = false;
   let timer;
@@ -54,12 +36,15 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     const rects = {
       toolbar: visibleRect(byId('toolbar')),
       drag: visibleRect(byId('drag-region')),
+      dragAreas: ['text-panel', 'split-view', 'notes-panel']
+        .flatMap(id => getBackgroundDragRects(byId(id))).slice(0, 24),
       text: visibleRect(byId('text-panel')),
       code: visibleRect(byId('code-panel')),
       notes: visibleRect(byId('notes-panel')),
-      modal: isModalOpen() ? visibleRect(byId('settings-dialog')) : null,
-      scrollbars: getSettings().scrollLocked || isModalOpen() ? []
-        : ['text-panel', 'code-panel', 'notes-panel'].flatMap(id => scrollbarRects(byId(id))),
+      // Native settings live in another window and cannot intercept this one.
+      modal: null,
+      scrollbars: getSettings().scrollLocked ? []
+        : ['text-panel', 'code-panel', 'notes-panel'].flatMap(id => getScrollbarRects(byId(id))),
     };
     const signature = JSON.stringify(rects);
     if (signature === lastRects) return;
@@ -81,7 +66,7 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
   async function resize() {
     if (stopped) return;
     if (resizing) { resizeAgain = true; return; }
-    const modalOpen = isModalOpen();
+    const modalOpen = !bridge.native && isModalOpen();
     const split = overlay.dataset.mode === 'code';
     const text = byId('text-panel');
     const code = byId('code-panel');
@@ -140,6 +125,8 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     const element = byId(id);
     if (element) observer.observe(element);
   }
+  const scrollSources = ['text-panel', 'code-panel', 'notes-panel'].map(byId).filter(Boolean);
+  for (const panel of scrollSources) panel.addEventListener('scroll', requestRects, { passive: true });
   window.addEventListener('resize', schedule);
   overlay.addEventListener('transitionend', requestRects);
   schedule();
@@ -150,6 +137,7 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
       observer.disconnect();
       clearTimeout(timer);
       cancelAnimationFrame(rectFrame);
+      for (const panel of scrollSources) panel.removeEventListener('scroll', requestRects);
       window.removeEventListener('resize', schedule);
       overlay.removeEventListener('transitionend', requestRects);
     },

@@ -13,11 +13,11 @@
   </head>
   <body>
     <main id="overlay" class="overlay" data-mode="text" aria-label="Ответ ассистента">
-      <div id="drag-region" class="drag-region" data-tauri-drag-region aria-hidden="true"></div>
-      <section id="text-panel" class="text-panel scroll-panel" data-scroll-panel="text" aria-label="Текст ответа" tabindex="0">
+      <div id="drag-region" class="drag-region" data-window-drag="handle" aria-hidden="true"></div>
+      <section id="text-panel" class="text-panel scroll-panel" data-scroll-panel="text" data-window-drag="background" aria-label="Текст ответа" tabindex="0">
         <div id="text-content" class="markdown-content"></div>
       </section>
-      <section id="split-view" class="split-view" aria-label="Код и пояснения">
+      <section id="split-view" class="split-view" data-window-drag="background" aria-label="Код и пояснения">
         <div class="code-card">
           <div class="code-header">
             <svg class="file-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M9 13l-2 2 2 2m6-4 2 2-2 2"/></svg>
@@ -27,11 +27,11 @@
             <div id="code-content"></div>
           </div>
         </div>
-        <section id="notes-panel" class="notes-panel scroll-panel" data-scroll-panel="notes" aria-label="Пояснения к коду" tabindex="0">
+        <section id="notes-panel" class="notes-panel scroll-panel" data-scroll-panel="notes" data-window-drag="background" aria-label="Пояснения к коду" tabindex="0">
           <div id="notes-content" class="markdown-content"></div>
         </section>
       </section>
-      <nav id="toolbar" class="toolbar" aria-label="Управление ассистентом">
+      <nav id="toolbar" class="toolbar" data-window-drag="background" aria-label="Управление ассистентом">
         <button class="icon-button" data-action="screen" type="button" aria-label="Передавать экран модели" aria-pressed="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
         </button>
@@ -46,6 +46,9 @@
         </button>
         <button class="icon-button" data-action="scroll-lock" type="button" aria-label="Заблокировать прокрутку" aria-pressed="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="12" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0"/></svg>
+        </button>
+        <button id="window-mode-btn" class="icon-button" data-action="window-mode" type="button" aria-label="Защищённый оверлей. Переключить в обычное окно" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18m-9 2-3 1v2.5c0 1.5 1.2 2.8 3 3.5 1.8-.7 3-2 3-3.5V12Z"/></svg>
         </button>
       </nav>
     </main>

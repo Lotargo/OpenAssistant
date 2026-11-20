@@ -5,13 +5,14 @@ import { createAgentSettings } from './agent-settings.js';
 
 const TABS = ['appearance', 'behavior', 'sources', 'agent'];
 
-/** Settings and agent controls share the native overlay modal. */
-export function createSettingsModal({ getSettings, onChange, onOpenChange, getRuntimeState = () => ({}), bridge }) {
+/** The same settings form runs embedded in preview or in its own native window. */
+export function createSettingsModal({ getSettings, onChange, onOpenChange, getRuntimeState = () => ({}), bridge, standalone = false }) {
   const host = document.getElementById('settings-root');
   const overlay = document.getElementById('overlay');
   const settingsButton = document.querySelector('[data-action="settings"]');
   const abort = new AbortController();
   let opened = false;
+  let visibilityVersion = 0;
   let activeTab = 'appearance';
   let colorTarget = 'panelColor';
   let previousFocus = null;
@@ -19,8 +20,8 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
 
   host.innerHTML = `
     <div id="settings-backdrop" class="settings-backdrop" hidden>
-      <section id="settings-dialog" class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
-        <header class="settings-header">
+      <section id="settings-dialog" class="settings-dialog" role="dialog" aria-modal="${!standalone}" aria-labelledby="settings-title" tabindex="-1">
+        <header class="settings-header" data-window-drag="handle">
           ${getIcon('settings')}<h1 id="settings-title">Настройки</h1>
           <button class="icon-button" type="button" data-close-settings aria-label="Закрыть настройки">${getIcon('close')}</button>
         </header>
@@ -174,15 +175,16 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
   }
 
   async function open(tab = 'appearance', request = null) {
+    ++visibilityVersion;
     current = normalizeSettings(getSettings());
     renderValues();
     selectTab(tab);
     if (!opened) {
       opened = true;
-      previousFocus = document.activeElement;
+      previousFocus = standalone ? null : document.activeElement;
       backdrop.hidden = false;
       agentSettings.setAudioVisible(activeTab === 'sources');
-      overlay.inert = true;
+      if (!standalone && overlay) overlay.inert = true;
       document.body.classList.add('settings-open');
       settingsButton?.setAttribute('aria-expanded', 'true');
       await onOpenChange?.(true);
@@ -204,17 +206,24 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
     });
   }
 
-  async function close() {
+  async function close({ notify = true } = {}) {
     if (!opened) return;
+    const version = ++visibilityVersion;
     void agentSettings.stopMicrophoneTest();
+    // Keep the independent form usable if a native close request fails. A later
+    // open/close event supersedes this request while it crosses the window bridge.
+    if (standalone && notify) {
+      await onOpenChange?.(false);
+      if (visibilityVersion !== version) return;
+    }
     opened = false;
     backdrop.hidden = true;
     agentSettings.setAudioVisible(false);
-    overlay.inert = false;
+    if (!standalone && overlay) overlay.inert = false;
     document.body.classList.remove('settings-open');
     settingsButton?.setAttribute('aria-expanded', 'false');
-    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
-    await onOpenChange?.(false);
+    if (!standalone && previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+    if (!standalone && notify) await onOpenChange?.(false);
   }
 
   host.addEventListener('click', (event) => {
@@ -222,7 +231,9 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
     const colorButton = event.target.closest('[data-color-target]');
     if (tab) selectTab(tab.dataset.tab);
     if (colorButton) { colorTarget = colorButton.dataset.colorTarget; renderValues(); }
-    if (event.target.closest('[data-close-settings]') || event.target === backdrop) void close();
+    if (event.target.closest('[data-close-settings]') || (!standalone && event.target === backdrop)) {
+      void close().catch(error => bridge?.reportError(error));
+    }
   }, { signal: abort.signal });
 
   host.addEventListener('input', (event) => {
@@ -243,7 +254,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
 
   document.addEventListener('keydown', (event) => {
     if (!opened) return;
-    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void close(); return; }
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void close().catch(error => bridge?.reportError(error)); return; }
     if (event.key !== 'Tab') return;
     const focusable = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), summary, a[href], [tabindex="0"]')]
       .filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0);
@@ -262,6 +273,6 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
     refresh() { current = normalizeSettings(getSettings()); renderValues(); },
     updateAudioLevels(levels) { agentSettings.updateAudioLevels(levels); },
     get isOpen() { return opened; },
-    destroy() { void close(); abort.abort(); picker.destroy(); agentSettings.destroy(); host.replaceChildren(); },
+    destroy() { void close({ notify: !standalone }).catch(() => {}); abort.abort(); picker.destroy(); agentSettings.destroy(); host.replaceChildren(); },
   };
 }

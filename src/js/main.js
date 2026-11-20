@@ -3,10 +3,12 @@ import { createStreamParser } from './stream-parser.js';
 import { createMarkdownStream } from './markdown-stream.js';
 import { createRenderer } from './renderer.js';
 import { createSettingsModal } from './settings-modal.js';
+import { createSettingsWindowHost } from './settings-window-bridge.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
 import { setButtonIcon } from './icons.js';
 import { createMicrophoneIndicator } from './microphone-meter.js';
 import { createGeometrySync } from './geometry.js';
+import { createWindowInteraction } from './window-interaction.js';
 import { playDemo } from './demo.js';
 
 const byId = id => document.getElementById(id);
@@ -15,7 +17,9 @@ let settings = { ...DEFAULT_SETTINGS };
 let bridge;
 let modal;
 let geometry;
+let windowInteraction;
 let modalOpen = false;
+let pendingSettingsRequest = null;
 let saveTimer;
 let runtime = {};
 const demoAbort = new AbortController();
@@ -24,6 +28,15 @@ const microphoneIndicator = createMicrophoneIndicator(document.querySelector('[d
 function persist() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => void bridge.saveSettings(settings).catch(() => modal?.refresh()), 150);
+}
+
+function requestSettings(payload) {
+  if (!modal) { pendingSettingsRequest = payload; return; }
+  const operation = payload.open ? modal.open(payload.tab || 'appearance', payload.request ?? null) : modal.close();
+  void Promise.resolve(operation).catch(error => {
+    bridge?.reportError(error);
+    byId('announcer').textContent = 'Не удалось открыть или закрыть настройки. ' + String(error?.message ?? error);
+  });
 }
 
 function renderControls(next = runtime) {
@@ -37,7 +50,9 @@ function renderControls(next = runtime) {
   setButtonIcon(mic, runtime.microphoneMuted ? 'microphone-muted' : 'microphone');
   setButtonIcon(screenButton, 'screen');
   setButtonIcon(reconnect, 'reconnect');
-  setButtonIcon(document.querySelector('[data-action="settings"]'), 'settings');
+  const settingsButton = document.querySelector('[data-action="settings"]');
+  setButtonIcon(settingsButton, 'settings');
+  if (bridge?.native) settingsButton.setAttribute('aria-expanded', String(Boolean(runtime.settingsOpen)));
   microphoneIndicator.update(runtime.microphoneLevels, runtime);
   screenButton.setAttribute('aria-pressed', String(Boolean(runtime.screenCaptureEnabled)));
   screenButton.dataset.state = runtime.screenCaptureEnabled ? 'active' : 'idle';
@@ -45,6 +60,15 @@ function renderControls(next = runtime) {
   lock.setAttribute('aria-label', runtime.scrollLocked ? 'Разблокировать прокрутку' : 'Заблокировать прокрутку');
   setButtonIcon(lock, runtime.scrollLocked ? 'lock' : 'unlock');
   reconnect.dataset.state = runtime.connectionStatus || 'unavailable';
+  const windowMode = runtime.windowMode === 'standard' ? 'standard' : 'overlay';
+  const windowButton = byId('window-mode-btn');
+  windowButton.setAttribute('aria-pressed', String(windowMode === 'standard'));
+  windowButton.setAttribute('aria-label', windowMode === 'standard'
+    ? 'Обычное окно. Переключить в защищённый оверлей'
+    : 'Защищённый оверлей. Переключить в обычное окно');
+  windowButton.dataset.mode = windowMode;
+  setButtonIcon(windowButton, windowMode === 'standard' ? 'window-standard' : 'window-overlay');
+  overlay.dataset.windowMode = windowMode;
   if (Boolean(runtime.scrollLocked) !== settings.scrollLocked) {
     settings = normalizeSettings({ ...settings, scrollLocked: Boolean(runtime.scrollLocked) });
     if (bridge) persist();
@@ -98,7 +122,7 @@ async function start() {
       modal?.updateAudioLevels(levels);
     },
     onScroll: scrollPanel,
-    onSettings: ({ open, tab, request }) => open ? modal?.open(tab || 'agent', request) : modal?.close(),
+    onSettings: payload => requestSettings({ tab: 'agent', ...payload }),
     onError: () => modal?.refresh(),
     onTurnStart: payload => {
       activeParser = payload?.format === 'tagged' ? parser : liveParser;
@@ -111,34 +135,58 @@ async function start() {
   settings = normalizeSettings(await bridge.loadSettings());
   applyTheme(settings);
 
-  modal = createSettingsModal({
-    bridge,
-    getSettings: () => settings,
-    onChange: next => applySettings(next),
-    onOpenChange(open) {
-      modalOpen = open;
-      geometry?.schedule();
-      return bridge.command('set_settings_open', { open }).catch(() => modal?.refresh());
-    },
-    getRuntimeState: () => bridge.getRuntimeState(),
+  if (bridge.native) {
+    modal = await createSettingsWindowHost({
+      bridge,
+      getSettings: () => settings,
+      onChange: next => applySettings(next),
+      onOpenChange(open) {
+        document.querySelector('[data-action="settings"]').setAttribute('aria-expanded', String(open));
+      },
+    });
+  } else {
+    modal = createSettingsModal({
+      bridge,
+      getSettings: () => settings,
+      onChange: next => applySettings(next),
+      onOpenChange(open) {
+        modalOpen = open;
+        geometry?.schedule();
+        return bridge.command('set_settings_open', { open }).catch(() => modal?.refresh());
+      },
+      getRuntimeState: () => bridge.getRuntimeState(),
+    });
+  }
+  geometry = createGeometrySync({ bridge, overlay, getSettings: () => settings, isModalOpen: () => !bridge.native && modalOpen });
+  windowInteraction = createWindowInteraction({
+    startDrag: () => bridge.native ? bridge.command('start_window_drag') : undefined,
+    onError: error => bridge.reportError(error),
   });
-  geometry = createGeometrySync({ bridge, overlay, getSettings: () => settings, isModalOpen: () => modalOpen });
   await bridge.command('set_scroll_locked', { locked: settings.scrollLocked });
   renderControls(bridge.getRuntimeState());
+  if (pendingSettingsRequest) {
+    const request = pendingSettingsRequest;
+    pendingSettingsRequest = null;
+    requestSettings(request);
+  }
 
   document.querySelector('#toolbar').addEventListener('click', async event => {
     const button = event.target.closest('button[data-action]');
     if (!button || modalOpen) return;
     const action = button.dataset.action;
-    if (action === 'settings') { modal.open(); return; }
+    if (action === 'settings') { requestSettings({ open: true, tab: 'appearance' }); return; }
     button.disabled = true;
     try {
       if (action === 'microphone') await bridge.command('set_microphone_muted', { muted: !runtime.microphoneMuted });
       if (action === 'screen') await bridge.command('set_screen_capture_enabled', { enabled: !runtime.screenCaptureEnabled });
       if (action === 'reconnect') await bridge.command('reconnect_session');
       if (action === 'scroll-lock') await bridge.command('set_scroll_locked', { locked: !runtime.scrollLocked });
-    } catch {
-      modal.open(action === 'microphone' || action === 'screen' ? 'sources' : 'agent');
+      if (action === 'window-mode') await bridge.command('set_window_mode', { mode: runtime.windowMode === 'standard' ? 'overlay' : 'standard' });
+    } catch (error) {
+      if (action === 'window-mode') {
+        byId('announcer').textContent = 'Не удалось изменить режим окна. ' + String(error?.message ?? error);
+        renderControls(bridge.getRuntimeState());
+      } else requestSettings({ open: true, tab: action === 'microphone' || action === 'screen' ? 'sources' : 'agent' });
     } finally { button.disabled = false; }
   });
 
@@ -163,7 +211,7 @@ async function start() {
   const demo = new URLSearchParams(location.search).get('demo');
   if (['text', 'code', 'settings', 'stream'].includes(demo)) {
     await playDemo(parser, demo, { signal: demoAbort.signal });
-    if (demo === 'settings') modal.open();
+    if (demo === 'settings') requestSettings({ open: true, tab: 'appearance' });
   }
   await renderer.flush();
   document.documentElement.dataset.ready = 'true';
@@ -173,6 +221,7 @@ window.addEventListener('pagehide', () => {
   clearTimeout(saveTimer);
   demoAbort.abort();
   microphoneIndicator.destroy();
+  windowInteraction?.destroy();
   geometry?.destroy();
   renderer.destroy();
   modal?.destroy();

@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-import { openNative } from './helpers/native.js';
+import { openNative, settingsPage } from './helpers/native.js';
 
 async function sendTurn(page, content, preserveCode = false) {
   await page.evaluate(({ content, preserveCode }) => {
@@ -29,21 +29,26 @@ test('native bridge ignores an older command reply after a newer hotkey state an
   await expect.poll(() => page.evaluate(() => window.__nativeContract.saves.at(-1)?.scrollLocked)).toBe(false);
 });
 
-test('settings wait for the native focus acknowledgement before moving keyboard focus into the modal', async ({ page }) => {
+test('native settings focus and visibility are isolated from the main overlay during a delayed open reply', async ({ page }) => {
   await openNative(page);
+  const bounds = await page.locator('#overlay').boundingBox();
+  const viewport = page.viewportSize();
   await page.evaluate(() => window.__nativeContract.delayNext('set_settings_open'));
   await page.locator('[data-action="settings"]').click();
-  await expect(page.locator('#settings-dialog')).toBeVisible();
+  const settings = await settingsPage(page);
+  await expect(settings.locator('#settings-dialog')).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.length)).toBe(1);
-  // Give an incorrectly scheduled focus callback two animation frames to run.
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  expect(await page.evaluate(() => Boolean(document.activeElement?.closest('#settings-dialog')))).toBe(false);
+  await expect(page.locator('#settings-dialog')).toHaveCount(0);
+  expect(await page.locator('#overlay').boundingBox()).toEqual(bounds);
+  expect(page.viewportSize()).toEqual(viewport);
+  await expect(settings.locator('#tab-appearance')).toBeFocused();
 
   await page.evaluate(() => window.__nativeContract.release('set_settings_open'));
-  await expect(page.locator('#tab-appearance')).toBeFocused();
-  await page.keyboard.press('Escape');
-  await expect(page.locator('#settings-dialog')).toBeHidden();
-  await expect.poll(() => page.evaluate(() => window.__nativeContract.calls.filter((call) => call.name === 'set_settings_open').at(-1)?.args.open)).toBe(false);
+  await expect(settings.locator('#tab-appearance')).toBeFocused();
+  await settings.keyboard.press('Escape');
+  await expect(settings.locator('#settings-dialog')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.calls.filter(call => call.name === 'set_settings_open').at(-1)?.args.open)).toBe(false);
+  expect(await page.locator('#overlay').boundingBox()).toEqual(bounds);
 });
 
 test('native response events preserve code during correction, resize back to short content and respect a small viewport', async ({ page }) => {

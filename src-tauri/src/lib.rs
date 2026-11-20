@@ -4,7 +4,7 @@ mod audio_commands;
 mod state;
 mod window_stealth;
 
-use state::{HitRects, OverlayState, RuntimeState};
+use state::{HitRects, OverlayState, RuntimeState, WindowMode};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -104,7 +104,7 @@ fn set_scroll_locked(
 }
 
 #[tauri::command]
-fn set_settings_open(
+async fn set_settings_open(
     window: WebviewWindow,
     state: State<'_, OverlayState>,
     open: bool,
@@ -112,8 +112,21 @@ fn set_settings_open(
     if !open {
         window.state::<audio::AudioState>().invalidate_test();
     }
-    window_stealth::set_settings_focus(&window, &state, open)?;
-    publish(window.app_handle(), state.snapshot()?)
+    window_stealth::set_settings_focus(window.app_handle(), &state, open).await
+}
+
+#[tauri::command]
+async fn set_window_mode(
+    window: WebviewWindow,
+    state: State<'_, OverlayState>,
+    mode: WindowMode,
+) -> Result<RuntimeState, String> {
+    window_stealth::set_window_mode(&window, &state, mode).await
+}
+
+#[tauri::command]
+fn start_window_drag(window: WebviewWindow, state: State<'_, OverlayState>) -> Result<(), String> {
+    window_stealth::drag_window(&window, &state)
 }
 
 #[tauri::command]
@@ -126,19 +139,21 @@ fn resize_overlay(
 }
 
 #[tauri::command]
-fn update_hit_rects(state: State<'_, OverlayState>, rects: HitRects) -> Result<(), String> {
+fn update_hit_rects(
+    window: WebviewWindow,
+    state: State<'_, OverlayState>,
+    rects: HitRects,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Only the main window may publish overlay hit rectangles".into());
+    }
     rects.validate()?;
     state.update(|data| data.rects = rects)?;
     Ok(())
 }
 
 fn open_settings(app: &AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or("Overlay window is unavailable")?;
-    let state = app.state::<OverlayState>();
-    window_stealth::set_settings_focus(&window, &state, true)?;
-    publish(app, state.snapshot()?)?;
+    // The primary WebView owns settings/audio state and opens the native child.
     app.emit("overlay:settings", SettingsEvent { open: true })
         .map_err(|error| error.to_string())
 }
@@ -162,9 +177,7 @@ fn retire_webview_session(app: &AppHandle) {
 }
 
 fn toggle_overlay_visibility(window: &WebviewWindow) -> Result<(), String> {
-    // A local microphone check follows the visible settings panel. Dictation
-    // keeps running when the non-focusable overlay is hidden or loses focus.
-    window.state::<audio::AudioState>().invalidate_test();
+    // Settings and its local microphone check have an independent lifecycle.
     window_stealth::toggle_visibility(window)
 }
 
@@ -276,18 +289,43 @@ pub fn run() {
         .manage(audio::AudioState::default())
         .plugin(tauri_plugin_store::Builder::default().build())
         .on_page_load(|webview, payload| {
-            if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
-            {
-                retire_webview_session(webview.app_handle());
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                if webview.label() == "main" {
+                    retire_webview_session(webview.app_handle());
+                } else if webview.label() == window_stealth::SETTINGS_LABEL {
+                    webview.state::<audio::AudioState>().invalidate_test();
+                }
             }
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if matches!(event, tauri::WindowEvent::Destroyed) {
                     retire_webview_session(window.app_handle());
-                } else if matches!(event, tauri::WindowEvent::Focused(false)) {
+                } else if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    // A hidden settings child must not keep a closed main app alive.
+                    api.prevent_close();
+                    window.app_handle().exit(0);
+                }
+            } else if window.label() == window_stealth::SETTINGS_LABEL {
+                let close = match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        Some(false)
+                    }
+                    tauri::WindowEvent::Destroyed => Some(true),
+                    tauri::WindowEvent::Focused(false) => {
+                        window.state::<audio::AudioState>().invalidate_test();
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(destroyed) = close {
                     window.state::<audio::AudioState>().invalidate_test();
+                    if let Err(error) =
+                        window_stealth::close_settings_from_native(window.app_handle(), destroyed)
+                    {
+                        report_error(window.app_handle(), error);
+                    }
                 }
             }
         })
@@ -308,6 +346,8 @@ pub fn run() {
             reconnect_session,
             set_scroll_locked,
             set_settings_open,
+            set_window_mode,
+            start_window_drag,
             resize_overlay,
             update_hit_rects
         ])
