@@ -3,10 +3,12 @@ import { expect } from '@playwright/test';
 const nativeWindows = new WeakMap();
 
 async function routeWindowEvent(record, { target, event, payload }) {
-  const label = typeof target === 'string' ? target : target?.label;
-  const recipient = label === 'main' ? record.main : label === 'settings' ? record.settings : null;
-  if (!recipient || recipient.isClosed()) return;
-  await recipient.evaluate(({ event, payload }) => window.__receiveNativeEvent?.(event, payload), { event, payload });
+  // Tauri emit_to visits every WebView: Any listeners also receive sibling
+  // window events. The registered listener target, not its owner, filters them.
+  await Promise.all([record.main, record.settings].filter(view => view && !view.isClosed()).map(view =>
+    view.evaluate(packet => window.__receiveNativeEvent?.(packet.event, packet.payload, packet.target),
+      { target, event, payload })));
+
 }
 
 async function installSettingsWindow(page, record) {
@@ -32,8 +34,15 @@ async function installSettingsWindow(page, record) {
     const listeners = new Map();
     let nextCallback = 1;
     window.__settingsNativeCalls = [];
-    window.__receiveNativeEvent = (event, payload) => {
-      for (const id of listeners.get(event) || []) callbacks.get(id)?.({ event, id, payload });
+    window.__receiveNativeEvent = (event, payload, target = { kind: 'Any' }) => {
+      const emitted = typeof target === 'string' ? { kind: 'AnyLabel', label: target } : target;
+      for (const listener of listeners.get(event) || []) {
+        const registered = listener.target;
+        const matches = emitted.kind === 'Any' || registered.kind === 'Any'
+          || emitted.kind === 'AnyLabel' && emitted.label === registered.label
+          || emitted.kind === registered.kind && emitted.label === registered.label;
+        if (matches) callbacks.get(listener.id)?.({ event, id: listener.id, payload });
+      }
     };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: 'settings' }, currentWebview: { label: 'settings' } },
@@ -47,11 +56,11 @@ async function installSettingsWindow(page, record) {
         window.__settingsNativeCalls.push({ name, args: { ...args } });
         if (name === 'plugin:event|listen') {
           const ids = listeners.get(args.event) || [];
-          ids.push(args.handler); listeners.set(args.event, ids);
+          ids.push({ id: args.handler, target: args.target || { kind: 'Any' } }); listeners.set(args.event, ids);
           return args.handler;
         }
         if (name === 'plugin:event|unlisten') {
-          listeners.set(args.event, (listeners.get(args.event) || []).filter(id => id !== args.eventId));
+          listeners.set(args.event, (listeners.get(args.event) || []).filter(listener => listener.id !== args.eventId));
           return null;
         }
         if (name === 'plugin:event|emit_to') return window.__routeNativeEvent(args);
@@ -96,6 +105,10 @@ export async function openNative(page, options = {}) {
     }
     if (record.settings && !record.settings.isClosed()) {
       await record.settings.evaluate(visible => { document.documentElement.dataset.nativeVisible = String(visible); }, open);
+      if (record.settingsVisible !== open) {
+        record.settingsVisible = open;
+        await routeWindowEvent(record, { target: 'settings', event: 'overlay:window-activity', payload: { active: open } });
+      }
     }
   });
   await page.exposeFunction('__applyNativeSize', async ({ width, height }) => {
@@ -183,8 +196,18 @@ export async function openNative(page, options = {}) {
         if (item.failure) item.reject(item.failure);
         else item.resolve(item.value);
       },
-      emit(event, payload) {
-        for (const id of listeners.get(event) || []) callbacks.get(id)?.({ event, id, payload });
+      emit(event, payload, target = { kind: 'Any' }) {
+        const emitted = typeof target === 'string' ? { kind: 'AnyLabel', label: target } : target;
+        for (const listener of listeners.get(event) || []) {
+          const registered = listener.target;
+          const matches = emitted.kind === 'Any' || registered.kind === 'Any'
+            || emitted.kind === 'AnyLabel' && emitted.label === registered.label
+            || emitted.kind === registered.kind && emitted.label === registered.label;
+          if (matches) callbacks.get(listener.id)?.({ event, id: listener.id, payload });
+        }
+      },
+      emitTo(target, event, payload) {
+        return window.__routeNativeEvent({ target, event, payload });
       },
       pushState(patch) {
         state = { ...state, ...patch, revision: state.revision + 1 };
@@ -241,13 +264,13 @@ export async function openNative(page, options = {}) {
       switch (name) {
         case 'plugin:event|listen': {
           const ids = listeners.get(args.event) || [];
-          ids.push(args.handler);
+          ids.push({ id: args.handler, target: args.target || { kind: 'Any' } });
           listeners.set(args.event, ids);
           return args.handler;
         }
         case 'plugin:event|emit_to': return window.__routeNativeEvent(args);
         case 'plugin:event|unlisten':
-          listeners.set(args.event, (listeners.get(args.event) || []).filter(id => id !== args.eventId));
+          listeners.set(args.event, (listeners.get(args.event) || []).filter(listener => listener.id !== args.eventId));
           return null;
         case 'get_runtime_state': return { ...state };
         case 'get_window_activity': return { active: true };

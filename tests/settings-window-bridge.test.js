@@ -18,7 +18,12 @@ function busFixture() {
   let hold = () => false;
   function deliver(packet) {
     queueMicrotask(() => {
-      for (const callback of listeners.get(packet.target + ':' + packet.event) || []) {
+      const emitted = typeof packet.target === 'string' ? { kind: 'AnyLabel', label: packet.target } : packet.target;
+      for (const { target, callback } of listeners.get(packet.event) || []) {
+        const matches = emitted.kind === 'Any' || target.kind === 'Any'
+          || emitted.kind === 'AnyLabel' && emitted.label === target.label
+          || emitted.kind === target.kind && emitted.label === target.label;
+        if (!matches) continue;
         try { Promise.resolve(callback({ event: packet.event, payload: structuredClone(packet.payload) })).catch(error => errors.push(error)); }
         catch (error) { errors.push(error); }
       }
@@ -30,12 +35,14 @@ function busFixture() {
     deliver,
     events(label) {
       return {
-        async listen(event, callback) {
-          const key = label + ':' + event;
-          const set = listeners.get(key) || new Set();
-          set.add(callback);
-          listeners.set(key, set);
-          return () => set.delete(callback);
+        async listen(event, callback, options = {}) {
+          const target = typeof options.target === 'string'
+            ? { kind: 'AnyLabel', label: options.target } : options.target || { kind: 'Any' };
+          const set = listeners.get(event) || new Set();
+          const listener = { target, callback };
+          set.add(listener);
+          listeners.set(event, set);
+          return () => set.delete(listener);
         },
         async emitTo(target, event, payload) {
           const packet = { source: label, target, event, payload: structuredClone(payload) };
@@ -315,11 +322,15 @@ test('settings activity is scoped to its own native event and a late initial que
   });
   await until(() => typeof resolveActivity === 'function');
   const native = owner.bus.events('native');
+  const anyActivity = [];
+  const unlistenAny = await owner.bus.events('main').listen('overlay:window-activity', ({ payload }) => anyActivity.push(payload.active));
+  t.after(unlistenAny);
   await native.emitTo('main', 'overlay:window-activity', { active: true });
   await turn();
   assert.deepEqual(activity, [], 'main-window activity must not affect the settings view');
   await native.emitTo('settings', 'overlay:window-activity', { active: false });
   await until(() => activity.length === 1);
+  assert.deepEqual(anyActivity, [true, false], 'Tauri Any listener also sees activity addressed to a sibling');
   resolveActivity({ active: true });
   const proxy = await opening;
   cleanup(t, owner, proxy);

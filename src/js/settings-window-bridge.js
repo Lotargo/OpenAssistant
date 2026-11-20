@@ -278,7 +278,9 @@ export async function createSettingsProxy({
       activityVersion++;
       onWindowActivity?.({ active: payload.active });
     };
-    unlisteners.push(await events.listen('overlay:window-activity', ({ payload }) => activity(payload)));
+    unlisteners.push(await events.listen('overlay:window-activity', ({ payload }) => activity(payload), {
+      target: { kind: 'WebviewWindow', label: 'settings' },
+    }));
     const initialActivityVersion = activityVersion;
     try {
       const initial = await nativeInvoke('get_window_activity');

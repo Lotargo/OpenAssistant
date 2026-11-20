@@ -822,7 +822,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       'assistant:turn-end': payload => onTurnEnd?.({ ...payload, format: 'tagged' }),
     };
     for (const [event, handler] of Object.entries(handlers)) {
-      unlisten.push(await listen(event, ({ payload }) => handler(payload)));
+      // Any-target listeners also receive activity emitted to sibling windows.
+      const options = event === 'overlay:window-activity'
+        ? { target: { kind: 'WebviewWindow', label: 'main' } } : undefined;
+      unlisten.push(await listen(event, ({ payload }) => handler(payload), options));
     }
     const initialActivityVersion = activityVersion;
     try {

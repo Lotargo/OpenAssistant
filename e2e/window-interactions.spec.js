@@ -235,3 +235,59 @@ test('scoped native activity restores both window gestures and main hit areas wi
     resizes: window.__nativeContract.resizes.length, width: innerWidth, height: innerHeight,
   }))).toEqual(before);
 });
+
+for (const closeVia of ['settings button', 'native close']) {
+  test('main drag remains available after ' + closeVia + ' without a restore event', async ({ page }) => {
+    await openNative(page);
+    await expect.poll(() => page.evaluate(() => Boolean(window.__nativeContract.hitRects?.drag))).toBe(true);
+    const before = await page.evaluate(() => ({
+      resizes: window.__nativeContract.resizes.length, width: innerWidth, height: innerHeight,
+    }));
+    const bounds = await page.locator('#overlay').boundingBox();
+    await page.evaluate(async () => {
+      window.__siblingActivity = [];
+      const handler = window.__TAURI_INTERNALS__.transformCallback(({ payload }) => window.__siblingActivity.push(payload.active));
+      await window.__TAURI_INTERNALS__.invoke('plugin:event|listen', {
+        event: 'overlay:window-activity', target: { kind: 'Any' }, handler,
+      });
+    });
+    const gesture = () => page.evaluate(() => {
+      const surface = document.querySelector('#drag-region');
+      const rect = surface.getBoundingClientRect();
+      const pointer = { bubbles: true, cancelable: true, pointerId: 21, pointerType: 'mouse', isPrimary: true,
+        button: 0, buttons: 1, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 };
+      const press = new PointerEvent('pointerdown', pointer);
+      surface.dispatchEvent(press);
+      surface.dispatchEvent(new PointerEvent('pointermove', { ...pointer, clientX: pointer.clientX + 10 }));
+      surface.dispatchEvent(new PointerEvent('pointerup', { ...pointer, clientX: pointer.clientX + 10, buttons: 0 }));
+      return press.defaultPrevented;
+    });
+    expect(await gesture()).toBe(true);
+    await expect.poll(() => dragCount(page)).toBe(1);
+    await page.locator('[data-action="settings"]').evaluate(button => button.click());
+    const settings = await settingsPage(page);
+    await expect(settings.locator('#settings-dialog')).toBeVisible();
+    await page.evaluate(() => {
+      window.__fixtureCloseLifecycle = [];
+      document.addEventListener('visibilitychange', () => window.__fixtureCloseLifecycle.push('visibilitychange'));
+      for (const event of ['focus', 'pageshow']) window.addEventListener(event, () => window.__fixtureCloseLifecycle.push(event));
+    });
+    if (closeVia === 'settings button') await settings.locator('[data-close-settings]').evaluate(button => button.click());
+    else await page.evaluate(() => window.__nativeContract.closeSettingsWindow());
+    await expect(settings.locator('#settings-dialog')).toBeHidden();
+    await expect.poll(() => page.evaluate(() => window.__siblingActivity)).toEqual([true, false]);
+    // Native hide sends settings:false to Any listeners, but the visible main
+    // window must remain interactive without focus, activity:true or restore.
+    expect(await gesture()).toBe(true);
+    await expect.poll(() => dragCount(page)).toBe(2);
+    expect(await page.evaluate(() => window.__nativeContract.dragStarts.at(-1))).toMatchObject({
+      windowLabel: 'main', settingsOpen: false,
+    });
+    expect(await page.evaluate(() => ({
+      resizes: window.__nativeContract.resizes.length, width: innerWidth, height: innerHeight,
+    }))).toEqual(before);
+    expect(await page.locator('#overlay').boundingBox()).toEqual(bounds);
+    expect(await page.evaluate(() => ({ events: window.__fixtureCloseLifecycle, hidden: document.hidden })))
+      .toEqual({ events: [], hidden: false });
+  });
+}
