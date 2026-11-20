@@ -120,10 +120,14 @@ test('stream append preserves an earlier paragraph, its text node and the reader
   renderer.update({ text: first + '\n\nНовый ответ', codeMeta: {} });
   await renderer.flush();
   const paragraph = elements.textContent.querySelector('p');
-  const textNode = paragraph.firstChild;
+  const walker = document.createTreeWalker(paragraph, dom.window.NodeFilter.SHOW_TEXT);
+  let textNode;
+  while ((textNode = walker.nextNode()) && !textNode.data.includes('выбранный')) {}
+  assert.ok(textNode, 'the selected word must remain real selectable text');
+  const offset = textNode.data.indexOf('выбранный');
   const range = document.createRange();
-  range.setStart(textNode, 10);
-  range.setEnd(textNode, 18);
+  range.setStart(textNode, offset);
+  range.setEnd(textNode, offset + 'выбранный'.length);
   const selection = dom.window.getSelection();
   selection.addRange(range);
   const selected = selection.toString();
@@ -131,10 +135,33 @@ test('stream append preserves an earlier paragraph, its text node and the reader
     renderer.update({ text: first + '\n\nНовый ответ' + ending, codeMeta: {} });
     await renderer.flush();
     assert.equal(elements.textContent.firstElementChild, paragraph);
-    assert.equal(paragraph.firstChild, textNode);
+    assert.equal(paragraph.contains(textNode), true);
     assert.equal(selection.toString(), selected);
   }
   assert.equal(elements.textContent.querySelector('strong').textContent, 'постепенно');
+  renderer.destroy();
+  dom.window.close();
+});
+
+test('stream layout preserves exact copy text, spaces and inline Markdown semantics', async () => {
+  const { dom, document, elements } = fixture();
+  const renderer = createRenderer(elements);
+  const source = 'Обычный **жирный** и _курсив_ — [ссылка](https://example.org).';
+  renderer.update({ text: source + '\n\nНовый абзац', codeMeta: {} });
+  await renderer.flush();
+  const paragraph = elements.textContent.querySelector('p');
+  const expected = 'Обычный жирный и курсив — ссылка.';
+  const copied = document.createRange();
+  copied.selectNodeContents(paragraph);
+  assert.equal(copied.toString(), expected);
+  assert.equal(paragraph.querySelector('strong').textContent, 'жирный');
+  assert.equal(paragraph.querySelector('em').textContent, 'курсив');
+  assert.equal(paragraph.querySelector('a').getAttribute('href'), 'https://example.org');
+  renderer.update({ text: source + '\n\nНовый абзац дополняется.', codeMeta: {} });
+  await renderer.flush();
+  assert.equal(paragraph.textContent, expected);
+  assert.equal(copied.toString(), expected);
+  assert.equal(paragraph.querySelector('a').getAttribute('rel'), 'noopener noreferrer');
   renderer.destroy();
   dom.window.close();
 });

@@ -1,8 +1,8 @@
 use crate::state::{OverlayState, RuntimeState, WindowMode, WindowRect};
 use serde::Serialize;
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
-    WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 
 pub const SETTINGS_LABEL: &str = "settings";
@@ -664,53 +664,140 @@ pub async fn drag_window(window: &WebviewWindow, state: &OverlayState) -> Result
 pub struct OverlaySize {
     pub width: f64,
     pub height: f64,
+    pub applied: bool,
 }
 
-pub fn resize(window: &WebviewWindow, width: f64, height: f64) -> Result<OverlaySize, String> {
+fn overlay_resize_rect(
+    current: WindowRect,
+    area: WindowRect,
+    scale: f64,
+    width: f64,
+    height: f64,
+) -> Result<WindowRect, String> {
+    if !scale.is_finite() || scale <= 0.0 || area.width == 0 || area.height == 0 {
+        return Err("Overlay monitor geometry is unavailable".into());
+    }
+    let max_width = area.width.min(i32::MAX as u32) as f64;
+    let max_height = area.height.min(i32::MAX as u32) as f64;
+    // Round the actual physical dimensions before deriving either anchor. Using
+    // fractional dimensions here moves the bottom by one pixel on some DPI scales.
+    let width = (width.clamp(320.0_f64.min(max_width / scale), max_width / scale) * scale)
+        .round()
+        .clamp(1.0, max_width) as u32;
+    let height = (height.clamp(120.0_f64.min(max_height / scale), max_height / scale) * scale)
+        .round()
+        .clamp(1.0, max_height) as u32;
+    let bottom = current.y as i64 + current.height as i64;
+    let left = area.x as i64;
+    let top = area.y as i64;
+    let x = (current.x as i64 + (current.width as i64 - width as i64) / 2)
+        .clamp(left, left + area.width as i64 - width as i64);
+    let y = (bottom - height as i64).clamp(top, top + area.height as i64 - height as i64);
+    Ok(WindowRect {
+        x: x as i32,
+        y: y as i32,
+        width,
+        height,
+    })
+}
+
+fn resize_on_main_thread(
+    window: &WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Result<OverlaySize, String> {
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let current_size = window.outer_size().map_err(|error| error.to_string())?;
+    // A resize queued before minimize/hide must not rewrite the iconic window's
+    // position or become a successfully cached target in the WebView.
+    if !window.is_visible().map_err(|error| error.to_string())?
+        || window.is_minimized().map_err(|error| error.to_string())?
+    {
+        return Ok(OverlaySize {
+            width: current_size.width as f64 / scale,
+            height: current_size.height as f64 / scale,
+            applied: false,
+        });
+    }
+    let current_pos = window.outer_position().map_err(|error| error.to_string())?;
+    let current = WindowRect {
+        x: current_pos.x,
+        y: current_pos.y,
+        width: current_size.width,
+        height: current_size.height,
+    };
+    let area = current_work_area(window)?.unwrap_or(WindowRect {
+        x: 0,
+        y: 0,
+        width: (1920.0 * scale).round() as u32,
+        height: (1080.0 * scale).round() as u32,
+    });
+    let rect = overlay_resize_rect(current, area, scale, width, height)?;
+    if rect != current {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+            };
+            let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+            // The main window is frameless with shadows disabled. One operation
+            // keeps its bottom fixed throughout WM_WINDOWPOSCHANGED/WM_SIZE;
+            // neither focus nor z-order changes, and normal Tao events still run.
+            let success = unsafe {
+                SetWindowPos(
+                    hwnd.0,
+                    std::ptr::null_mut(),
+                    rect.x,
+                    rect.y,
+                    rect.width as i32,
+                    rect.height as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+            if success == 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            window
+                .set_size(PhysicalSize::new(rect.width, rect.height))
+                .map_err(|error| error.to_string())?;
+            window
+                .set_position(PhysicalPosition::new(rect.x, rect.y))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(OverlaySize {
+        width: rect.width as f64 / scale,
+        height: rect.height as f64 / scale,
+        applied: true,
+    })
+}
+
+pub async fn resize(
+    window: &WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Result<OverlaySize, String> {
     if window.label() != "main" {
         return Err("Only the main overlay can use content resizing".into());
     }
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Err("Overlay dimensions must be finite and positive".into());
     }
-    let scale = window.scale_factor().map_err(|error| error.to_string())?;
-    let current_size = window.outer_size().map_err(|error| error.to_string())?;
-    let current_pos = window.outer_position().map_err(|error| error.to_string())?;
-    let monitor = window
-        .current_monitor()
-        .map_err(|error| error.to_string())?
-        .or(window
-            .primary_monitor()
-            .map_err(|error| error.to_string())?);
-    let (left, top, max_width, max_height) = monitor
-        .map(|monitor| {
-            let area = monitor.work_area();
-            (
-                area.position.x as f64,
-                area.position.y as f64,
-                area.size.width as f64,
-                area.size.height as f64,
-            )
+    let target = window.clone();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    // Read the current position and apply it on the same UI turn. No state mutex
+    // is held while waiting; a drag or restore cannot interleave the two halves.
+    window
+        .run_on_main_thread(move || {
+            let _ = result_tx.send(resize_on_main_thread(&target, width, height));
         })
-        .unwrap_or((0.0, 0.0, 1920.0 * scale, 1080.0 * scale));
-    let actual_width = width.clamp(320.0_f64.min(max_width / scale), max_width / scale);
-    let actual_height = height.clamp(120.0_f64.min(max_height / scale), max_height / scale);
-    let physical_width = actual_width * scale;
-    let physical_height = actual_height * scale;
-    let center = current_pos.x as f64 + current_size.width as f64 / 2.0;
-    let bottom = current_pos.y as f64 + current_size.height as f64;
-    let x = (center - physical_width / 2.0).clamp(left, left + max_width - physical_width);
-    let y = (bottom - physical_height).clamp(top, top + max_height - physical_height);
-    window
-        .set_size(LogicalSize::new(actual_width, actual_height))
         .map_err(|error| error.to_string())?;
-    window
-        .set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))
-        .map_err(|error| error.to_string())?;
-    Ok(OverlaySize {
-        width: actual_width,
-        height: actual_height,
-    })
+    result_rx
+        .await
+        .map_err(|_| "Window closed before the resize could be applied".to_owned())?
 }
 
 pub fn initialize(window: &WebviewWindow) -> Result<(), String> {
@@ -1139,6 +1226,89 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_fractional_dpi_content_growth_keeps_the_bottom_anchor_exact() {
+        let area = WindowRect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+        };
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let height = (144.0_f64 * scale).round() as u32;
+            let mut rect = WindowRect {
+                x: 100,
+                y: 1000 - height as i32,
+                width: (900.0 * scale).round() as u32,
+                height,
+            };
+            for desired in (144..400).chain((144..400).rev()) {
+                rect = overlay_resize_rect(rect, area, scale, 900.0, desired as f64).unwrap();
+                assert_eq!(rect.y as i64 + rect.height as i64, 1000, "scale={scale}");
+                assert_eq!(rect.x, 100);
+                assert_eq!(rect.height, (desired as f64 * scale).round() as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn alternating_text_and_code_widths_do_not_accumulate_horizontal_rounding() {
+        let area = WindowRect {
+            x: -2560,
+            y: 0,
+            width: 2560,
+            height: 1400,
+        };
+        let original = WindowRect {
+            x: -1800,
+            y: 800,
+            width: 1125,
+            height: 180,
+        };
+        let mut rect = original;
+        for _ in 0..50 {
+            rect = overlay_resize_rect(rect, area, 1.25, 1280.0, 300.0).unwrap();
+            assert!(
+                (2 * rect.x + rect.width as i32 - (2 * original.x + original.width as i32)).abs()
+                    <= 1
+            );
+            rect = overlay_resize_rect(rect, area, 1.25, 900.0, 144.0).unwrap();
+            assert_eq!(rect, original);
+        }
+    }
+
+    #[test]
+    fn content_resize_clamps_to_the_current_work_area_in_physical_pixels() {
+        let area = WindowRect {
+            x: -1600,
+            y: -900,
+            width: 1600,
+            height: 860,
+        };
+        let current = WindowRect {
+            x: -1800,
+            y: -1000,
+            width: 900,
+            height: 144,
+        };
+        let clamped = overlay_resize_rect(current, area, 1.5, 900.0, 400.0).unwrap();
+        assert_eq!(
+            clamped,
+            WindowRect {
+                x: -1600,
+                y: -900,
+                width: 1350,
+                height: 600
+            }
+        );
+        assert_eq!(
+            overlay_resize_rect(current, area, 1.5, 8000.0, 8000.0).unwrap(),
+            area
+        );
+        assert!(overlay_resize_rect(current, area, 0.0, 900.0, 144.0).is_err());
+        assert!(overlay_resize_rect(current, area, f64::NAN, 900.0, 144.0).is_err());
+    }
 
     #[test]
     fn settings_has_own_focus_while_main_keeps_the_selected_window_policy() {

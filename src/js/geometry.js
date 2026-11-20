@@ -22,10 +22,20 @@ function visibleRect(element) {
   return width > 0 && height > 0 ? { x, y, width, height } : null;
 }
 
+function intersectRect(rect, bounds) {
+  if (!rect || !bounds) return null;
+  const x = Math.max(rect.x, bounds.x);
+  const y = Math.max(rect.y, bounds.y);
+  const width = Math.min(rect.x + rect.width, bounds.x + bounds.width) - x;
+  const height = Math.min(rect.y + rect.height, bounds.y + bounds.height) - y;
+  return width > 0 && height > 0 ? { x, y, width, height } : null;
+}
+
 export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }) {
   let stopped = false;
   let windowActive = true;
-  let timer = null;
+  let sizeFrame = null;
+  let sizeEpoch = 0;
   let rectFrame;
   let lastSize = '';
   let lastRects = '';
@@ -39,18 +49,31 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
   async function syncRects() {
     if (stopped || !windowActive || !bridge.native || document.hidden || window.innerWidth <= 0 || window.innerHeight <= 0) return;
     const epoch = rectEpoch;
+    const surface = intersectRect(visibleRect(overlay), {
+      x: 0, y: 0, width: window.innerWidth, height: window.innerHeight,
+    });
+    const panelRect = id => intersectRect(visibleRect(byId(id)), surface);
+    const text = panelRect('text-panel');
+    const code = panelRect('code-panel');
+    const notes = panelRect('notes-panel');
+    const backgrounds = (id, bounds = panelRect(id)) => getBackgroundDragRects(byId(id))
+      .map(rect => intersectRect(rect, bounds))
+      .filter(rect => rect && rect.width >= 2 && rect.height >= 2);
     const rects = {
-      toolbar: visibleRect(byId('toolbar')),
-      drag: visibleRect(byId('drag-region')),
-      dragAreas: ['text-panel', 'split-view', 'notes-panel']
-        .flatMap(id => getBackgroundDragRects(byId(id))).slice(0, 24),
-      text: visibleRect(byId('text-panel')),
-      code: visibleRect(byId('code-panel')),
-      notes: visibleRect(byId('notes-panel')),
+      toolbar: panelRect('toolbar'),
+      drag: panelRect('drag-region'),
+      // The inner text layout can exceed the animated viewport. Empty space is
+      // draggable only where it is visible, never in the transparent envelope.
+      dragAreas: [
+        ...backgrounds('text-panel', text), ...backgrounds('text-layout', text),
+        ...backgrounds('split-view'), ...backgrounds('notes-panel', notes),
+      ].slice(0, 24),
+      text, code, notes,
       // Native settings live in another window and cannot intercept this one.
       modal: null,
       scrollbars: getSettings().scrollLocked ? []
-        : ['text-panel', 'code-panel', 'notes-panel'].flatMap(id => getScrollbarRects(byId(id))),
+        : ['text-panel', 'code-panel', 'notes-panel'].flatMap(id =>
+          getScrollbarRects(byId(id)).map(rect => intersectRect(rect, panelRect(id))).filter(Boolean)),
     };
     const signature = JSON.stringify(rects);
     if (signature === lastRects) return;
@@ -79,9 +102,9 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     const code = byId('code-panel');
     const notes = byId('notes-panel');
     const toolbarHeight = byId('toolbar')?.getBoundingClientRect().height || 56;
-    // scrollHeight includes the pane's padding; use the content's natural height,
-    // never the current window height, to avoid a resize feedback loop.
-    const textHeight = byId('text-content')?.scrollHeight ?? 0;
+    // Measure the normal layout box, not scrollable overflow: animated word
+    // transforms can extend scrollHeight without changing the natural text size.
+    const textHeight = byId('text-content')?.getBoundingClientRect().height ?? 0;
     const codeHeight = byId('code-content')?.querySelector('pre')?.scrollHeight || 64;
     const notesHeight = byId('notes-content')?.scrollHeight || 64;
     const verticalPadding = element => {
@@ -103,18 +126,38 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
       modalOpen,
     });
     if (bridge.native) {
+      const heightValue = `${size.height}px`;
+      const toolbarValue = `${toolbarHeight}px`;
+      const capValue = String(size.height >= size.maxHeight);
+      if (overlay.style.getPropertyValue('--output-target-height') !== heightValue
+        || overlay.style.getPropertyValue('--output-toolbar-height') !== toolbarValue
+        || overlay.dataset.outputAtCap !== capValue) {
+        overlay.dispatchEvent(new overlay.ownerDocument.defaultView.Event('output:beforelayout'));
+      }
       overlay.style.setProperty('--overlay-max-height', `${size.maxHeight}px`);
+      // Layout uses the final content box while only the visual surface grows.
+      // New text must not overflow a temporary animation-height scroll viewport.
+      overlay.style.setProperty('--output-target-height', heightValue);
+      overlay.style.setProperty('--output-toolbar-height', toolbarValue);
+      overlay.dataset.outputLayout = 'target';
+      overlay.dataset.outputAtCap = capValue;
+      overlay.dispatchEvent(new overlay.ownerDocument.defaultView.Event('output:layout'));
       const signature = `${size.width}:${size.height}`;
       if (signature !== lastSize) {
         resizing = true;
+        const epoch = sizeEpoch;
         const finishGrowth = outputGrowth.prepare(size.height, split ? 'code' : 'text');
         try {
-          await bridge.resize(size.width, size.height);
+          const result = await bridge.resize(size.width, size.height);
+          if (stopped || epoch !== sizeEpoch || !windowActive || document.hidden || result?.applied === false) {
+            finishGrowth(false);
+            return;
+          }
           lastSize = signature;
           finishGrowth();
         } catch (error) {
           finishGrowth(false);
-          bridge.reportError(error);
+          if (!stopped && epoch === sizeEpoch && windowActive && !document.hidden) bridge.reportError(error);
         } finally {
           resizing = false;
           if (resizeAgain) { resizeAgain = false; schedule(); }
@@ -126,16 +169,16 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
 
   function schedule() {
     if (stopped || !windowActive || document.hidden) {
-      clearTimeout(timer);
-      timer = null;
+      cancelAnimationFrame(sizeFrame);
+      sizeFrame = null;
       return;
     }
-    // Throttle rather than debounce: a continuous 70ms stream must still grow
-    // before it ends, with the latest natural content height at each resize.
-    if (timer === null) timer = setTimeout(() => {
-      timer = null;
+    // Measure the latest render before the next paint. A timer here creates a
+    // temporary overflow/scroll frame before the native envelope can grow.
+    if (sizeFrame === null) sizeFrame = requestAnimationFrame(() => {
+      sizeFrame = null;
       void resize();
-    }, 90);
+    });
     requestRects();
   }
 
@@ -145,11 +188,20 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     lastRects = '';
     cancelAnimationFrame(rectFrame);
     rectFrame = null;
-    // Keep lastSize: restoring input regions must not overwrite a user's window size.
+    if (document.hidden) {
+      sizeEpoch++;
+      outputGrowth.cancel();
+    }
+    // Keep acknowledged lastSize: input-region restoration alone must not resize.
     schedule();
   }
 
-  const observer = new ResizeObserver(schedule);
+  const observer = new ResizeObserver(entries => {
+    // A visual height transition changes hit regions, not natural content size.
+    // Observing it as new content would keep restarting the growth measurement.
+    if (entries.some(entry => entry.target !== overlay)) schedule();
+    else requestRects();
+  });
   for (const id of ['overlay', 'text-content', 'code-content', 'notes-content']) {
     const element = byId(id);
     if (element) observer.observe(element);
@@ -165,16 +217,19 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
   return {
     schedule,
     setActive(active) {
-      windowActive = active !== false;
+      const next = active !== false;
+      if (windowActive !== next) sizeEpoch++;
+      windowActive = next;
       if (!windowActive) outputGrowth.cancel();
       refreshViewport();
     },
     destroy() {
       stopped = true;
       rectEpoch++;
+      sizeEpoch++;
       observer.disconnect();
       outputGrowth.destroy();
-      clearTimeout(timer);
+      cancelAnimationFrame(sizeFrame);
       cancelAnimationFrame(rectFrame);
       for (const panel of scrollSources) panel.removeEventListener('scroll', requestRects);
       window.removeEventListener('resize', refreshViewport);

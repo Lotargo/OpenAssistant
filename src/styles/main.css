@@ -43,7 +43,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: roun
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025);
   font-size: var(--font-size);
   line-height: 1.5;
-  transition: width 180ms ease, max-height 180ms ease, height 180ms ease;
+  transition: width 180ms ease, max-height 180ms ease, height 220ms linear;
 }
 
 /* The native window may be slightly taller than measured content. Pin the
@@ -62,11 +62,16 @@ body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; he
 .scroll-panel::-webkit-scrollbar, .settings-dialog::-webkit-scrollbar, .settings-main::-webkit-scrollbar { width: 8px; height: 8px; }
 .scroll-panel::-webkit-scrollbar-track, .settings-main::-webkit-scrollbar-track { background: rgba(255,255,255,.035); border-radius: 8px; }
 .scroll-panel::-webkit-scrollbar-thumb, .settings-dialog::-webkit-scrollbar-thumb, .settings-main::-webkit-scrollbar-thumb { border: 2px solid transparent; background: rgba(202,207,215,.34); background-clip: padding-box; border-radius: 8px; }
-.text-panel { display: flex; flex-direction: column; padding: 24px 28px; flex: 1 1 auto; max-height: var(--content-max-height, none); }
-/* Auto margins center a short response, but resolve to zero on overflow so the
-   beginning of a long response remains reachable by normal scrolling. */
-.text-panel > .markdown-content { flex: 0 0 auto; width: 100%; max-width: 72ch; margin: auto; text-align: center; }
-.text-panel > .markdown-content :is(ul, ol, pre, table, blockquote) { text-align: left; }
+.text-panel { --output-padding-block: 48px; display: flex; flex-direction: column; padding: 24px 28px; flex: 1 1 auto; max-height: var(--content-max-height, none); overflow-anchor: none; overflow-x: hidden; scrollbar-gutter: stable both-edges; }
+/* Layout uses the final available height while the outer surface reveals it.
+   Appending a line must not scroll down and then back up as the window grows. */
+.output-layout { display: flex; flex-direction: column; flex: 0 0 auto; width: 100%; max-width: 72ch; min-height: min-content; margin: 0 auto; cursor: auto; }
+.overlay[data-output-layout="target"][data-mode="text"] .output-layout { height: max(100%, calc(var(--output-target-height) - var(--output-toolbar-height) - var(--output-padding-block) - 2px)); }
+.overlay[data-output-layout="target"][data-output-at-cap="false"][data-mode="text"] .text-panel { overflow-y: hidden; }
+.text-panel > .markdown-content, .output-layout > .markdown-content { flex: 0 0 auto; width: 100%; max-width: 72ch; margin: auto; text-align: center; overflow: clip; }
+.text-panel > .markdown-content :is(ul, ol, pre, table, blockquote),
+.output-layout > .markdown-content :is(ul, ol, pre, table, blockquote) { text-align: left; }
+.output-word { display: inline-block; max-width: 100%; vertical-align: baseline; overflow-wrap: anywhere; }
 .text-panel:empty { min-height: 56px; }
 .markdown-content { overflow-wrap: anywhere; }
 .markdown-content > :first-child { margin-top: 0; }
@@ -194,7 +199,7 @@ body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; he
 
 @media (max-width: 720px) {
   .overlay { border-radius: 17px; }
-  .text-panel { padding: 22px 20px; }
+  .text-panel { --output-padding-block: 44px; padding: 22px 20px; }
   .split-view { padding: 14px; gap: 10px; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
   .notes-panel { padding: 14px; }
   .toolbar { --toolbar-gap: 8px; }

@@ -1,6 +1,6 @@
 import { marked } from 'marked';
 import createDOMPurify from 'dompurify';
-import { createOutputReveal } from './output-motion.js';
+import { createOutputReveal, createWordMotion, createScrollFollow } from './output-motion.js';
 
 const LANGUAGE_LOADERS = {
   sql: () => import('@shikijs/langs/sql'),
@@ -71,12 +71,73 @@ export function createMarkdownRenderer(document) {
   };
 }
 
+const PROSE_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+const MAX_WORDS_PER_BLOCK = 384;
+const MAX_WORDS_PER_RESPONSE = 2048;
+
+/** Trusted wrappers are added after sanitization; whitespace and inline markup stay intact. */
+function createProseDecorator() {
+  let cache = new WeakMap();
+  let total = 0;
+  function wrap(block, budget) {
+    let count = 0;
+    const document = block.ownerDocument;
+    function walk(parent) {
+      for (const node of [...parent.childNodes]) {
+        if (count >= budget) break;
+        if (node.nodeType === 3) {
+          const parts = node.data.match(/\S+|\s+/gu) || [];
+          const fragment = document.createDocumentFragment();
+          for (const part of parts) {
+            if (!/\s/u.test(part) && count < budget) {
+              const word = document.createElement('span');
+              word.className = 'output-word';
+              word.textContent = part;
+              fragment.append(word);
+              count++;
+            } else fragment.append(document.createTextNode(part));
+          }
+          node.replaceWith(fragment);
+        } else if (node.nodeType === 1 && !['CODE', 'PRE'].includes(node.nodeName)) walk(node);
+      }
+    }
+    walk(block);
+    if (count) block.classList.add('output-prose');
+    return count;
+  }
+  return {
+    prepare(current, next) {
+      if (next.nodeType !== 1 || !PROSE_TAGS.has(next.nodeName)) return null;
+      const source = next.innerHTML;
+      const old = current && cache.get(current);
+      if (current?.nodeName === next.nodeName && old?.source === source) return { skip: true };
+      const budget = Math.max(0, Math.min(MAX_WORDS_PER_BLOCK, MAX_WORDS_PER_RESPONSE - total + (old?.count || 0)));
+      return { source, count: wrap(next, budget) };
+    },
+    commit(retained, old, prepared) {
+      if (old && cache.has(old)) { total -= cache.get(old).count; cache.delete(old); }
+      if (prepared) { cache.set(retained, prepared); total += prepared.count; }
+    },
+    remove(node) {
+      if (cache.has(node)) { total -= cache.get(node).count; cache.delete(node); }
+    },
+    reset() { cache = new WeakMap(); total = 0; },
+  };
+}
+
 // Incoming nodes have already passed the Markdown sanitizer. Keep unchanged
 // blocks and text nodes in place so streaming does not reset selection or links.
-function reconcileMarkdown(parent, incoming) {
+function reconcileMarkdown(parent, incoming, prose = null) {
   let current = parent.firstChild;
   for (const next of [...incoming.childNodes]) {
-    if (!current) { parent.append(next); continue; }
+    const prepared = prose?.prepare(current, next);
+    if (prepared?.skip) { current = current.nextSibling; continue; }
+    if (!current) {
+      parent.append(next);
+      prose?.commit(next, null, prepared);
+      continue;
+    }
+    const old = current;
     let retained = current;
     if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
       parent.replaceChild(next, current);
@@ -98,10 +159,12 @@ function reconcileMarkdown(parent, incoming) {
         retained = next;
       }
     }
+    prose?.commit(retained, old, prepared);
     current = retained.nextSibling;
   }
   while (current) {
     const next = current.nextSibling;
+    prose?.remove(current);
     current.remove();
     current = next;
   }
@@ -163,6 +226,82 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
   const window = document.defaultView;
   const renderMarkdown = createMarkdownRenderer(document);
   const outputReveal = createOutputReveal(textContent);
+  const prose = createProseDecorator();
+  const textPanel = scrollContainer(textContent);
+  const overlay = textContent.closest('#overlay');
+  if (overlay && textContent.parentElement.id !== 'text-layout') {
+    const layout = document.createElement('div');
+    layout.id = 'text-layout';
+    layout.className = 'output-layout';
+    layout.dataset.windowDrag = 'background';
+    textContent.before(layout);
+    layout.append(textContent);
+  }
+  const wordMotion = createWordMotion(textContent);
+  let pendingScroll = null;
+  let layoutBefore = null;
+  let responseReset = false;
+  const scrollFollow = createScrollFollow(textPanel, () => {
+    if (pendingScroll) pendingScroll = {
+      follow: false, top: textPanel.scrollTop, left: textPanel.scrollLeft, scrollRevision: scrollFollow.revision,
+    };
+  });
+  const naturalScrollHeight = () => {
+    const style = window.getComputedStyle(textPanel);
+    return textContent.getBoundingClientRect().height + parseFloat(style.paddingTop || 0) + parseFloat(style.paddingBottom || 0);
+  };
+  const targetPanelHeight = () => Math.max(textPanel.clientHeight,
+    (parseFloat(overlay?.style.getPropertyValue('--output-target-height')) || 0)
+    - (parseFloat(overlay?.style.getPropertyValue('--output-toolbar-height')) || 0) - 2);
+  function respectUserScroll() {
+    if (pendingScroll && Math.abs(textPanel.scrollTop - pendingScroll.top) > 2
+      && !scrollFollow.ownsPositionSince(pendingScroll.scrollRevision)) scrollFollow.interrupt();
+  }
+  const beforeLayout = () => {
+    respectUserScroll();
+    layoutBefore = { words: wordMotion.capture(), height: parseFloat(overlay.style.getPropertyValue('--output-target-height')) || 0 };
+  };
+  const afterLayout = () => {
+    // At the height cap geometry still commits, but does not emit beforelayout.
+    // A user's wheel/scrollbar movement between render and this pass wins.
+    if (!layoutBefore) respectUserScroll();
+    if (pendingScroll) {
+      const { follow, top, left } = pendingScroll;
+      if (follow && overlay.dataset.outputAtCap === 'true') {
+        scrollFollow.follow(Math.max(0, naturalScrollHeight() - targetPanelHeight()));
+      } else {
+        scrollFollow.cancel();
+        textPanel.scrollTop = follow ? 0 : top;
+      }
+      textPanel.scrollLeft = left;
+      pendingScroll = null;
+    }
+    if (layoutBefore) {
+      const height = parseFloat(overlay.style.getPropertyValue('--output-target-height')) || 0;
+      if (height < layoutBefore.height) wordMotion.cancel();
+      else wordMotion.play(layoutBefore.words);
+    }
+    layoutBefore = null;
+  };
+  overlay?.addEventListener('output:beforelayout', beforeLayout);
+  overlay?.addEventListener('output:layout', afterLayout);
+  function renderText(render, autoScroll) {
+    if (overlay?.dataset.outputLayout !== 'target') {
+      preserveScroll(textContent, render, autoScroll);
+      return;
+    }
+    const top = textPanel.scrollTop, left = textPanel.scrollLeft;
+    const following = scrollFollow.active || (overlay.dataset.outputAtCap !== 'true'
+      ? top <= 2 : naturalScrollHeight() - targetPanelHeight() - top <= 2);
+    const carriedFollow = pendingScroll?.follow && (Math.abs(top - pendingScroll.top) <= 2
+      || scrollFollow.ownsPositionSince(pendingScroll.scrollRevision));
+    pendingScroll = { follow: autoScroll && (following || carriedFollow), top, left, scrollRevision: scrollFollow.revision };
+    render();
+    // Target layout is published on the next geometry pass. Never jump to the
+    // bottom of the temporarily smaller visual viewport in between.
+    textPanel.scrollTop = top;
+    textPanel.scrollLeft = left;
+  }
   let latest = null;
   let revision = 0;
   let renderedRevision = 0;
@@ -186,10 +325,15 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
     const autoScroll = Boolean(getAutoScroll());
     for (const [key, element] of [['text', textContent], ['notes', notesContent]]) {
       const value = current[key] || '';
-      if (value !== previous[key]) {
-        const firstText = key === 'text' && !previous.text?.trim() && Boolean(value.trim());
-        if (key === 'text' && !value.trim()) outputReveal.cancel();
-        preserveScroll(element, () => reconcileMarkdown(element, renderMarkdown(value)), autoScroll);
+      if (value !== previous[key] || key === 'text' && responseReset) {
+        const firstText = key === 'text' && (responseReset || !previous.text?.trim()) && Boolean(value.trim());
+        if (key === 'text') {
+          if (!value.trim()) { outputReveal.cancel(); wordMotion.cancel(); }
+          const before = responseReset ? new Map() : wordMotion.capture();
+          renderText(() => reconcileMarkdown(element, renderMarkdown(value), prose), autoScroll);
+          wordMotion.play(before);
+          responseReset = false;
+        } else preserveScroll(element, () => reconcileMarkdown(element, renderMarkdown(value)), autoScroll);
         previous[key] = value;
         if (firstText) outputReveal.start();
       }
@@ -248,6 +392,15 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
 
   function update(value) {
     if (destroyed) return;
+    if (value.text === '' && latest?.text) {
+      responseReset = true;
+      outputReveal.cancel();
+      wordMotion.cancel();
+      scrollFollow.cancel();
+      prose.reset();
+      pendingScroll = null;
+      layoutBefore = null;
+    }
     latest = { ...value, codeMeta: { ...value.codeMeta } };
     revision += 1;
     if (timeout !== null || animationFrame !== null || running) return;
@@ -271,8 +424,12 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
     destroyed = true;
     cancelScheduled();
     outputReveal.destroy();
+    wordMotion.destroy();
+    scrollFollow.destroy();
+    overlay?.removeEventListener('output:beforelayout', beforeLayout);
+    overlay?.removeEventListener('output:layout', afterLayout);
     latest = null;
   }
 
-  return { update, flush, destroy };
+  return { update, flush, destroy, noteUserScroll: scrollFollow.interrupt };
 }

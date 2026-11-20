@@ -206,8 +206,8 @@ export async function openNative(page, options = {}) {
   });
   await page.addInitScript((options) => {
     window.isTauri = true;
-    Object.defineProperty(screen, 'availWidth', { configurable: true, get: () => 1440 });
-    Object.defineProperty(screen, 'availHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(screen, 'availWidth', { configurable: true, get: () => options.screen?.width || 1440 });
+    Object.defineProperty(screen, 'availHeight', { configurable: true, get: () => options.screen?.height || 1000 });
     let nextCallback = 1;
     let nextSession = 1;
     let nextTask = 1;
@@ -498,7 +498,7 @@ export async function openNative(page, options = {}) {
         case 'resize_overlay':
           harness.resizes.push({ width: args.width, height: args.height });
           if (harness.applyResizes) await window.__applyNativeSize(args);
-          return { width: innerWidth, height: innerHeight };
+          return { width: innerWidth, height: innerHeight, applied: true };
         case 'update_hit_rects':
           harness.hitRects = args.rects;
           return null;

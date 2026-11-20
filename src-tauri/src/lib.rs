@@ -140,12 +140,12 @@ async fn start_window_drag(
 }
 
 #[tauri::command]
-fn resize_overlay(
+async fn resize_overlay(
     window: WebviewWindow,
     width: f64,
     height: f64,
 ) -> Result<window_stealth::OverlaySize, String> {
-    window_stealth::resize(&window, width, height)
+    window_stealth::resize(&window, width, height).await
 }
 
 #[tauri::command]

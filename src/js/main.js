@@ -219,6 +219,7 @@ let activeParser = liveParser;
 
 function scrollPanel({ target, deltaY }) {
   if (settings.scrollLocked || modalOpen || !['text', 'code', 'notes'].includes(target) || !Number.isFinite(deltaY)) return;
+  if (target === 'text') renderer.noteUserScroll();
   byId(`${target}-panel`)?.scrollBy({ top: deltaY, behavior: 'instant' });
 }
 

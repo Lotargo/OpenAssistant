@@ -1229,7 +1229,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       catch (error) { reportError('Не удалось прочитать настройки: ' + String(error)); return null; }
     },
     saveSettings(settings) { return saveValue('appearance', APPEARANCE_KEY, settings); },
-    async resize(width, height) { if (native) await invoke('resize_overlay', { width, height }); },
+    async resize(width, height) { if (native) return invoke('resize_overlay', { width, height }); },
     async updateHitRects(rects) { if (native) await invoke('update_hit_rects', { rects }); },
     async destroy() {
       destroyed = true;
