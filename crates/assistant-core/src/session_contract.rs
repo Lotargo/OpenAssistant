@@ -9,6 +9,7 @@ struct Fixture {
     log: PathBuf,
     input: mpsc::Sender<SessionInput>,
     events: mpsc::Receiver<Value>,
+    voice_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     task: Option<tokio::task::JoinHandle<Result<(), SafeError>>>,
 }
 impl Fixture {
@@ -37,6 +38,8 @@ impl Fixture {
             custom_name: default_custom_name(),
             custom_instructions: custom_instructions.into(),
             custom_behavior: CustomBehavior::default(),
+            silence_timeout_secs: default_silence_timeout_secs(),
+            agent_auto_end: true,
             workspace: root.clone(),
             model: None,
             effort: None,
@@ -63,15 +66,21 @@ impl Fixture {
         ]);
         let (input, input_rx) = mpsc::channel(64);
         let (events_tx, events) = mpsc::channel(128);
+        let voice_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempted = voice_attempts.clone();
         let task = tokio::spawn(async move {
             // Deliberately fail voice without reading credentials or contacting any endpoint.
-            let voice = async { Err(SafeError::new("Offline voice connection failure")) };
+            let voice = async move {
+                attempted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                Err(SafeError::new("Offline voice connection failure"))
+            };
             run_inner(
                 &config,
                 options,
                 input_rx,
                 Events { sender: events_tx },
                 voice,
+                BroadcastControl::default(),
             )
             .await
         });
@@ -80,6 +89,7 @@ impl Fixture {
             log,
             input,
             events,
+            voice_attempts,
             task: Some(task),
         }
     }
@@ -114,7 +124,10 @@ impl Fixture {
             .collect()
     }
     async fn shutdown(&mut self) {
-        self.send(json!({"type":"disconnect"})).await;
+        let _ = self
+            .input
+            .send(SessionInput::Message(json!({"type":"disconnect"})))
+            .await;
         time::timeout(Duration::from_secs(8), self.task.take().unwrap())
             .await
             .expect("session did not shut down")
@@ -132,13 +145,19 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
-async fn voice_failure_keeps_native_tasks_approvals_and_metadata_filtering_alive() {
+async fn text_tasks_and_approvals_do_not_open_voice_and_failed_start_is_terminal() {
     let mut fixture = Fixture::start("chatgpt", true);
     fixture.until("agent_state", Some(("stage", "ready"))).await;
-    let voice = fixture
-        .until("status", Some(("stage", "voice_error")))
-        .await;
-    assert_eq!(voice["agent_available"], true);
+    assert_eq!(
+        fixture.until("status", Some(("stage", "ready"))).await["realtime"],
+        false
+    );
+    assert_eq!(
+        fixture
+            .voice_attempts
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
 
     fixture
         .send(json!({"type":"agent_task","task":"mock:tools"}))
@@ -165,6 +184,31 @@ async fn voice_failure_keeps_native_tasks_approvals_and_metadata_filtering_alive
     let done = fixture.until("agent_done", None).await;
     assert_eq!(done["text"], "METADATA_FILTERED");
 
+    assert_eq!(
+        fixture
+            .voice_attempts
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    fixture
+        .send(json!({"type":"broadcast_start","broadcast_id":"dialogue-1"}))
+        .await;
+    let voice = fixture
+        .until("status", Some(("stage", "voice_error")))
+        .await;
+    assert_eq!(voice["agent_available"], true);
+    assert_eq!(
+        fixture
+            .until("broadcast_state", Some(("stage", "ended")))
+            .await["reason"],
+        "error"
+    );
+    assert_eq!(
+        fixture
+            .voice_attempts
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
     let audit = fixture.audit();
     assert!(
         audit

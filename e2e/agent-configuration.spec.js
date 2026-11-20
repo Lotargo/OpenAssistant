@@ -66,12 +66,12 @@ test('live catalog, effort and workspace choices persist without starting captur
 test('interview explicitly starts and stops separate microphone and meeting audio streams', async ({ page }) => {
   await openNative(page);
   const settings = await openAgent(page);
-  await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-label', 'Включить микрофон');
+  await expect(page.locator('[data-action="microphone"]')).toBeDisabled();
   await settings.locator('#tab-modes').click();
   await settings.locator('#agent-scenario').selectOption('interview');
-  await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-label', 'Начать прослушивание собеседования');
+  await expect(page.locator('[data-action="microphone"]')).toBeDisabled();
   await expect(settings.locator('#interview-panel')).toBeVisible();
-  await expect(settings.locator('#interview-state')).toHaveText('Не слушаю');
+  await expect(settings.locator('#interview-state')).toHaveText('Эфир выключен');
   await settings.locator('#tab-audio').click();
   await settings.locator('#mic-device').selectOption('fixture-usb');
   await settings.locator('#system-audio-device').selectOption('fixture-headphones');
@@ -82,7 +82,7 @@ test('interview explicitly starts and stops separate microphone and meeting audi
   await settings.locator('#tab-modes').click();
   await settings.locator('#interview-start').click();
   await expect(settings.locator('#interview-state')).toHaveText('Слушаю');
-  await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-label', 'Остановить прослушивание собеседования');
+  await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-label', 'Выключить микрофон в эфире');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioStarts.length)).toBe(1);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.systemAudioStarts.length)).toBe(1);
   expect(await page.evaluate(() => window.__nativeContract.audioStarts[0].deviceId)).toBe('fixture-usb');
@@ -114,8 +114,8 @@ test('interview explicitly starts and stops separate microphone and meeting audi
   }
   await settings.locator('#tab-modes').click();
   await settings.locator('#interview-stop').click();
-  await expect(settings.locator('#interview-state')).toHaveText('Не слушаю');
-  await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-label', 'Начать прослушивание собеседования');
+  await expect(settings.locator('#interview-state')).toHaveText('Эфир завершён');
+  await expect(page.locator('[data-action="microphone"]')).toBeDisabled();
   await expect.poll(() => page.evaluate(() => ({
     microphone: window.__nativeContract.lastCapture('microphone').active,
     system: window.__nativeContract.lastCapture('system').active,
@@ -140,15 +140,16 @@ test('stopping an interview while native connect is pending never starts either 
   const sessionId = await page.evaluate(() => window.__nativeContract.sessionIds.at(-1));
   await expect(settings.locator('#interview-stop')).toBeEnabled();
   await settings.locator('#interview-stop').click();
-  await expect(settings.locator('#interview-state')).toHaveText('Не слушаю');
+  await expect(settings.locator('#interview-state')).toHaveText('Завершаю эфир');
   await page.evaluate(id => {
     window.__nativeContract.release('assistant_connect');
     window.__nativeContract.readySession(id);
   }, sessionId);
-  await expect(settings.locator('#agent-connect')).toHaveText('Переподключить');
+  await expect.poll(() => page.evaluate(id => window.__nativeContract.calls.some(call => call.name === 'assistant_disconnect' && call.args.sessionId === id), sessionId)).toBe(true);
+  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
   await expect(settings.locator('#interview-start')).toBeEnabled();
   expect(await page.evaluate(() => ({
     microphone: window.__nativeContract.audioStarts, system: window.__nativeContract.systemAudioStarts,
   }))).toEqual({ microphone: [], system: [] });
-  await expect(settings.locator('#interview-state')).toHaveText('Не слушаю');
+  await expect(settings.locator('#interview-state')).toHaveText('Эфир завершён');
 });

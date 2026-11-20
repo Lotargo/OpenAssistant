@@ -2,6 +2,8 @@
 pub mod agent;
 pub mod auth;
 pub mod bridge;
+mod broadcast;
+pub mod broadcast_control;
 pub mod codex;
 mod custom;
 pub mod interview;

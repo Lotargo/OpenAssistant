@@ -1,5 +1,5 @@
 import { createBridge } from './bridge.js';
-import { usesMeetingAudio } from './agent-config.js';
+import { createActionToast } from './action-toast.js';
 import { createStreamParser } from './stream-parser.js';
 import { createMarkdownStream } from './markdown-stream.js';
 import { createRenderer } from './renderer.js';
@@ -7,7 +7,7 @@ import { createSettingsModal } from './settings-modal.js';
 import { createSettingsWindowHost } from './settings-window-bridge.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
 import { setButtonIcon } from './icons.js';
-import { createMicrophoneIndicator, createToolbarAudioIndicator } from './microphone-meter.js';
+import { createMicrophoneIndicator, createToolbarAudioIndicator, selectToolbarAudio } from './microphone-meter.js';
 import { createGeometrySync } from './geometry.js';
 import { createWindowInteraction } from './window-interaction.js';
 import { playDemo } from './demo.js';
@@ -24,9 +24,54 @@ let modalOpen = false;
 let pendingSettingsRequest = null;
 let saveTimer;
 let runtime = {};
+let modeChanging = false;
+let broadcastOperation = null;
+let broadcastEpoch = 0;
+let previousBroadcastStage = 'idle';
+const notifiedBroadcasts = new Set();
+const modeLabels = { assistant: 'Ассистент', interview: 'Совещание', custom: 'Свой режим' };
 const demoAbort = new AbortController();
 const microphoneIndicator = createMicrophoneIndicator(document.querySelector('[data-action="microphone"]'));
-const toolbarAudioIndicator = createToolbarAudioIndicator(byId('toolbar'));
+const toolbar = byId('toolbar');
+const toolbarAudioIndicator = createToolbarAudioIndicator(toolbar);
+const actionToast = createActionToast({
+  element: byId('action-toast'), overlay, toolbar, announcer: byId('announcer'),
+  isEnabled: () => settings.actionNotifications,
+});
+function syncToolbarLayout() {
+  const anchor = toolbar.querySelector(window.matchMedia('(max-width: 760px)').matches ? '.toolbar-actions' : '.toolbar-controls');
+  const bar = toolbar.getBoundingClientRect(), content = anchor.getBoundingClientRect();
+  if (bar.width <= 0 || content.width <= 0) return;
+  toolbar.style.setProperty('--toolbar-wave-span', content.width + 'px');
+  toolbar.style.setProperty('--toolbar-audio-top', (content.top - bar.top + content.height / 2) + 'px');
+}
+const toolbarLayoutObserver = new ResizeObserver(syncToolbarLayout);
+for (const element of [toolbar, toolbar.querySelector('.toolbar-controls'), toolbar.querySelector('.toolbar-actions')]) toolbarLayoutObserver.observe(element);
+
+function updateToolbarAudio() {
+  const audio = selectToolbarAudio(runtime);
+  toolbar.dataset.audioSource = audio.source;
+  toolbarAudioIndicator.update(audio.levels, audio);
+}
+
+function renderNotificationControl() {
+  const button = byId('notifications-btn');
+  button.setAttribute('aria-pressed', String(settings.actionNotifications));
+  button.setAttribute('aria-label', settings.actionNotifications ? 'Выключить всплывающие уведомления' : 'Включить всплывающие уведомления');
+  setButtonIcon(button, settings.actionNotifications ? 'notifications' : 'notifications-off');
+  if (!settings.actionNotifications) actionToast.dismiss();
+}
+function observeBroadcast(state = {}) {
+  const stage = state.stage || 'idle';
+  if (stage === 'starting' && previousBroadcastStage !== 'starting') broadcastEpoch++;
+  previousBroadcastStage = stage;
+  if (stage !== 'ended') return;
+  const key = state.broadcast_id == null ? 'local:' + broadcastEpoch : String(state.broadcast_id);
+  if (notifiedBroadcasts.has(key)) return;
+  notifiedBroadcasts.add(key);
+  while (notifiedBroadcasts.size > 20) notifiedBroadcasts.delete(notifiedBroadcasts.values().next().value);
+  actionToast.show(state.farewell || state.detail || 'Эфир завершён.', { timeout: 4500, kind: state.reason === 'error' ? 'error' : 'info' });
+}
 
 function persist() {
   clearTimeout(saveTimer);
@@ -34,11 +79,13 @@ function persist() {
 }
 
 function requestSettings(payload) {
-  if (!modal) { pendingSettingsRequest = payload; return; }
+  if (!modal) { pendingSettingsRequest = payload; return Promise.resolve(false); }
   const operation = payload.open ? modal.open(payload.tab || 'appearance', payload.request ?? null) : modal.close();
-  void Promise.resolve(operation).catch(error => {
+  return Promise.resolve(operation).then(() => true).catch(error => {
     bridge?.reportError(error);
     byId('announcer').textContent = 'Не удалось открыть или закрыть настройки. ' + String(error?.message ?? error);
+    actionToast.show(byId('announcer').textContent, { kind: 'error' });
+    return false;
   });
 }
 
@@ -49,11 +96,24 @@ function renderControls(next = runtime) {
   const lock = document.querySelector('[data-action="scroll-lock"]');
   const reconnect = document.querySelector('[data-action="reconnect"]');
   mic.setAttribute('aria-pressed', String(Boolean(runtime.microphoneMuted)));
-  const interview = usesMeetingAudio(runtime.agentConfig) || runtime.systemAudioActive;
-  const starting = runtime.microphoneStarting || runtime.interviewStarting;
-  mic.setAttribute('aria-label', starting ? 'Остановить подключение микрофона' : interview
-    ? runtime.microphoneMuted ? 'Начать прослушивание собеседования' : 'Остановить прослушивание собеседования'
-    : runtime.microphoneMuted ? 'Включить микрофон' : 'Выключить микрофон');
+  const broadcast = runtime.broadcastState || {};
+  const stage = broadcast.stage || 'idle';
+  const active = ['starting', 'live', 'stopping'].includes(stage);
+  mic.disabled = stage !== 'live' || Boolean(runtime.microphoneBusy);
+  mic.setAttribute('aria-label', stage !== 'live' ? 'Микрофон доступен во время эфира'
+    : runtime.microphoneMuted ? 'Включить микрофон в эфире' : 'Выключить микрофон в эфире');
+  const broadcastButton = byId('broadcast-btn');
+  broadcastButton.dataset.stage = stage;
+  broadcastButton.setAttribute('aria-pressed', String(active));
+  broadcastButton.setAttribute('aria-label', stage === 'starting' ? 'Остановить подключение эфира'
+    : stage === 'stopping' ? 'Эфир завершается' : active ? 'Завершить эфир' : 'Включить эфир');
+  broadcastButton.disabled = !runtime.nativeWindow || stage === 'stopping' || broadcastOperation?.kind === 'stop';
+  for (const button of byId('mode-switcher').querySelectorAll('[data-scenario]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.scenario === (runtime.agentConfig?.scenario || 'assistant')));
+    button.disabled = modeChanging || stage === 'stopping';
+  }
+  renderNotificationControl();
+  observeBroadcast(broadcast);
   setButtonIcon(mic, runtime.microphoneMuted ? 'microphone-muted' : 'microphone');
   setButtonIcon(screenButton, 'screen');
   setButtonIcon(reconnect, 'reconnect');
@@ -61,13 +121,14 @@ function renderControls(next = runtime) {
   setButtonIcon(settingsButton, 'settings');
   if (bridge?.native) settingsButton.setAttribute('aria-expanded', String(Boolean(runtime.settingsOpen)));
   microphoneIndicator.update(runtime.microphoneLevels, runtime);
-  toolbarAudioIndicator.update(runtime.microphoneLevels, runtime);
+  updateToolbarAudio();
   screenButton.setAttribute('aria-pressed', String(Boolean(runtime.screenCaptureEnabled)));
   screenButton.dataset.state = runtime.screenCaptureEnabled ? 'active' : 'idle';
   lock.setAttribute('aria-pressed', String(Boolean(runtime.scrollLocked)));
   lock.setAttribute('aria-label', runtime.scrollLocked ? 'Разблокировать прокрутку' : 'Заблокировать прокрутку');
   setButtonIcon(lock, runtime.scrollLocked ? 'lock' : 'unlock');
   reconnect.dataset.state = runtime.connectionStatus || 'unavailable';
+  reconnect.disabled = ['starting', 'stopping'].includes(stage) || runtime.connectionStatus === 'connecting';
   const windowMode = runtime.windowMode === 'standard' ? 'standard' : 'overlay';
   const windowButton = byId('window-mode-btn');
   windowButton.setAttribute('aria-pressed', String(windowMode === 'standard'));
@@ -112,6 +173,7 @@ async function applySettings(next) {
   const previousLock = settings.scrollLocked;
   settings = normalizeSettings(next);
   applyTheme(settings);
+  renderNotificationControl();
   overlay.dataset.scrollLocked = String(settings.scrollLocked);
   geometry?.schedule();
   persist();
@@ -130,6 +192,7 @@ async function start() {
       geometry?.setActive(active);
       microphoneIndicator.setVisible(active);
       toolbarAudioIndicator.setVisible(active);
+      actionToast.setVisible(active);
     },
     onAudioLevels(levels) {
       if (levels?.source === 'system') runtime = { ...runtime, systemAudioLevels: levels };
@@ -137,7 +200,7 @@ async function start() {
         runtime = { ...runtime, microphoneLevels: levels };
         microphoneIndicator.update(levels, runtime);
       }
-      toolbarAudioIndicator.update(runtime.microphoneLevels, runtime);
+      updateToolbarAudio();
       modal?.updateAudioLevels(levels);
     },
     onScroll: scrollPanel,
@@ -191,24 +254,81 @@ async function start() {
     requestSettings(request);
   }
 
-  document.querySelector('#toolbar').addEventListener('click', async event => {
-    const button = event.target.closest('button[data-action]');
-    if (!button || modalOpen) return;
-    const action = button.dataset.action;
-    if (action === 'settings') { requestSettings({ open: true, tab: 'appearance' }); return; }
-    if (action !== 'microphone') button.disabled = true;
+  async function toggleBroadcast() {
+    const state = bridge.getRuntimeState().broadcastState || {};
+    const stop = ['starting', 'live', 'stopping'].includes(state.stage) || broadcastOperation?.kind === 'start';
+    const operation = { kind: stop ? 'stop' : 'start' };
+    broadcastOperation = operation;
+    renderControls(bridge.getRuntimeState());
     try {
-      if (action === 'microphone') await bridge.command('set_microphone_muted', { muted: Boolean(runtime.microphoneStarting || runtime.interviewStarting || !runtime.microphoneMuted) });
-      if (action === 'screen') await bridge.command('set_screen_capture_enabled', { enabled: !runtime.screenCaptureEnabled });
-      if (action === 'reconnect') await bridge.command('reconnect_session');
-      if (action === 'scroll-lock') await bridge.command('set_scroll_locked', { locked: !runtime.scrollLocked });
-      if (action === 'window-mode') await bridge.command('set_window_mode', { mode: runtime.windowMode === 'standard' ? 'overlay' : 'standard' });
+      await bridge.command(stop ? 'stop_broadcast' : 'start_broadcast');
+      if (broadcastOperation === operation && !stop && bridge.getRuntimeState().broadcastState?.stage === 'live') actionToast.show('Эфир включён');
     } catch (error) {
+      if (broadcastOperation === operation) {
+        actionToast.show(String(error?.message ?? error), { kind: 'error', timeout: 4500 });
+        void requestSettings({ open: true, tab: 'modes' });
+      }
+    } finally {
+      if (broadcastOperation === operation) broadcastOperation = null;
+      renderControls(bridge.getRuntimeState());
+    }
+  }
+
+  toolbar.addEventListener('click', async event => {
+    if (modalOpen) return;
+    const scenarioButton = event.target.closest('button[data-scenario]');
+    if (scenarioButton) {
+      const scenario = scenarioButton.dataset.scenario;
+      if (scenarioButton.disabled || modeChanging || scenario === runtime.agentConfig?.scenario) return;
+      modeChanging = true;
+      renderControls();
+      try {
+        await bridge.command('set_scenario', { scenario });
+        actionToast.show('Режим: ' + modeLabels[bridge.getAgentSettings().scenario]);
+      } catch (error) { actionToast.show(String(error?.message ?? error), { kind: 'error', timeout: 4500 }); }
+      finally { modeChanging = false; renderControls(bridge.getRuntimeState()); }
+      return;
+    }
+    const button = event.target.closest('button[data-action]');
+    if (!button || button.disabled) return;
+    const action = button.dataset.action;
+    if (action === 'settings') {
+      if (await requestSettings({ open: true, tab: 'appearance' })) actionToast.show('Настройки открыты');
+      return;
+    }
+    if (action === 'notifications') {
+      await applySettings({ ...settings, actionNotifications: !settings.actionNotifications });
+      if (settings.actionNotifications) actionToast.show('Уведомления включены');
+      return;
+    }
+    if (action === 'broadcast') { await toggleBroadcast(); return; }
+    button.disabled = true;
+    try {
+      if (action === 'microphone') {
+        await bridge.command('set_microphone_muted', { muted: !runtime.microphoneMuted });
+        if (bridge.getRuntimeState().broadcastState?.stage === 'live') actionToast.show(bridge.getRuntimeState().microphoneMuted ? 'Микрофон выключен' : 'Микрофон включён');
+      }
+      if (action === 'screen') await bridge.command('set_screen_capture_enabled', { enabled: !runtime.screenCaptureEnabled });
+      if (action === 'reconnect') {
+        await bridge.command('reconnect_session');
+        actionToast.show('Codex подключён');
+      }
+      if (action === 'scroll-lock') {
+        await bridge.command('set_scroll_locked', { locked: !runtime.scrollLocked });
+        actionToast.show(bridge.getRuntimeState().scrollLocked ? 'Прокрутка заблокирована' : 'Прокрутка разблокирована');
+      }
       if (action === 'window-mode') {
-        byId('announcer').textContent = 'Не удалось изменить режим окна. ' + String(error?.message ?? error);
-        renderControls(bridge.getRuntimeState());
-      } else requestSettings({ open: true, tab: action === 'microphone' ? 'audio' : action === 'screen' ? 'screen' : 'agent' });
-    } finally { if (action !== 'microphone') button.disabled = false; }
+        await bridge.command('set_window_mode', { mode: runtime.windowMode === 'standard' ? 'overlay' : 'standard' });
+        actionToast.show(bridge.getRuntimeState().windowMode === 'standard' ? 'Обычное окно' : 'Защищённый оверлей');
+      }
+    } catch (error) {
+      actionToast.show(String(error?.message ?? error), { kind: 'error', timeout: 4500 });
+      if (action === 'window-mode') byId('announcer').textContent = 'Не удалось изменить режим окна. ' + String(error?.message ?? error);
+      else void requestSettings({ open: true, tab: action === 'microphone' ? 'audio' : action === 'screen' ? 'screen' : 'agent' });
+    } finally {
+      button.disabled = false;
+      renderControls(bridge.getRuntimeState());
+    }
   });
 
   // Browser wheel input is handled normally. In desktop click-through mode the
@@ -241,6 +361,8 @@ window.addEventListener('pagehide', () => {
   demoAbort.abort();
   microphoneIndicator.destroy();
   toolbarAudioIndicator.destroy();
+  toolbarLayoutObserver.disconnect();
+  actionToast.destroy();
   windowInteraction?.destroy();
   geometry?.destroy();
   renderer.destroy();

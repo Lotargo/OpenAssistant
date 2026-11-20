@@ -16,7 +16,7 @@ async function pointIn(locator, dx = 12, dy = 10) {
   return { x: box.x + dx, y: box.y + dy };
 }
 
-test('window mode makes the native roundtrip, survives reload and keeps all six controls within a small window', async ({ page }) => {
+test('window mode makes the native roundtrip, survives reload and keeps all broadcast and icon controls within a small window', async ({ page }) => {
   await openNative(page);
   const button = modeButton(page);
   await expect(button).toHaveAttribute('aria-pressed', 'false');
@@ -36,8 +36,8 @@ test('window mode makes the native roundtrip, survives reload and keeps all six 
 
   await page.evaluate(() => { window.__nativeContract.applyResizes = false; });
   await page.setViewportSize({ width: 320, height: 180 });
-  const controls = page.locator('#toolbar > button');
-  await expect(controls).toHaveCount(6);
+  const controls = page.locator('.toolbar-actions > button');
+  await expect(controls).toHaveCount(7);
   const boxes = await controls.evaluateAll(buttons => buttons.map(button => {
     const { x, y, width, height } = button.getBoundingClientRect();
     return { x, y, width, height };
@@ -50,6 +50,13 @@ test('window mode makes the native roundtrip, survives reload and keeps all six 
     if (index) expect(boxes[index - 1].x + boxes[index - 1].width).toBeLessThanOrEqual(box.x);
   }
   expect(Math.abs((boxes[0].x + boxes.at(-1).x + boxes.at(-1).width) / 2 - 160)).toBeLessThan(1);
+  await expect(page.locator('#mode-switcher button')).toHaveCount(3);
+  for (const control of await page.locator('.toolbar-session button').all()) {
+    const box = await control.boundingBox();
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(320);
+    expect(box.y + box.height).toBeLessThanOrEqual(boxes[0].y);
+  }
 });
 
 test('a late window-mode command cannot overwrite a newer native mode or persist its stale value', async ({ page }) => {

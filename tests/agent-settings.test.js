@@ -26,7 +26,7 @@ function formFixture(t, patch = {}) {
   const state = {
     nativeWindow: true, agentConfig: { model: 'focused', effort: 'high', workspace_mode: 'temporary', workspace: 'F:\\saved-project', scenario: 'assistant' },
     models, modelCatalog: { status: 'ready', error: '' }, workspaceState: { mode: 'temporary', path: '', cleanupStatus: '' },
-    interviewState: { stage: 'idle' }, agentStage: 'idle', connectionStatus: 'idle',
+    interviewState: { stage: 'idle' }, broadcastState: { stage: 'idle' }, agentStage: 'idle', connectionStatus: 'idle',
     microphoneMuted: true, microphoneTesting: false, audioAvailable: true, microphoneDevices: [],
     systemAudioDevices: [{ deviceId: '', label: 'System default' }, { deviceId: 'speakers', label: 'Meeting speakers' }],
     systemAudioAvailable: true, tasks: [], activities: [], approvals: [], inputs: [], ...patch,
@@ -47,6 +47,10 @@ function formFixture(t, patch = {}) {
     async command(name, args = {}) {
       calls.push({ name, args });
       if (handlers.has(name)) await handlers.get(name)(args);
+      if (name === 'set_scenario') {
+        state.agentConfig = { ...state.agentConfig, scenario: args.scenario };
+        form.refresh();
+      }
     },
   };
   form = createSettingsModal({
@@ -142,19 +146,21 @@ test('scenario selection does not start listening; pending start can stop and so
   f.change('agent-scenario', 'interview');
   await turn();
   assert.equal(f.byId('interview-panel').hidden, false);
-  assert.deepEqual(f.calls, []);
-  assert.equal(f.byId('interview-state').textContent, 'Не слушаю');
+  assert.deepEqual(f.calls, [{ name: 'set_scenario', args: { scenario: 'interview' } }]);
+  assert.equal(f.byId('interview-state').textContent, 'Эфир выключен');
   let finish;
-  f.handlers.set('start_interview', () => new Promise(resolve => { finish = resolve; }));
+  f.handlers.set('start_broadcast', () => new Promise(resolve => { finish = resolve; }));
   f.byId('interview-start').click();
   assert.equal(f.byId('interview-start').disabled, true);
   assert.equal(f.byId('interview-stop').disabled, false);
-  assert.equal(f.byId('interview-state').textContent, 'Не слушаю');
+  assert.equal(f.byId('interview-state').textContent, 'Эфир выключен');
   f.byId('interview-stop').click();
   await turn();
-  assert.equal(f.calls.at(-1).name, 'stop_interview');
+  assert.equal(f.calls.at(-1).name, 'stop_broadcast');
   finish();
   await turn();
+  f.state.broadcastState = { stage: 'live' };
+  f.state.systemAudioActive = true;
   f.state.interviewState = { stage: 'evaluating', source: 'system', speaker: 'unknown', detail: 'Question received' };
   f.form.refresh();
   assert.equal(f.byId('interview-source').textContent, 'Звук встречи');
@@ -177,6 +183,7 @@ test('scenario selection does not start listening; pending start can stop and so
   assert.equal(f.byId('system-audio-monitor').dataset.active, 'false');
   assert.equal(f.byId('mic-monitor').dataset.active, 'true');
   f.change('agent-scenario', 'assistant');
+  await turn();
   assert.equal(f.byId('interview-panel').hidden, false); // An active capture must always retain Stop.
 });
 

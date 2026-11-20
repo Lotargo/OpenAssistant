@@ -143,12 +143,33 @@ export async function openNative(page, options = {}) {
     const delayed = new Map();
     const failures = new Map();
     const pending = [];
+    const delayedExecution = new Map();
+    const pendingExecution = [];
     const storeKey = 'openassistant.native-contract.store';
     const persisted = sessionStorage.getItem(storeKey);
     const values = new Map(persisted ? JSON.parse(persisted) : Object.entries(options.storeValues || {}));
     const sessions = new Map();
     const tasks = new Map();
     const captures = new Map();
+    function stopBoundCaptures(sessionId, broadcastId) {
+      for (const capture of captures.values()) {
+        if (capture.active && capture.mode !== 'test' && capture.sessionId === sessionId && capture.broadcastId === broadcastId) {
+          capture.active = false;
+          harness.emitAudio(capture.id, { type: 'stopped', reason: 'invalidated' });
+        }
+      }
+    }
+    function closeIdleSession(sessionId) {
+      const session = sessions.get(sessionId);
+      if (!session?.active || session.broadcast?.stage !== 'ended'
+        || [...tasks.values()].some(task => task.sessionId === sessionId && task.status === 'running')) return;
+      session.active = false;
+      if (workspaceState?.path === session.workspace) {
+        workspaceState = { ...workspaceState, cleanup_status: workspaceState.temporary ? 'removed' : 'preserved' };
+        harness.emitSession(sessionId, { type: 'workspace_state', ...workspaceState });
+      }
+      harness.emitSession(sessionId, { type: 'session_closed', message: 'Эфир завершён.' });
+    }
     let models = options.models || [
       { id: 'fixture-codex', display_name: 'Fixture Codex', description: 'General fixture model', is_default: true, reasoning_efforts: ['medium', 'high'], default_effort: 'medium' },
       { id: 'fixture-codex-small', display_name: 'Fixture Small', description: 'Small fixture model', is_default: false, reasoning_efforts: ['low', 'medium'], default_effort: 'low' },
@@ -157,6 +178,7 @@ export async function openNative(page, options = {}) {
       calls: [], resizes: [], saves: [], agentSaves: [], windowModeSaves: [], dragStarts: [], sessionIds: [], events: [],
       messages: [], audio: [], audioStarts: [], audioStops: [], audioNoiseChanges: [], audioSaves: [], captureIds: [], pending, applyResizes: true,
       systemAudioStarts: [], systemAudioStops: [], clipboardWrites: [], workspaceChoices,
+      broadcastStarts: [], broadcastStops: [], voiceOpens: [], voiceCloses: [], pendingExecution,
       setModels(next) { models = structuredClone(next); },
       queueWorkspaceChoice(path) { workspaceChoices.push(path); },
       getWorkspaceState() { return structuredClone(workspaceState); },
@@ -188,6 +210,12 @@ export async function openNative(page, options = {}) {
         return capture ? { id: capture.id, channelId: capture.channel.id, mode: capture.mode, active: capture.active, noiseSuppression: capture.noiseSuppression } : null;
       },
       delayNext(name) { delayed.set(name, (delayed.get(name) || 0) + 1); },
+      delayBefore(name) { delayedExecution.set(name, (delayedExecution.get(name) || 0) + 1); },
+      releaseBefore(name) {
+        const index = pendingExecution.findIndex(item => item.name === name);
+        if (index < 0) throw new Error('No pending ' + name + ' execution');
+        pendingExecution.splice(index, 1)[0].resolve();
+      },
       failNext(name, message = 'Fixture command failed') { failures.set(name, message); },
       release(name) {
         const index = pending.findIndex(item => item.name === name);
@@ -234,9 +262,36 @@ export async function openNative(page, options = {}) {
           model: session.config.model || models.find(model => model.is_default)?.id || '', effort: session.config.effort || 'medium',
         });
         harness.emitSession(sessionId, {
-          type: 'status', stage: session.config.realtime ? 'ready' : 'disabled',
-          detail: session.config.realtime ? 'Realtime подключён' : 'Только текстовый Codex',
+          type: 'status', stage: 'ready', realtime: false, detail: 'Codex · текстовый режим',
         });
+      },
+      readyBroadcast(sessionId) {
+        const session = sessions.get(sessionId);
+        if (!session?.active || session.broadcast?.stage !== 'starting') return false;
+        const id = session.broadcast.id;
+        session.broadcast.stage = 'live';
+        harness.emitSession(sessionId, { type: 'status', stage: 'ready', realtime: true, detail: 'Realtime подключён', broadcast_id: id });
+        harness.emitSession(sessionId, { type: 'broadcast_state', stage: 'live', broadcast_id: id });
+        return true;
+      },
+      finishBroadcast(sessionId, reason = 'user', farewell = '') {
+        const session = sessions.get(sessionId);
+        if (!session?.active || !session.broadcast || session.broadcast.stage === 'ended') return false;
+        const id = session.broadcast.id;
+        session.broadcast.stage = 'stopping';
+        harness.emitSession(sessionId, { type: 'broadcast_state', stage: 'stopping', broadcast_id: id, reason });
+        stopBoundCaptures(sessionId, id);
+        if (session.voiceOpen) harness.voiceCloses.push({ sessionId, broadcastId: id, reason });
+        session.voiceOpen = false;
+        session.broadcast.stage = 'ended';
+        harness.emitSession(sessionId, { type: 'broadcast_state', stage: 'ended', broadcast_id: id, reason, ...(farewell ? { farewell } : {}) });
+        queueMicrotask(() => closeIdleSession(sessionId));
+        return true;
+      },
+      lastBroadcast() {
+        const sessionId = harness.broadcastStarts.at(-1)?.sessionId;
+        const session = sessions.get(sessionId);
+        return session?.broadcast ? { sessionId, ...session.broadcast, voiceOpen: session.voiceOpen, sessionActive: session.active } : null;
       },
       lastTask() { return [...tasks.values()].at(-1); },
       finishTask(taskId, text = '', status = 'completed') {
@@ -247,6 +302,7 @@ export async function openNative(page, options = {}) {
         if (![...tasks.values()].some(item => item.sessionId === task.sessionId && item.status === 'running')) {
           harness.emitSession(task.sessionId, { type: 'agent_state', stage: 'ready', detail: 'Codex подключён' });
         }
+        closeIdleSession(task.sessionId);
       },
     };
     window.__nativeContract = harness;
@@ -256,9 +312,11 @@ export async function openNative(page, options = {}) {
       const recorded = { ...args };
       delete recorded.onEvent;
       harness.calls.push({ name, args: recorded });
-      if (failures.has(name)) {
-        const message = failures.get(name);
-        failures.delete(name);
+      const typedKey = name === 'assistant_send' ? name + ':' + args.message?.type : name;
+      const failureKey = failures.has(typedKey) ? typedKey : name;
+      if (failures.has(failureKey)) {
+        const message = failures.get(failureKey);
+        failures.delete(failureKey);
         throw new Error(message);
       }
       switch (name) {
@@ -302,6 +360,12 @@ export async function openNative(page, options = {}) {
         case 'audio_start':
         case 'system_audio_start': {
           const source = name === 'system_audio_start' ? 'system' : 'microphone';
+          if (args.mode !== 'test') {
+            const owner = sessions.get(args.sessionId);
+            if (!owner?.active || owner.broadcast?.stage !== 'live' || args.broadcastId !== owner.broadcast.id) {
+              throw new Error('Эфир завершён или не готов к захвату звука.');
+            }
+          } else if (args.sessionId != null || args.broadcastId != null) throw new Error('Local microphone checks must not bind to a broadcast.');
           const devices = source === 'system' ? systemAudioDevices : audioDevices;
           const device = args.deviceId ? devices.find(item => item.id === args.deviceId)
             : devices.find(item => item.is_default);
@@ -313,10 +377,10 @@ export async function openNative(page, options = {}) {
               harness.emitAudio(previous.id, { type: 'stopped', reason: 'replaced' });
             }
           }
-          captures.set(id, { id, source, channel: args.onEvent, index: 0, active: true, mode: args.mode, noiseSuppression: args.noiseSuppression });
+          captures.set(id, { id, source, channel: args.onEvent, index: 0, active: true, mode: args.mode, noiseSuppression: args.noiseSuppression, sessionId: args.sessionId, broadcastId: args.broadcastId });
           harness.captureIds.push(id);
           const starts = source === 'system' ? harness.systemAudioStarts : harness.audioStarts;
-          starts.push({ captureId: id, mode: args.mode, deviceId: args.deviceId, noiseSuppression: args.noiseSuppression });
+          starts.push({ captureId: id, mode: args.mode, deviceId: args.deviceId, noiseSuppression: args.noiseSuppression, ...(args.mode !== 'test' ? { sessionId: args.sessionId, broadcastId: args.broadcastId } : {}) });
           queueMicrotask(() => harness.emitAudio(id, { type: 'started', device_id: device.id, device_name: device.name }));
           return id;
         }
@@ -354,7 +418,7 @@ export async function openNative(page, options = {}) {
           const temporary = args.config.workspace_mode !== 'project';
           const workspace = temporary ? 'F:\\fixture-temporary\\session-' + id : args.config.workspace;
           workspaceState = { workspace_mode: temporary ? 'temporary' : 'project', path: workspace, temporary, cleanup_status: 'active' };
-          sessions.set(id, { channel: args.onEvent, index: 0, config: structuredClone(args.config), workspace, active: true });
+          sessions.set(id, { channel: args.onEvent, index: 0, config: structuredClone(args.config), workspace, active: true, broadcast: null, voiceOpen: false });
           harness.sessionIds.push(id);
           if (options.autoReady !== false) queueMicrotask(() => harness.readySession(id));
           return id;
@@ -364,7 +428,25 @@ export async function openNative(page, options = {}) {
           if (!session?.active) throw new Error('Session is closed');
           const message = structuredClone(args.message);
           harness.messages.push({ sessionId: args.sessionId, ...message });
-          if (message.type === 'agent_task') {
+          if (message.type === 'broadcast_start') {
+            if (!session.config.realtime) throw new Error('Голосовое подключение выключено.');
+            if (session.broadcast || typeof message.broadcast_id !== 'string' || !message.broadcast_id) throw new Error('Для нового эфира нужна новая сессия.');
+            const id = message.broadcast_id;
+            session.broadcast = { id, stage: 'starting' };
+            session.voiceOpen = true;
+            harness.broadcastStarts.push({ sessionId: args.sessionId, broadcastId: id });
+            const meeting = session.config.scenario === 'interview' || session.config.scenario === 'custom' && session.config.custom_behavior !== 'dialogue';
+            harness.voiceOpens.push({ sessionId: args.sessionId, broadcastId: id, sources: meeting ? ['microphone', 'system'] : ['microphone'] });
+            harness.emitSession(args.sessionId, { type: 'broadcast_state', stage: 'starting', broadcast_id: id });
+            harness.emitSession(args.sessionId, { type: 'status', stage: 'connecting', realtime: true, broadcast_id: id });
+            if (options.autoVoiceReady !== false) queueMicrotask(() => harness.readyBroadcast(args.sessionId));
+          } else if (message.type === 'broadcast_stop') {
+            if (!session.broadcast || message.broadcast_id !== session.broadcast.id) throw new Error('Устаревший эфир.');
+            harness.broadcastStops.push({ sessionId: args.sessionId, broadcastId: message.broadcast_id });
+            harness.finishBroadcast(args.sessionId, 'user', 'Эфир завершён. Нажмите «Эфир», чтобы начать снова.');
+          } else if (['mic_start', 'mic_stop', 'system_start', 'system_stop', 'interview_start', 'interview_stop'].includes(message.type)) {
+            if (!session.broadcast || message.broadcast_id !== session.broadcast.id) throw new Error('Голосовая команда не привязана к текущему эфиру.');
+          } else if (message.type === 'agent_task') {
             const taskId = 'fixture-task-' + nextTask++;
             tasks.set(taskId, { task_id: taskId, sessionId: args.sessionId, task: message.task, status: 'running' });
             harness.emitSession(args.sessionId, { type: 'agent_state', stage: 'running', detail: 'Codex выполняет задачу' });
@@ -391,13 +473,22 @@ export async function openNative(page, options = {}) {
         case 'clipboard_write_text':
           harness.clipboardWrites.push(args.text);
           return null;
-        case 'assistant_audio':
-          if (!sessions.get(args.sessionId)?.active) throw new Error('Session is closed');
-          harness.audio.push({ sessionId: args.sessionId, bytes: args.audio.length, source: args.source || 'microphone' });
+        case 'assistant_audio': {
+          const session = sessions.get(args.sessionId);
+          if (!session?.active || session.broadcast?.stage !== 'live' || args.broadcastId !== session.broadcast.id) throw new Error('Audio belongs to a closed broadcast');
+          harness.audio.push({ sessionId: args.sessionId, broadcastId: args.broadcastId, bytes: args.audio.length, source: args.source || 'microphone' });
           return null;
+        }
         case 'assistant_disconnect': {
           const session = sessions.get(args.sessionId);
-          if (session) session.active = false;
+          if (session) {
+            session.active = false;
+            if (session.broadcast) {
+              stopBoundCaptures(args.sessionId, session.broadcast.id);
+              if (session.voiceOpen) harness.voiceCloses.push({ sessionId: args.sessionId, broadcastId: session.broadcast.id, reason: 'disconnect' });
+              session.voiceOpen = false;
+            }
+          }
           if (session && workspaceState?.path === session.workspace) {
             workspaceState = { ...workspaceState, cleanup_status: workspaceState.temporary ? 'removed' : 'preserved' };
             harness.emitSession(args.sessionId, { type: 'workspace_state', ...workspaceState });
@@ -432,13 +523,20 @@ export async function openNative(page, options = {}) {
       },
       unregisterCallback(id) { callbacks.delete(id); },
       async invoke(name, args = {}, windowLabel = 'main') {
-        const hold = (delayed.get(name) || 0) > 0;
-        if (hold) delayed.set(name, delayed.get(name) - 1);
+        const typedKey = name === 'assistant_send' ? name + ':' + args.message?.type : name;
+        const executionKey = delayedExecution.get(typedKey) > 0 ? typedKey : name;
+        if ((delayedExecution.get(executionKey) || 0) > 0) {
+          delayedExecution.set(executionKey, delayedExecution.get(executionKey) - 1);
+          await new Promise(resolve => pendingExecution.push({ name: executionKey, resolve }));
+        }
+        const replyKey = delayed.get(typedKey) > 0 ? typedKey : name;
+        const hold = (delayed.get(replyKey) || 0) > 0;
+        if (hold) delayed.set(replyKey, delayed.get(replyKey) - 1);
         let value;
         let failure;
         try { value = await execute(name, args, windowLabel); }
         catch (error) { failure = error; }
-        if (hold) return new Promise((resolve, reject) => pending.push({ name, value, failure, resolve, reject }));
+        if (hold) return new Promise((resolve, reject) => pending.push({ name: replyKey, value, failure, resolve, reject }));
         if (failure) throw failure;
         return value;
       },
@@ -480,6 +578,14 @@ export async function connectAgent(page, { realtime = false } = {}) {
   await expect(settings.locator('#agent-connect')).toHaveText('Переподключить');
   await expect(settings.locator('#agent-model option')).toHaveCount(3);
   return page.evaluate(() => window.__nativeContract.sessionIds.at(-1));
+}
+
+export async function startBroadcast(page, { scenario } = {}) {
+  if (scenario) await setPressed(page.locator('#mode-switcher [data-scenario="' + scenario + '"]'), true);
+  await page.locator('#broadcast-btn').click();
+  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'live');
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture()?.active)).toBe(true);
+  return page.evaluate(() => window.__nativeContract.lastBroadcast());
 }
 
 export async function sendTask(page, text) {

@@ -1,6 +1,6 @@
 import { createMicrophoneMeter } from './microphone-meter.js';
 import { setButtonIcon } from './icons.js';
-import { modelControls, catalogStatus, workspaceStatus, interviewStatus, modeSettings } from './agent-settings-view.js';
+import { modelControls, catalogStatus, workspaceStatus, interviewStatus, modeSettings, broadcastStatus } from './agent-settings-view.js';
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -45,10 +45,6 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
   let testEpoch = 0;
   let noiseIntent = null;
   const optionIntents = new Map();
-  let voiceEpoch = 0;
-  let voiceStartPending = false;
-  let voiceStopPending = false;
-  let voiceFailure = '';
   let journalBusy = false;
   let destroyed = false;
   let busy = false;
@@ -89,23 +85,6 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     try { await bridge.setAgentSettings({ [key]: optionIntents.get(key) }); }
     catch (failure) { error(failure); }
     finally { optionIntents.delete(key); refresh(); }
-  }
-  async function setVoiceMuted(muted) {
-    const button = byId(muted ? 'voice-stop' : 'voice-start');
-    if (!bridge || button.disabled) return;
-    const epoch = ++voiceEpoch;
-    voiceStartPending = !muted;
-    voiceStopPending = muted;
-    voiceFailure = '';
-    refresh();
-    try { await bridge.command('set_microphone_muted', { muted }); }
-    catch (failure) {
-      if (epoch === voiceEpoch) { voiceFailure = failure instanceof Error ? failure.message : String(failure); error(failure); }
-    }
-    finally {
-      if (epoch === voiceEpoch) { voiceStartPending = false; voiceStopPending = false; }
-      refresh();
-    }
   }
   async function journalAction(command) {
     if (!bridge || journalBusy || !getRuntimeState()?.activities?.length) return;
@@ -178,8 +157,10 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     const key = target.dataset.agentSetting;
     if (key && target.tagName !== 'BUTTON') {
       const limit = Number(target.dataset.maxCodepoints);
-      const value = limit ? [...target.value].slice(0, limit).join('') : target.value;
+      const value = key === 'silence_timeout_secs' ? Number(target.value)
+        : limit ? [...target.value].slice(0, limit).join('') : target.value;
       if (limit) target.value = value;
+      if (key === 'scenario') { void action(null, 'set_scenario', { scenario: value }); return; }
       const patch = { [key]: value };
       if (key === 'model') patch.effort = '';
       void bridge.setAgentSettings(patch).catch(error);
@@ -197,8 +178,8 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     const button = event.target.closest('button');
     if (!button || button.disabled) return;
     if (button.matches('[data-agent-setting][aria-pressed]')) void setAgentOption(button);
-    if (button.id === 'voice-start') void setVoiceMuted(false);
-    if (button.id === 'voice-stop') void setVoiceMuted(true);
+    if (button.id === 'voice-start' || button.id === 'interview-start') void action(button, 'start_broadcast');
+    if (button.id === 'voice-stop' || button.id === 'interview-stop') void action(button, 'stop_broadcast');
     if (button.id === 'mic-noise-suppression') void setNoiseSuppression(button.getAttribute('aria-pressed') !== 'true');
     if (button.id === 'screen-window-mode') void action(button, 'set_window_mode', { mode: getRuntimeState()?.windowMode === 'standard' ? 'overlay' : 'standard' });
     if (button.id === 'journal-copy') void journalAction('copy_journal');
@@ -210,8 +191,6 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     if (button.id === 'agent-model-refresh') void action(button, 'refresh_models');
     if (button.id === 'agent-workspace-choose') void action(button, 'choose_workspace');
     if (button.id === 'agent-workspace-clear') void action(button, 'clear_temporary_workspace');
-    if (button.id === 'interview-start') void action(button, 'start_interview');
-    if (button.id === 'interview-stop') void action(button, 'stop_interview');
     if (button.id === 'mic-test') {
       if (testRequested || getRuntimeState()?.microphoneTesting) void stopMicrophoneTest();
       else void startMicrophoneTest();
@@ -379,11 +358,18 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     byId('agent-effort-description').classList.toggle('agent-inline-error', controls.missingEffort);
     const mode = modeSettings(config);
     fillOptions(byId('agent-scenario'), [
-      { value: 'assistant', label: 'Голосовой помощник' }, { value: 'interview', label: 'Собеседование' }, { value: 'custom', label: 'Свой режим' },
+      { value: 'assistant', label: 'Голосовой помощник' }, { value: 'interview', label: 'Совещание и собеседование' }, { value: 'custom', label: 'Свой режим' },
     ], config.scenario || 'assistant');
     fillOptions(byId('agent-custom-behavior'), [
       { value: 'dialogue', label: 'После моей реплики' }, { value: 'selective', label: 'Когда нужна подсказка' }, { value: 'on_request', label: 'Только по моей просьбе' },
     ], config.custom_behavior || 'dialogue');
+    const timeout = Number(config.silence_timeout_secs ?? 300);
+    const timeoutOptions = [
+      [0, 'Не завершать'], [60, '1 минута'], [180, '3 минуты'], [300, '5 минут'],
+      [600, '10 минут'], [900, '15 минут'], [1800, '30 минут'], [3600, '1 час'],
+    ].map(([value, label]) => ({ value: String(value), label }));
+    if (Number.isFinite(timeout) && !timeoutOptions.some(option => option.value === String(timeout))) timeoutOptions.push({ value: String(timeout), label: timeout + ' с' });
+    fillOptions(byId('agent-silence-timeout'), timeoutOptions, String(timeout));
     byId('agent-custom-fields').hidden = !mode.custom;
     byId('mode-description').textContent = mode.description;
     byId('mode-config-status').textContent = runtime.configDirty
@@ -400,23 +386,26 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     byId('agent-workspace-path-label').textContent = workspace.pathLabel;
     byId('agent-workspace-path').textContent = workspace.path;
     const sessionActive = ['starting', 'connecting', 'ready', 'running'].includes(runtime.agentStage)
-      || runtime.connectionStatus === 'connecting';
+      || runtime.connectionStatus === 'connecting' || ['starting', 'live', 'stopping'].includes(runtime.broadcastState?.stage);
     byId('agent-workspace-clear').hidden = workspace.mode !== 'temporary' && runtime.workspaceState?.mode !== 'temporary';
     byId('agent-workspace-clear').disabled = !runtime.nativeWindow || workspace.busy || sessionActive || pendingActions.has('clear_temporary_workspace');
-    const interview = interviewStatus(runtime.interviewStarting && (!runtime.interviewState || runtime.interviewState.stage === 'idle')
-      ? { ...runtime.interviewState, stage: 'starting', detail: 'Подключаю источники' } : runtime.interviewState);
-    byId('interview-panel').hidden = !mode.meeting && !interview.active && !runtime.interviewStarting && !pendingActions.has('start_interview');
-    byId('interview-panel').dataset.stage = interview.stage;
-    byId('interview-state').textContent = interview.label;
-    byId('interview-detail').textContent = config.realtime === false && !interview.active
+    const broadcast = broadcastStatus(runtime.broadcastState);
+    const broadcastPending = pendingActions.has('start_broadcast');
+    const interview = interviewStatus(runtime.interviewState);
+    const meetingView = mode.meeting || Boolean(runtime.systemAudioActive || runtime.interviewStarting);
+    byId('interview-panel').hidden = !meetingView;
+    byId('interview-panel').dataset.stage = broadcast.live ? interview.stage : broadcast.stage;
+    byId('interview-state').textContent = broadcast.live && interview.active ? interview.label : broadcast.label;
+    byId('interview-detail').textContent = config.realtime === false && !broadcast.active
       ? 'Голос выключен. Его можно включить в разделе «Агенты».'
-      : interview.active || interview.error ? interview.detail : mode.description;
+      : broadcast.active || broadcast.stage === 'ended' ? broadcast.detail || interview.detail : mode.description;
     byId('interview-source').textContent = [interview.source, interview.speaker].filter(Boolean).join(' · ');
     byId('interview-speaker-status').textContent = typeof runtime.speakerState?.detail === 'string' ? runtime.speakerState.detail : '';
-    byId('interview-start').disabled = !runtime.nativeWindow || !mode.meeting || config.realtime === false || interview.active || runtime.interviewStarting || pendingActions.has('start_interview');
-    byId('interview-stop').disabled = (!interview.active && !runtime.interviewStarting && !pendingActions.has('start_interview')) || interview.stopping || pendingActions.has('stop_interview');
-    byId('interview-error').textContent = interview.error;
-    byId('interview-error').hidden = !interview.error;
+    byId('interview-start').disabled = !runtime.nativeWindow || config.realtime === false || broadcast.active || broadcastPending;
+    byId('interview-stop').disabled = (!broadcast.active && !broadcastPending) || broadcast.stopping || pendingActions.has('stop_broadcast');
+    const meetingError = interview.error || broadcast.error;
+    byId('interview-error').textContent = meetingError;
+    byId('interview-error').hidden = !meetingError;
     byId('agent-prompt').placeholder = mode.meeting ? 'Дополнительный вопрос или задача'
       : workspace.mode === 'project' ? 'Что нужно сделать в проекте?' : 'Чем помочь?';
     const microphoneDevices = runtime.microphoneDevices?.length ? runtime.microphoneDevices
@@ -426,18 +415,17 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     const testing = Boolean(runtime.microphoneTesting || testRequested);
     const dictating = runtime.microphoneMuted === false && !runtime.microphoneTesting;
     const audioBusy = Boolean(runtime.microphoneBusy);
-    const voiceStarting = Boolean(voiceStartPending || runtime.microphoneStarting);
-    const voiceActive = dictating && !interview.active;
-    byId('voice-panel').hidden = interview.active || runtime.interviewStarting || (mode.meeting && !voiceActive && !voiceStarting && !voiceStopPending);
-    byId('voice-panel').dataset.stage = voiceActive ? 'listening' : voiceStarting ? 'starting' : 'idle';
-    byId('voice-state').textContent = voiceStopPending ? 'Выключаю микрофон' : voiceStarting ? 'Подключаю голосовой ввод' : voiceActive ? 'Микрофон включён' : 'Микрофон выключен';
-    byId('voice-detail').textContent = !runtime.nativeWindow ? 'Голосовой ввод доступен в приложении OpenAssistant.'
-      : config.realtime === false && !voiceActive ? 'Голос выключен. Его можно включить в разделе «Агенты».'
-        : voiceActive ? runtime.micDetail || 'Слушаю ваши реплики в режиме «' + mode.label + '».'
-          : mode.description;
-    byId('voice-start').disabled = !runtime.nativeWindow || mode.meeting || config.realtime === false || interview.active || voiceActive || voiceStarting || voiceStopPending || audioBusy;
-    byId('voice-stop').disabled = (!voiceActive && !voiceStarting) || voiceStopPending;
-    const voiceError = runtime.voiceError || runtime.microphoneError || voiceFailure;
+    const voiceStarting = broadcast.stage === 'starting' || broadcastPending || Boolean(runtime.microphoneStarting);
+    byId('voice-panel').hidden = meetingView;
+    byId('voice-panel').dataset.stage = broadcast.live ? 'listening' : broadcast.stage;
+    byId('voice-state').textContent = broadcast.label;
+    byId('voice-detail').textContent = !runtime.nativeWindow ? 'Эфир доступен в приложении OpenAssistant.'
+      : config.realtime === false && !broadcast.active ? 'Голос выключен. Его можно включить в разделе «Агенты».'
+        : broadcast.live ? runtime.microphoneMuted ? 'Микрофон выключен. Эфир остаётся включён.' : runtime.micDetail || 'Слушаю ваши реплики.'
+          : broadcast.detail || mode.description;
+    byId('voice-start').disabled = !runtime.nativeWindow || config.realtime === false || broadcast.active || broadcastPending;
+    byId('voice-stop').disabled = (!broadcast.active && !broadcastPending) || broadcast.stopping || pendingActions.has('stop_broadcast');
+    const voiceError = runtime.voiceError || runtime.microphoneError || broadcast.error;
     byId('voice-error').textContent = voiceError;
     byId('voice-error').hidden = !voiceError;
     byId('agent-realtime-status').textContent = runtime.voiceError || (runtime.liveAvailable ? 'Realtime подключён.'
@@ -448,7 +436,7 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     byId('mic-refresh').disabled = !runtime.nativeWindow || audioBusy || pendingActions.has('refresh_microphones');
     byId('mic-runtime').textContent = !runtime.nativeWindow ? 'Микрофон доступен в приложении OpenAssistant.'
       : runtime.microphoneStatus || (runtime.microphoneMuted ? 'Микрофон выключен' : runtime.micDetail || 'Микрофон включён');
-    byId('mic-test').disabled = !testing && (!runtime.audioAvailable || audioBusy || dictating || voiceStarting || runtime.interviewStarting || interview.active);
+    byId('mic-test').disabled = !testing && (!runtime.audioAvailable || audioBusy || dictating || voiceStarting || broadcast.active);
     byId('mic-test').setAttribute('aria-pressed', String(testing));
     byId('mic-test-label').textContent = testing ? 'Остановить проверку' : 'Проверить микрофон';
     setButtonIcon(byId('mic-test-icon'), testing ? 'stop' : 'play');
@@ -486,7 +474,7 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     const connecting = ['starting', 'connecting'].includes(runtime.agentStage) || runtime.connectionStatus === 'connecting';
     const connected = ['ready', 'running'].includes(runtime.agentStage);
     byId('agent-connect').textContent = connecting ? 'Подключение…' : runtime.configDirty && connected ? 'Применить и переподключить' : connected ? 'Переподключить' : 'Подключить';
-    byId('agent-connect').disabled = connecting || pendingActions.has('reconnect_session');
+    byId('agent-connect').disabled = connecting || ['starting', 'stopping'].includes(broadcast.stage) || pendingActions.has('reconnect_session');
     byId('agent-disconnect').disabled = (runtime.agentStage === 'idle' && runtime.connectionStatus === 'idle') || pendingActions.has('disconnect_session');
     byId('agent-send').disabled = busy;
     byId('agent-send').textContent = busy ? 'Отправляю…' : 'Отправить';

@@ -7,6 +7,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   maxHeightPercent: 70,
   autoScroll: true,
   scrollLocked: false,
+  actionNotifications: true,
 });
 
 export function normalizeHex(value, fallback = null) {
@@ -34,6 +35,7 @@ export function normalizeSettings(value = {}) {
     maxHeightPercent: numberWithin(source.maxHeightPercent, DEFAULT_SETTINGS.maxHeightPercent, 40, 85),
     autoScroll: typeof source.autoScroll === 'boolean' ? source.autoScroll : DEFAULT_SETTINGS.autoScroll,
     scrollLocked: typeof source.scrollLocked === 'boolean' ? source.scrollLocked : DEFAULT_SETTINGS.scrollLocked,
+    actionNotifications: typeof source.actionNotifications === 'boolean' ? source.actionNotifications : DEFAULT_SETTINGS.actionNotifications,
   };
 }
 

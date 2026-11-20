@@ -4,6 +4,7 @@ export const DEFAULT_AGENT = Object.freeze({
   custom_name: 'Свой режим', custom_instructions: '', custom_behavior: 'dialogue',
   model: '', effort: '', web_search: true, parallel: true,
   realtime: true, realtime_model: 'gpt-realtime-2.1',
+  silence_timeout_secs: 300, agent_auto_end: true,
 });
 
 export function normalizeAgent(value = {}) {
@@ -20,6 +21,10 @@ export function normalizeAgent(value = {}) {
     web_search: typeof source.web_search === 'boolean' ? source.web_search : true,
     parallel: typeof source.parallel === 'boolean' ? source.parallel : true,
     realtime: typeof source.realtime === 'boolean' ? source.realtime : true,
+    silence_timeout_secs: Number.isInteger(source.silence_timeout_secs)
+      && (source.silence_timeout_secs === 0 || source.silence_timeout_secs >= 30 && source.silence_timeout_secs <= 3600)
+      ? source.silence_timeout_secs : DEFAULT_AGENT.silence_timeout_secs,
+    agent_auto_end: typeof source.agent_auto_end === 'boolean' ? source.agent_auto_end : true,
     realtime_model: ['gpt-realtime-2.1', 'gpt-realtime-1.5'].includes(source.realtime_model) ? source.realtime_model : 'gpt-realtime-2.1',
   };
 }
@@ -40,5 +45,5 @@ export function usesMeetingAudio(config = {}) {
 
 export function modeLabel(config = {}) {
   if (config?.scenario === 'custom') return config.custom_name?.trim() || 'Свой режим';
-  return config?.scenario === 'interview' ? 'Собеседование' : 'Голосовой помощник';
+  return config?.scenario === 'interview' ? 'Помощь на совещании' : 'Голосовой помощник';
 }

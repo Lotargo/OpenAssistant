@@ -281,3 +281,7 @@ body.settings-window { height: 100dvh; overflow: hidden; }
 .settings-window-actions .action-button { padding: 8px 16px; border: 1px solid var(--settings-accent-button-border); border-radius: 8px; background: var(--settings-accent-button-bg); color: var(--settings-accent-button-text); cursor: pointer; }
 .settings-window-actions .secondary { border-color: #343438; background: #222225; }
 .settings-window-actions .action-button:disabled { opacity: .5; cursor: default; }
+
+.behavior-broadcast { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--settings-line); }
+.behavior-broadcast > h3 { margin: 0 0 5px; font-size: 14px; font-weight: 600; }
+.behavior-broadcast .settings-row { padding-bottom: 0; }

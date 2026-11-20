@@ -1,4 +1,7 @@
 //! Native IPC adapter. Provider credentials and child processes stay in Rust.
+#[path = "assistant_broadcast.rs"]
+mod broadcast_audio;
+use crate::audio::{AudioState, SystemAudioState};
 use assistant_core::{
     bridge::{MAX_AUDIO_BYTES, MAX_LOCAL_MESSAGE},
     session::{self, SessionConfig, SessionInput},
@@ -6,6 +9,7 @@ use assistant_core::{
         self, CleanupReport, CleanupStatus, WorkspaceLease, WorkspaceMode, WorkspaceStatus,
     },
 };
+pub(crate) use broadcast_audio::BroadcastAudio;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -44,10 +48,14 @@ struct NativeSession {
     workspace: Arc<WorkspaceLease>,
     last_workspace: Arc<StdMutex<Option<WorkspaceStatus>>>,
     on_event: Option<Channel<Value>>,
+    audio: Arc<BroadcastAudio>,
+    voice_control: session::BroadcastControl,
 }
 
 impl NativeSession {
     async fn stop(mut self) {
+        self.audio.cancel();
+        self.voice_control.cancel_all();
         let _ = self
             .input
             .try_send(SessionInput::Message(json!({"type":"disconnect"})));
@@ -61,6 +69,7 @@ impl NativeSession {
         }
         self.forward.abort();
         let _ = (&mut self.forward).await;
+        let _ = self.audio.join().await;
         let status = cleanup_workspace(self.workspace.clone(), &self.last_workspace).await;
         if let Some(channel) = &self.on_event {
             let _ = channel.send(workspace_event(&status));
@@ -72,6 +81,8 @@ impl Drop for NativeSession {
     fn drop(&mut self) {
         // Aborting the core drops its agent handle, closing the app-server process
         // and its provider socket. No orphaned session survives the native window.
+        self.audio.cancel();
+        self.voice_control.cancel_all();
         self.run.abort();
         self.forward.abort();
     }
@@ -150,6 +161,8 @@ pub struct ConnectOptions {
     custom_name: String,
     custom_instructions: String,
     custom_behavior: session::CustomBehavior,
+    silence_timeout_secs: u32,
+    agent_auto_end: bool,
     model: String,
     effort: String,
     web_search: bool,
@@ -167,6 +180,8 @@ impl Default for ConnectOptions {
             custom_name: session::default_custom_name(),
             custom_instructions: String::new(),
             custom_behavior: session::CustomBehavior::default(),
+            silence_timeout_secs: session::default_silence_timeout_secs(),
+            agent_auto_end: session::default_agent_auto_end(),
             model: String::new(),
             effort: String::new(),
             web_search: true,
@@ -192,6 +207,8 @@ fn options(config: ConnectOptions) -> Result<(SessionConfig, Arc<WorkspaceLease>
     if !assistant_core::provider::allowed_model(&config.realtime_model) {
         return Err("Unsupported Realtime model.".into());
     }
+    session::validate_silence_timeout(config.silence_timeout_secs)
+        .map_err(|error| error.to_string())?;
     let (custom_name, custom_instructions) =
         session::normalize_custom_settings(config.custom_name, config.custom_instructions)
             .map_err(|error| error.to_string())?;
@@ -209,6 +226,8 @@ fn options(config: ConnectOptions) -> Result<(SessionConfig, Arc<WorkspaceLease>
         custom_name,
         custom_instructions,
         custom_behavior: config.custom_behavior,
+        silence_timeout_secs: config.silence_timeout_secs,
+        agent_auto_end: config.agent_auto_end,
         model,
         effort,
         web_search: config.web_search,
@@ -327,6 +346,7 @@ pub async fn assistant_choose_workspace(
 
 #[tauri::command]
 pub async fn assistant_connect(
+    app: AppHandle,
     state: State<'_, AssistantState>,
     config: ConnectOptions,
     on_event: Channel<Value>,
@@ -337,6 +357,12 @@ pub async fn assistant_connect(
         .await
         .map_err(|_| "Could not prepare the workspace.".to_owned())??;
     let mut slot = state.session.lock().await;
+    if slot
+        .as_ref()
+        .is_some_and(|previous| previous.audio.terminal() && !previous.run.is_finished())
+    {
+        return Err("Дождись завершения текущих задач Codex перед новым эфиром.".into());
+    }
     if let Some(previous) = slot.take() {
         previous.stop().await;
     }
@@ -356,13 +382,26 @@ pub async fn assistant_connect(
     let run_workspace = workspace.clone();
     let last_workspace = state.last_workspace.clone();
     let cleanup_channel = on_event.clone();
+    let audio = Arc::new(BroadcastAudio::new(
+        app.state::<AudioState>().inner().clone(),
+        app.state::<SystemAudioState>().inner().clone(),
+    ));
+    let voice_control = session::BroadcastControl::default();
+    let run_control = voice_control.clone();
+    let forward_control = voice_control.clone();
+    let run_audio = audio.clone();
+    let forward_audio = audio.clone();
     let run = tokio::spawn(async move {
-        if let Err(error) = session::run(config, input_rx, events_tx).await {
+        if let Err(error) =
+            session::run_with_control(config, input_rx, events_tx, run_control).await
+        {
             // SafeError contains fixed/sanitized text, never provider bodies.
             let _ = final_events
                 .send(json!({"type":"agent_error","message":error.to_string()}))
                 .await;
         }
+        run_audio.cancel();
+        let _ = run_audio.join().await;
         let cleaned = cleanup_workspace(run_workspace, &last_workspace).await;
         let _ = final_events.send(workspace_event(&cleaned)).await;
         let _ = final_events
@@ -371,8 +410,16 @@ pub async fn assistant_connect(
     });
     let abort_run = run.abort_handle();
     let forward = tokio::spawn(async move {
-        while let Some(event) = events_rx.recv().await {
+        while let Some(mut event) = events_rx.recv().await {
+            if forward_audio.observe(&event) {
+                if let Err(error) = forward_audio.join().await {
+                    event["reason"] = json!("error");
+                    event["farewell"] = json!(error);
+                }
+            }
             if on_event.send(event).is_err() {
+                forward_audio.cancel();
+                forward_control.cancel_all();
                 // The webview disappeared/reloaded. Do not keep recording or
                 // executing tasks for a UI that cannot receive approval requests.
                 abort_run.abort();
@@ -389,6 +436,8 @@ pub async fn assistant_connect(
         workspace,
         last_workspace: state.last_workspace.clone(),
         on_event: Some(cleanup_channel),
+        audio,
+        voice_control,
     });
     Ok(id)
 }
@@ -403,6 +452,8 @@ fn valid_message(message: &Value) -> Result<(), String> {
         return Err("Некорректное или слишком большое сообщение.".into());
     }
     let allowed = [
+        "broadcast_start",
+        "broadcast_stop",
         "agent_task",
         "agent_interrupt",
         "agent_approval",
@@ -427,6 +478,7 @@ fn valid_message(message: &Value) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn active_input(
     state: &AssistantState,
     session_id: u64,
@@ -442,6 +494,39 @@ async fn active_input(
         .ok_or_else(|| "Сессия уже закрыта. Подключись к Codex заново.".into())
 }
 
+async fn active_session(
+    state: &AssistantState,
+    session_id: u64,
+) -> Result<(mpsc::Sender<SessionInput>, Arc<BroadcastAudio>), String> {
+    let slot = state.session.lock().await;
+    slot.as_ref()
+        .filter(|session| {
+            session.id == session_id
+                && session.view_epoch == state.view_epoch.load(Ordering::Acquire)
+                && !session.run.is_finished()
+        })
+        .map(|session| (session.input.clone(), session.audio.clone()))
+        .ok_or_else(|| "Сессия уже закрыта. Подключись к Codex заново.".into())
+}
+impl AssistantState {
+    pub async fn audio_binding(
+        &self,
+        session_id: u64,
+        broadcast_id: &str,
+    ) -> Result<Arc<BroadcastAudio>, String> {
+        let (_, audio) = active_session(self, session_id).await?;
+        audio.require_live(broadcast_id)?;
+        Ok(audio)
+    }
+}
+fn message_broadcast_id(message: &Value) -> Result<&str, String> {
+    let id = message["broadcast_id"]
+        .as_str()
+        .ok_or_else(|| "Не задан идентификатор эфира.".to_owned())?;
+    BroadcastAudio::validate_id(id)?;
+    Ok(id)
+}
+
 #[tauri::command]
 pub async fn assistant_send(
     state: State<'_, AssistantState>,
@@ -449,7 +534,26 @@ pub async fn assistant_send(
     message: Value,
 ) -> Result<(), String> {
     valid_message(&message)?;
-    let input = active_input(&state, session_id).await?;
+    let (input, audio) = active_session(&state, session_id).await?;
+    match message["type"].as_str().unwrap_or("") {
+        "broadcast_start" => audio.start(message_broadcast_id(&message)?)?,
+        "broadcast_stop" => {
+            let id = message_broadcast_id(&message)?;
+            audio.stop(id)?;
+            let slot = state.session.lock().await;
+            if let Some(session) = slot.as_ref().filter(|session| session.id == session_id) {
+                session.voice_control.stop(id);
+            }
+        }
+        "agent_task" | "text" if audio.terminal() => {
+            return Err(
+                "The broadcast has ended; wait for current Codex tasks before reconnecting.".into(),
+            );
+        }
+        "mic_start" | "mic_stop" | "system_start" | "system_stop" | "interview_start"
+        | "interview_stop" => audio.require_live(message_broadcast_id(&message)?)?,
+        _ => {}
+    }
     tokio::time::timeout(
         Duration::from_secs(2),
         input.send(SessionInput::Message(message)),
@@ -463,6 +567,7 @@ pub async fn assistant_send(
 pub async fn assistant_audio(
     state: State<'_, AssistantState>,
     session_id: u64,
+    broadcast_id: String,
     audio: Vec<u8>,
     source: Option<String>,
 ) -> Result<(), String> {
@@ -470,14 +575,21 @@ pub async fn assistant_audio(
         return Err("Некорректный PCM16 аудиофрагмент.".into());
     }
     let packet = match source.as_deref().unwrap_or("microphone") {
-        "microphone" => SessionInput::Audio(audio),
-        "system" => SessionInput::SystemAudio(audio),
+        "microphone" => SessionInput::Audio {
+            broadcast_id: broadcast_id.clone(),
+            data: audio,
+        },
+        "system" => SessionInput::SystemAudio {
+            broadcast_id: broadcast_id.clone(),
+            data: audio,
+        },
         _ => return Err("Неизвестный источник звука.".into()),
     };
     // Audio must never wait behind an unbounded queue. Let the frontend stop the
     // microphone explicitly on backpressure rather than accumulate stale speech.
-    active_input(&state, session_id)
-        .await?
+    let (input, binding) = active_session(&state, session_id).await?;
+    binding.require_live(&broadcast_id)?;
+    input
         .try_send(packet)
         .map_err(|_| "Передача аудио не успевает за микрофоном или сессия закрыта.".into())
 }
@@ -519,6 +631,8 @@ mod tests {
             workspace: Arc::new(WorkspaceLease::open(WorkspaceMode::Temporary, None).unwrap()),
             last_workspace: state.last_workspace.clone(),
             on_event: None,
+            audio: Arc::new(BroadcastAudio::default()),
+            voice_control: session::BroadcastControl::default(),
         });
     }
 

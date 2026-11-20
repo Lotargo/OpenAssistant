@@ -1,52 +1,98 @@
-use crate::audio::{
-    self, AudioConfig, AudioEvent, AudioState, CaptureMode, InputState, SystemAudioEvent,
-    SystemAudioState,
+use crate::{
+    assistant::{AssistantState, BroadcastAudio},
+    audio::{
+        self, AudioConfig, AudioEvent, AudioState, CaptureMode, InputState, StartTicket,
+        SystemAudioEvent, SystemAudioState,
+    },
 };
-use tauri::{ipc::Channel, State};
+use std::sync::Arc;
+use tauri::{State, ipc::Channel};
 
-/// Device discovery is independent of Codex, Realtime, and WebView permissions.
+struct CapturePermission {
+    ticket: StartTicket,
+    binding: Option<(Arc<BroadcastAudio>, String)>,
+}
+impl CapturePermission {
+    fn current(&self) -> bool {
+        self.binding
+            .as_ref()
+            .is_none_or(|(owner, id)| owner.live(id))
+    }
+}
+async fn prepare_capture(
+    assistant: &AssistantState,
+    audio: &AudioState,
+    mode: CaptureMode,
+    session_id: Option<u64>,
+    broadcast_id: Option<String>,
+) -> Result<CapturePermission, String> {
+    if mode == CaptureMode::Test {
+        return Ok(CapturePermission {
+            ticket: audio.start_ticket(mode),
+            binding: None,
+        });
+    }
+    let session_id =
+        session_id.ok_or_else(|| "Для передачи звука нужен активный эфир.".to_owned())?;
+    let broadcast_id = broadcast_id.ok_or_else(|| "Не задан идентификатор эфира.".to_owned())?;
+    let binding = assistant.audio_binding(session_id, &broadcast_id).await?;
+    let ticket = binding.ticket(&broadcast_id, audio)?;
+    Ok(CapturePermission {
+        ticket,
+        binding: Some((binding, broadcast_id)),
+    })
+}
+fn validate_device(device_id: &Option<String>) -> Result<(), String> {
+    if device_id
+        .as_ref()
+        .is_some_and(|id| id.len() > 4096 || id.chars().any(char::is_control))
+    {
+        Err("Некорректное аудиоустройство.".into())
+    } else {
+        Ok(())
+    }
+}
 #[tauri::command]
 pub async fn audio_input_state() -> Result<InputState, String> {
     tauri::async_runtime::spawn_blocking(audio::input_state)
         .await
         .map_err(|_| "Не удалось проверить аудиоустройства Windows.".to_string())
 }
-
-/// The native worker owns capture and DSP. Test mode never emits PCM to the UI.
+/// Flat IPC fields preserve the existing UI contract; only stream mode requires ownership.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn audio_start(
     state: State<'_, AudioState>,
+    assistant: State<'_, AssistantState>,
     mode: CaptureMode,
     device_id: Option<String>,
     noise_suppression: bool,
     on_event: Channel<AudioEvent>,
+    session_id: Option<u64>,
+    broadcast_id: Option<String>,
 ) -> Result<u64, String> {
-    if device_id
-        .as_ref()
-        .is_some_and(|id| id.len() > 4096 || id.chars().any(char::is_control))
-    {
-        return Err("Некорректное устройство ввода.".into());
-    }
+    validate_device(&device_id)?;
     let audio = state.inner().clone();
-    // Capture the permission to start before entering the blocking queue. Closing
-    // the settings/view while queued invalidates this ticket before any device opens.
-    let ticket = audio.start_ticket(mode);
+    let permission = prepare_capture(&assistant, &audio, mode, session_id, broadcast_id).await?;
     tauri::async_runtime::spawn_blocking(move || {
-        audio.start_with_ticket(
+        let id = audio.start_with_ticket(
             AudioConfig {
                 device_id: device_id.filter(|id| !id.is_empty()),
                 mode,
                 noise_suppression,
             },
-            ticket,
+            permission.ticket,
             move |event| on_event.send(event).is_ok(),
-        )
+        )?;
+        if !permission.current() {
+            audio.stop(Some(id))?;
+            return Err("Запуск микрофона отменён: эфир завершён.".into());
+        }
+        Ok(id)
     })
     .await
     .map_err(|_| "Не удалось запустить обработку микрофона.".to_string())?
 }
-
-/// A delayed stop from an old view or input cannot stop its replacement.
 #[tauri::command]
 pub async fn audio_stop(state: State<'_, AudioState>, capture_id: u64) -> Result<(), String> {
     let audio = state.inner().clone();
@@ -54,9 +100,6 @@ pub async fn audio_stop(state: State<'_, AudioState>, capture_id: u64) -> Result
         .await
         .map_err(|_| "Не удалось остановить микрофон.".to_string())?
 }
-
-/// Processing switches on the existing stream; toggling a filter must not reopen
-/// a USB endpoint or interrupt the Realtime microphone interval.
 #[tauri::command]
 pub fn audio_set_noise_suppression(
     state: State<'_, AudioState>,
@@ -65,49 +108,46 @@ pub fn audio_set_noise_suppression(
 ) -> Result<(), String> {
     state.set_noise_suppression(capture_id, enabled)
 }
-
-/// Render endpoint inventory only; this never starts recording.
 #[tauri::command]
 pub async fn system_audio_state() -> Result<InputState, String> {
     tauri::async_runtime::spawn_blocking(audio::system_state)
         .await
         .map_err(|_| "Не удалось проверить устройства вывода Windows.".to_string())
 }
-
-/// A distinct native state allows microphone and output loopback to run together.
-/// Output is the selected endpoint's complete mix, not participant-specific audio.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn system_audio_start(
     state: State<'_, SystemAudioState>,
+    assistant: State<'_, AssistantState>,
     mode: CaptureMode,
     device_id: Option<String>,
     noise_suppression: bool,
     on_event: Channel<SystemAudioEvent>,
+    session_id: Option<u64>,
+    broadcast_id: Option<String>,
 ) -> Result<u64, String> {
-    if device_id
-        .as_ref()
-        .is_some_and(|id| id.len() > 4096 || id.chars().any(char::is_control))
-    {
-        return Err("Некорректное устройство вывода.".into());
-    }
+    validate_device(&device_id)?;
     let audio = state.inner().clone();
-    let ticket = audio.start_ticket(mode);
+    let permission = prepare_capture(&assistant, &audio, mode, session_id, broadcast_id).await?;
     tauri::async_runtime::spawn_blocking(move || {
-        audio.start_with_ticket(
+        let id = audio.start_with_ticket(
             AudioConfig {
                 device_id: device_id.filter(|id| !id.is_empty()),
                 mode,
                 noise_suppression,
             },
-            ticket,
+            permission.ticket,
             move |event| on_event.send(event.into()).is_ok(),
-        )
+        )?;
+        if !permission.current() {
+            audio.stop(Some(id))?;
+            return Err("Запуск звука встречи отменён: эфир завершён.".into());
+        }
+        Ok(id)
     })
     .await
     .map_err(|_| "Не удалось запустить захват системного звука.".to_string())?
 }
-
-/// Exact IDs cannot stop a different microphone or a replacement output capture.
 #[tauri::command]
 pub async fn system_audio_stop(
     state: State<'_, SystemAudioState>,
@@ -117,4 +157,35 @@ pub async fn system_audio_stop(
     tauri::async_runtime::spawn_blocking(move || audio.stop(Some(capture_id)))
         .await
         .map_err(|_| "Не удалось остановить захват системного звука.".to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn stream_requires_a_live_binding_but_local_test_does_not() {
+        let assistant = AssistantState::default();
+        let audio = AudioState::default();
+        assert!(
+            prepare_capture(&assistant, &audio, CaptureMode::Stream, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare_capture(
+                &assistant,
+                &audio,
+                CaptureMode::Stream,
+                Some(99),
+                Some("old".into())
+            )
+            .await
+            .is_err()
+        );
+        let test = prepare_capture(&assistant, &audio, CaptureMode::Test, None, None)
+            .await
+            .unwrap();
+        assert!(test.current());
+        assert!(audio.ticket_valid_for_test(test.ticket, CaptureMode::Test));
+    }
 }

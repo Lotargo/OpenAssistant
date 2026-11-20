@@ -52,10 +52,11 @@ test('custom mode keeps its exact draft and disabled voice across both window re
 });
 
 for (const change of ['stop-connect', 'mode-stop', 'instructions']) {
-  test('custom dialogue cannot start capture after pending voice ' + change, async ({ page }) => {
-    await openNative(page, { autoReady: false });
+  test('custom dialogue cannot start capture after pending broadcast ' + change, async ({ page }) => {
+    await openNative(page, { autoReady: false, autoVoiceReady: false });
     const settings = await openSettingsTab(page, 'modes');
     await settings.locator('#agent-scenario').selectOption('custom');
+    await expect(page.locator('#mode-switcher [data-scenario="custom"]')).toHaveAttribute('aria-pressed', 'true');
     if (change === 'stop-connect') await page.evaluate(() => window.__nativeContract.delayNext('assistant_connect'));
     await settings.locator('#voice-start').click();
     await expect.poll(() => page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(1);
@@ -65,33 +66,32 @@ for (const change of ['stop-connect', 'mode-stop', 'instructions']) {
       await expect.poll(() => page.evaluate(() => window.__nativeContract.pending.some(item => item.name === 'assistant_connect'))).toBe(true);
       await settings.locator('#voice-stop').click();
       await page.evaluate(() => window.__nativeContract.release('assistant_connect'));
+      await page.evaluate(id => window.__nativeContract.readySession(id), sessionId);
     } else {
-      await emitSession(page, sessionId, { type: 'agent_state', stage: 'ready', detail: 'Codex подключён' });
-      await expect(settings.locator('#agent-runtime')).toHaveText('Codex подключён');
+      await page.evaluate(id => window.__nativeContract.readySession(id), sessionId);
+      await expect.poll(() => page.evaluate(() => window.__nativeContract.broadcastStarts.length)).toBe(1);
       await expect(settings.locator('#agent-realtime-status')).toContainText('подключается');
       if (change === 'mode-stop') {
+        // Changing source semantics ends the pending old broadcast; it must not
+        // automatically create a microphone-plus-system broadcast.
         await settings.locator('#agent-custom-behavior').selectOption('selective');
-        await expect(settings.locator('#mode-config-status')).toContainText('следующем подключении');
-        // The toolbar must cancel the old single-microphone intent even though
-        // the newly selected mode uses both sources and no capture is active yet.
-        await expect(page.locator('[data-action="microphone"]')).toBeEnabled();
-        await page.locator('[data-action="microphone"]').click();
+        await expect.poll(() => page.evaluate(() => window.__nativeContract.agentSaves.at(-1)?.custom_behavior)).toBe('selective');
       } else {
         await settings.locator('#agent-custom-instructions').fill('Новое правило после готовности текстового агента.');
         await settings.locator('#agent-custom-name').focus();
         await expect(settings.locator('#mode-config-status')).toContainText('следующем подключении');
       }
     }
-    await page.evaluate(id => window.__nativeContract.readySession(id), sessionId);
-    await expect(settings.locator('#agent-runtime')).toHaveText('Codex подключён');
-    await expect(settings.locator('#agent-connect')).toHaveText(change === 'stop-connect' ? 'Переподключить' : 'Применить и переподключить');
-    if (change === 'instructions') await expect(settings.locator('#voice-error')).toContainText('Параметры изменились во время подключения');
-    else await expect(settings.locator('#voice-stop')).toBeDisabled();
+    await page.evaluate(id => window.__nativeContract.readyBroadcast(id), sessionId);
+    await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
+    await expect(page.locator('[data-action="microphone"]')).toBeDisabled();
+    if (change === 'instructions') await expect(settings.locator('#agent-error')).toContainText('Настройки изменились во время подключения');
+    await expect(settings.locator(change === 'mode-stop' ? '#interview-stop' : '#voice-stop')).toBeDisabled();
     expect(await page.evaluate(() => ({
       microphone: window.__nativeContract.audioStarts,
       system: window.__nativeContract.systemAudioStarts,
-      disconnected: window.__nativeContract.calls.filter(call => call.name === 'assistant_disconnect').length,
-    }))).toEqual({ microphone: [], system: [], disconnected: 0 });
+      starts: window.__nativeContract.broadcastStarts.length,
+    }))).toEqual({ microphone: [], system: [], starts: change === 'stop-connect' ? 0 : 1 });
     await settings.locator('#tab-agent').click();
     await settings.locator('#agent-prompt').fill('Текстовый агент остаётся доступен.');
     await expect(settings.locator('#agent-send')).toBeEnabled();

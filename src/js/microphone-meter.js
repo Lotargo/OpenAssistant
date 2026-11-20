@@ -126,6 +126,25 @@ export function createMicrophoneIndicator(button) {
 /** Normal mode mirrors the mic; interview mode keeps mic left, meeting right.
  * Displays consume existing frames only and have bounded stale-frame timers.
  */
+/** The toolbar shows the freshest usable source with the louder input level.
+ * Muting the microphone never hides meeting audio; the mic button stays separate.
+ */
+export function selectToolbarAudio(runtime = {}, now = Date.now()) {
+  let chosen = null;
+  let strength = -1;
+  let source = '';
+  for (const [name, levels, enabled] of [
+    ['microphone', runtime.microphoneLevels, Boolean(runtime.microphoneTesting || !runtime.microphoneMuted)],
+    ['system', runtime.systemAudioLevels, Boolean(runtime.systemAudioActive)],
+  ]) {
+    const view = audioLevelView(levels, enabled, now);
+    if (view.active && (view.percent > strength || view.percent === strength && levels.at > (chosen?.at ?? 0))) {
+      chosen = levels; strength = view.percent; source = name;
+    }
+  }
+  return { levels: chosen, source, microphoneMuted: !chosen, toolbarSharedAudio: true };
+}
+
 export function createToolbarAudioIndicator(toolbar) {
   const sides = [...toolbar.querySelectorAll('[data-toolbar-audio]')].map(panel => {
     const wave = panel.querySelector('.toolbar-audio-wave');
@@ -143,6 +162,10 @@ export function createToolbarAudioIndicator(toolbar) {
   });
   return {
     update(levels, runtime = {}) {
+      if (runtime.toolbarSharedAudio) {
+        for (const side of sides) side.update(levels, runtime);
+        return;
+      }
       sides[0]?.update(levels, runtime);
       const separate = runtime.systemAudioActive || ['starting', 'listening', 'evaluating', 'helping'].includes(runtime.interviewState?.stage);
       sides[1]?.update(separate ? runtime.systemAudioLevels : levels, separate

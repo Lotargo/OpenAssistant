@@ -4,12 +4,12 @@ mod devices;
 mod levels;
 mod loopback;
 mod processing;
-pub use devices::{input_state, system_state, InputState};
+pub use devices::{InputState, input_state, system_state};
 pub use levels::AudioLevels;
 
 use cpal::{
-    traits::{DeviceTrait, StreamTrait},
     FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
+    traits::{DeviceTrait, StreamTrait},
 };
 use loopback::LoopbackClock;
 use processing::{Captured, Processor};
@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
         Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -139,6 +139,7 @@ impl Control {
 struct Worker {
     id: u64,
     mode: CaptureMode,
+    stream_epoch: u64,
     control: Arc<Control>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -167,6 +168,7 @@ struct Slots {
 struct Inner {
     epoch: AtomicU64,
     test_epoch: AtomicU64,
+    stream_epoch: AtomicU64,
     operation: Mutex<()>,
     slots: Mutex<Slots>,
 }
@@ -188,6 +190,7 @@ impl Drop for Inner {
 pub struct StartTicket {
     epoch: u64,
     test_epoch: u64,
+    stream_epoch: u64,
     mode: CaptureMode,
 }
 impl StartTicket {
@@ -196,6 +199,8 @@ impl StartTicket {
             && self.epoch == state.epoch.load(Ordering::Acquire)
             && (mode != CaptureMode::Test
                 || self.test_epoch == state.test_epoch.load(Ordering::Acquire))
+            && (mode != CaptureMode::Stream
+                || self.stream_epoch == state.stream_epoch.load(Ordering::Acquire))
     }
 }
 
@@ -224,11 +229,51 @@ impl std::ops::Deref for SystemAudioState {
     }
 }
 
+/// A stop snapshot owns only stream generations that already existed. Joining it
+/// later cannot stop a new broadcast or a local microphone test.
+#[derive(Clone)]
+pub struct StreamStop {
+    audio: AudioState,
+    through_epoch: u64,
+}
+impl StreamStop {
+    pub fn join(&self) -> Result<(), String> {
+        // Wait for an already queued start to register/retire its worker. The
+        // epoch fence has already made its ticket invalid before any activation.
+        let _operation = lock(&self.audio.inner.operation);
+        let workers = self.audio.take_matching(|worker| {
+            worker.mode == CaptureMode::Stream && worker.stream_epoch <= self.through_epoch
+        });
+        for worker in &workers {
+            worker.control.stop(DISCARD);
+        }
+        for worker in workers {
+            worker.join()?;
+        }
+        Ok(())
+    }
+}
+
 impl AudioState {
+    pub fn invalidate_stream(&self) -> StreamStop {
+        let through_epoch = self.inner.stream_epoch.fetch_add(1, Ordering::AcqRel);
+        self.invalidate_matching(|worker| {
+            worker.mode == CaptureMode::Stream && worker.stream_epoch <= through_epoch
+        });
+        StreamStop {
+            audio: self.clone(),
+            through_epoch,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn ticket_valid_for_test(&self, ticket: StartTicket, mode: CaptureMode) -> bool {
+        ticket.valid(&self.inner, mode)
+    }
     pub fn start_ticket(&self, mode: CaptureMode) -> StartTicket {
         StartTicket {
             epoch: self.inner.epoch.load(Ordering::Acquire),
             test_epoch: self.inner.test_epoch.load(Ordering::Acquire),
+            stream_epoch: self.inner.stream_epoch.load(Ordering::Acquire),
             mode,
         }
     }
@@ -309,6 +354,7 @@ impl AudioState {
         let candidate = Arc::new(Worker {
             id,
             mode,
+            stream_epoch: ticket.stream_epoch,
             control,
             thread: Mutex::new(Some(thread)),
         });
@@ -759,7 +805,7 @@ fn capture(
             _ => {
                 return Err(format!(
                     "Формат аудиоустройства {format:?} пока не поддерживается."
-                ))
+                ));
             }
         };
         if control.stop.load(Ordering::Acquire) != 0 || !is_current() {

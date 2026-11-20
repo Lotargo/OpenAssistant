@@ -33,6 +33,8 @@ async fn abort_finishes_before_temporary_workspace_files_are_removed() {
         workspace,
         last_workspace: last_workspace.clone(),
         on_event: None,
+        audio: Arc::new(BroadcastAudio::default()),
+        voice_control: session::BroadcastControl::default(),
     };
     session.stop().await;
     assert!(!path.exists());

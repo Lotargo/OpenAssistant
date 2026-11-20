@@ -189,25 +189,22 @@ async fn reject_task(
     result.and(error)
 }
 async fn finish_cleanup(output: &mpsc::Sender<Output>, tasks: Vec<(String, String, String)>) {
-    // Complete all accepted function calls first; UI delivery is best effort during teardown.
-    let sends = tasks.iter().map(|(id, text, status)| {
-        output.send(Output::Completed {
-            id: id.clone(),
-            text: text.clone(),
-            status: status.clone(),
-        })
+    // A terminal broadcast may exit after its last Completed. Keep the matching
+    // UI result ahead of it, including when teardown meets channel backpressure.
+    let sends = tasks.into_iter().map(|(id, text, status)| async move {
+        let _ = output
+            .send(Output::Ui(bridge::event(
+                "agent_done",
+                json!({"task_id":id,"text":text,"status":status}),
+            )))
+            .await;
+        let _ = output.send(Output::Completed { id, text, status }).await;
     });
     let _ = time::timeout(
         Duration::from_millis(700),
         futures_util::future::join_all(sends),
     )
     .await;
-    for (id, text, status) in tasks {
-        let _ = output.try_send(Output::Ui(bridge::event(
-            "agent_done",
-            json!({"task_id":id,"text":text,"status":status}),
-        )));
-    }
 }
 
 pub fn require_chatgpt(account: &Value) -> Result<(), SafeError> {
@@ -958,6 +955,46 @@ async fn notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_publishes_task_status_before_terminal_session_drains() {
+        let (output, mut events) = mpsc::channel(1);
+        let cleanup = tokio::spawn(async move {
+            finish_cleanup(
+                &output,
+                vec![
+                    ("first".into(), "Codex disconnected".into(), "failed".into()),
+                    ("second".into(), "Cancelled".into(), "interrupted".into()),
+                ],
+            )
+            .await;
+        });
+        let mut visible = HashMap::new();
+        let mut remaining = HashSet::from(["first".to_owned(), "second".to_owned()]);
+        // Model the session's terminal drain: it stops reading after the last
+        // accepted task completes. Every final UI result must already be seen.
+        while !remaining.is_empty() {
+            match time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .expect("cleanup must settle all accepted tasks")
+            {
+                Output::Ui(value) => {
+                    assert_eq!(value["type"], "agent_done");
+                    visible.insert(value["task_id"].as_str().unwrap().to_owned(), value);
+                }
+                Output::Completed { id, text, status } => {
+                    let terminal = visible.get(&id).expect("UI result precedes drain");
+                    assert_eq!(terminal["text"], text);
+                    assert_eq!(terminal["status"], status);
+                    assert!(remaining.remove(&id));
+                }
+            }
+        }
+        assert_eq!(visible.len(), 2);
+        cleanup.await.unwrap();
+    }
+
     #[test]
     fn requires_chatgpt_account_without_exposing_account_data() {
         assert!(require_chatgpt(&json!({"account":{"type":"chatgpt","email":"private"}})).is_ok());

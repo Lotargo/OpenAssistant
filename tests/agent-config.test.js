@@ -46,3 +46,19 @@ test('switching to a preset retains the custom draft without activating its beha
   assert.equal(normalizeAgent({ ...draft, scenario: 'unknown' }).scenario, 'assistant');
   assert.equal(normalizeAgent({ ...draft, custom_behavior: 'unknown' }).custom_behavior, 'dialogue');
 });
+
+test('broadcast preferences migrate safely and retain explicit silence and semantic-end choices', () => {
+  const defaults = normalizeAgent({ scenario: 'assistant', realtime: false });
+  assert.equal(defaults.silence_timeout_secs, 300);
+  assert.equal(defaults.agent_auto_end, true);
+  for (const seconds of [0, 30, 300, 3600]) {
+    const config = normalizeAgent({ scenario: 'custom', silence_timeout_secs: seconds, agent_auto_end: false });
+    assert.equal(config.silence_timeout_secs, seconds);
+    assert.equal(config.agent_auto_end, false);
+    assert.equal(normalizeAgent({ ...config, scenario: 'interview' }).silence_timeout_secs, seconds);
+  }
+  for (const invalid of [-1, 29, 3601, 60.5, NaN, Infinity, '300', null]) {
+    assert.equal(normalizeAgent({ silence_timeout_secs: invalid }).silence_timeout_secs, 300);
+  }
+  for (const invalid of ['false', 0, null]) assert.equal(normalizeAgent({ agent_auto_end: invalid }).agent_auto_end, true);
+});

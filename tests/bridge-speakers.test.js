@@ -31,20 +31,44 @@ async function fixture(t, scenario = 'interview') {
         return { available: true, devices: [{ id: name, name: 'Fixture only', is_default: true }] };
       case 'assistant_connect': {
         const id = nextSession++;
-        const owner = { channel: args.onEvent, index: 0 };
+        const owner = { id, channel: args.onEvent, index: 0, broadcastId: null, stage: 'idle', active: true };
         sessions.set(id, owner);
         queueMicrotask(() => {
-          emit(owner, { type: 'interview_state', stage: 'idle' });
-          emit(owner, { type: 'speaker_state', status: 'loading', detail: 'Starting local grouping' });
           emit(owner, { type: 'agent_state', stage: 'ready', detail: 'Ready' });
-          emit(owner, { type: 'status', stage: 'ready', realtime: true });
+          emit(owner, { type: 'status', stage: 'ready', realtime: false });
         });
         return id;
       }
-      case 'assistant_send': messages.push(args.message); return null;
+      case 'assistant_send': {
+        const owner = sessions.get(args.sessionId);
+        const message = args.message;
+        messages.push(message);
+        if (message.type === 'broadcast_start') {
+          assert.equal(owner.broadcastId, null);
+          owner.broadcastId = message.broadcast_id;
+          owner.stage = 'live';
+          emit(owner, { type: 'broadcast_state', stage: 'starting', broadcast_id: owner.broadcastId });
+          emit(owner, { type: 'status', stage: 'ready', realtime: true, broadcast_id: owner.broadcastId });
+          emit(owner, { type: 'broadcast_state', stage: 'live', broadcast_id: owner.broadcastId });
+        } else if (message.type === 'broadcast_stop') {
+          assert.equal(message.broadcast_id, owner.broadcastId);
+          owner.stage = 'ended';
+          emit(owner, { type: 'broadcast_state', stage: 'ended', reason: 'user', broadcast_id: owner.broadcastId });
+          queueMicrotask(() => emit(owner, { type: 'session_closed', message: 'Stopped' }));
+        } else if (message.type === 'interview_start') {
+          emit(owner, { type: 'speaker_state', status: 'loading', detail: 'Starting local grouping' });
+          emit(owner, { type: 'interview_state', stage: 'listening' });
+        }
+        return null;
+      }
       case 'assistant_audio': throw new Error('Speaker metadata tests must never send PCM');
-      case 'assistant_disconnect': return null;
+      case 'assistant_disconnect':
+        if (sessions.has(args.sessionId)) sessions.get(args.sessionId).active = false;
+        return null;
       case 'audio_start': case 'system_audio_start': {
+        const session = sessions.get(args.sessionId);
+        assert.ok(session?.active && session.stage === 'live');
+        assert.equal(args.broadcastId, session.broadcastId);
         const id = nextCapture++;
         const owner = { channel: args.onEvent, index: 0 };
         captures.set(id, owner);
@@ -89,7 +113,7 @@ async function fixture(t, scenario = 'interview') {
 
 test('speaker attribution updates only matching remote history and the current label only for the latest utterance', async t => {
   const f = await fixture(t);
-  await f.bridge.command('start_interview');
+  await f.bridge.command('start_broadcast');
   assert.equal(f.state().interviewState.stage, 'listening');
   assert.equal(f.state().speakerState.status, 'loading');
   f.emit({ type: 'transcript', utterance_id: 10, source: 'system', text: 'Earlier remote question' });
@@ -111,12 +135,12 @@ test('speaker attribution updates only matching remote history and the current l
   assert.equal(f.state().interviewState.speaker_label, 'Участник B');
 });
 
-test('explicit interview stop clears context and late same-channel events cannot revive listening or speaker state', async t => {
+test('broadcast stop clears meeting context and late same-channel events cannot revive listening or speaker state', async t => {
   const f = await fixture(t);
-  await f.bridge.command('start_interview');
+  await f.bridge.command('start_broadcast');
   f.emit({ type: 'transcript', utterance_id: 21, source: 'system', text: 'A meeting question' });
   f.emit({ type: 'speaker_state', status: 'ready', detail: 'Grouping ready' });
-  await f.bridge.command('stop_interview');
+  await f.bridge.command('stop_broadcast');
   assert.equal(f.state().transcript, '');
   assert.deepEqual(f.state().transcriptHistory, []);
   assert.equal(f.state().speakerState.status, 'idle');
@@ -132,17 +156,17 @@ test('explicit interview stop clears context and late same-channel events cannot
   f.emit({ type: 'interview_state', stage: 'error', detail: 'A useful failure status' });
   assert.equal(f.state().interviewState.stage, 'error');
   f.emit({ type: 'interview_state', stage: 'idle' });
-  await f.bridge.command('start_interview');
+  await f.bridge.command('start_broadcast');
   f.emit({ type: 'speaker_state', status: 'loading', detail: 'Restarting grouping' });
   f.emit({ type: 'transcript', utterance_id: 23, source: 'system', text: 'A new meeting turn' });
   assert.equal(f.state().speakerState.status, 'loading');
   assert.equal(f.state().transcriptHistory.at(-1).utterance_id, 23);
-  assert.equal(f.calls.filter(name => name === 'assistant_connect').length, connects);
+  assert.equal(f.calls.filter(name => name === 'assistant_connect').length, connects + 1);
 });
 
-test('ordinary assistant transcripts remain available without interview listening intent', async t => {
+test('ordinary assistant broadcast transcripts remain available without meeting listening intent', async t => {
   const f = await fixture(t, 'assistant');
-  await f.bridge.command('reconnect_session');
+  await f.bridge.command('start_broadcast');
   f.emit({ type: 'transcript', text: 'Ordinary dictation', source: 'microphone' });
   assert.equal(f.state().transcript, 'Ordinary dictation');
   assert.equal(f.state().transcriptHistory.length, 1);

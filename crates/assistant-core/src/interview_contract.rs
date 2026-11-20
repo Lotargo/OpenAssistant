@@ -58,7 +58,11 @@ impl VoiceHub {
                 }
             }
         });
-        Voice { commands, task }
+        Voice {
+            commands,
+            task,
+            lifecycle: None,
+        }
     }
     async fn event(&self, source: Source, value: Value) {
         let output = self.outputs.lock().unwrap()[source.index()]
@@ -116,6 +120,7 @@ struct Fixture {
     events: mpsc::Receiver<Value>,
     gates: mpsc::UnboundedReceiver<Value>,
     hub: Arc<VoiceHub>,
+    control: BroadcastControl,
     task: Option<JoinHandle<Result<(), SafeError>>>,
 }
 impl Fixture {
@@ -133,6 +138,25 @@ impl Fixture {
         custom_behavior: session::CustomBehavior,
         custom_instructions: &str,
     ) -> Self {
+        Self::start_runtime(
+            auto_clear,
+            scenario,
+            custom_behavior,
+            custom_instructions,
+            300,
+            false,
+        )
+    }
+    fn start_runtime(
+        auto_clear: bool,
+        scenario: session::Scenario,
+        custom_behavior: session::CustomBehavior,
+        custom_instructions: &str,
+        silence_timeout_secs: u32,
+        agent_auto_end: bool,
+    ) -> Self {
+        // This internal seam allows a one-second offline watchdog; public validation
+        // still requires zero or 30..=3600 seconds.
         let root = std::env::temp_dir().join(format!(
             "openassistant-interview-contract-{}-{}",
             std::process::id(),
@@ -163,6 +187,8 @@ impl Fixture {
             custom_name: session::default_custom_name(),
             custom_instructions: custom_instructions.into(),
             custom_behavior,
+            silence_timeout_secs,
+            agent_auto_end,
             model: None,
             effort: None,
             web_search: false,
@@ -181,6 +207,7 @@ impl Fixture {
             stopped: AtomicUsize::new(0),
         });
         let worker = hub.clone();
+        let control = BroadcastControl::default();
         let task = tokio::spawn(run_inner(
             config,
             input_rx,
@@ -188,6 +215,7 @@ impl Fixture {
             options,
             move |source, _model, output| worker.start(source, output),
             None,
+            control.clone(),
         ));
         Self {
             root,
@@ -196,10 +224,27 @@ impl Fixture {
             events,
             gates,
             hub,
+            control,
             task: Some(task),
         }
     }
-    async fn message(&self, value: Value) {
+    async fn message(&self, mut value: Value) {
+        if matches!(
+            value["type"].as_str(),
+            Some(
+                "broadcast_start"
+                    | "broadcast_stop"
+                    | "mic_start"
+                    | "mic_stop"
+                    | "system_start"
+                    | "system_stop"
+                    | "interview_start"
+                    | "interview_stop"
+            )
+        ) && value.get("broadcast_id").is_none()
+        {
+            value["broadcast_id"] = json!("broadcast-1");
+        }
         self.input.send(SessionInput::Message(value)).await.unwrap();
     }
     async fn event(&mut self, kind: &str, stage: Option<&str>) -> Value {
@@ -215,12 +260,13 @@ impl Fixture {
         .expect("interview event timed out")
     }
     async fn ready(&mut self) {
-        loop {
-            let value = self.event("status", Some("ready")).await;
-            if value["realtime"] == true {
-                break;
-            }
-        }
+        assert_eq!(self.event("status", Some("ready")).await["realtime"], false);
+        self.begin_voice().await;
+    }
+    async fn begin_voice(&mut self) {
+        self.message(json!({"type":"broadcast_start"})).await;
+        assert_eq!(self.event("status", Some("ready")).await["realtime"], true);
+        self.event("broadcast_state", Some("live")).await;
     }
     async fn start_listening(&mut self) {
         let clears = self.hub.count("input_audio_buffer.clear");
@@ -264,14 +310,25 @@ impl Fixture {
             .collect()
     }
     async fn finish(&mut self) {
-        self.message(json!({"type":"disconnect"})).await;
+        let _ = self
+            .input
+            .send(SessionInput::Message(json!({"type":"disconnect"})))
+            .await;
         time::timeout(Duration::from_secs(5), self.task.take().unwrap())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+        let started = self
+            .hub
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|output| output.is_some())
+            .count();
         time::timeout(Duration::from_secs(2), async {
-            while self.hub.stopped.load(Ordering::Acquire) != 2 {
+            while self.hub.stopped.load(Ordering::Acquire) != started {
                 time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -416,12 +473,18 @@ async fn two_sources_route_independently_and_semantic_gate_is_the_only_hint_trig
     fixture.ready().await;
     fixture
         .input
-        .send(SessionInput::Audio(vec![1, 0]))
+        .send(SessionInput::Audio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![1, 0],
+        })
         .await
         .unwrap();
     fixture
         .input
-        .send(SessionInput::SystemAudio(vec![2, 0]))
+        .send(SessionInput::SystemAudio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![2, 0],
+        })
         .await
         .unwrap();
     time::sleep(Duration::from_millis(20)).await;
@@ -429,12 +492,18 @@ async fn two_sources_route_independently_and_semantic_gate_is_the_only_hint_trig
     fixture.start_listening().await;
     fixture
         .input
-        .send(SessionInput::Audio(vec![1, 0]))
+        .send(SessionInput::Audio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![1, 0],
+        })
         .await
         .unwrap();
     fixture
         .input
-        .send(SessionInput::SystemAudio(vec![2, 0]))
+        .send(SessionInput::SystemAudio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![2, 0],
+        })
         .await
         .unwrap();
     fixture.hub.wait_count("input_audio_buffer.append", 2).await;
@@ -677,15 +746,22 @@ async fn pause_cancels_unknown_and_late_allocated_response_ids_without_starting_
 }
 
 #[tokio::test]
-async fn a_provider_failure_stops_both_sources_but_keeps_explicit_text_tasks_working() {
+async fn a_provider_failure_closes_voice_but_preserves_an_accepted_task_and_approval() {
     let mut fixture = Fixture::start(true);
     fixture.ready().await;
     fixture.start_listening().await;
+    fixture
+        .message(json!({"type":"agent_task","task":"mock:approval file"}))
+        .await;
+    let approval = fixture.event("agent_approval", None).await;
     fixture.hub.failed(Source::System).await;
     fixture.event("status", Some("voice_error")).await;
-    fixture
-        .message(json!({"type":"text","text":"explicit manual task"}))
-        .await;
+    assert_eq!(
+        fixture.event("broadcast_state", Some("ended")).await["reason"],
+        "error"
+    );
+    assert_eq!(fixture.hub.stopped.load(Ordering::Acquire), 2);
+    fixture.message(json!({"type":"agent_approval","request_id":approval["request_id"],"decision":"decline"})).await;
     let done = fixture.event("agent_done", None).await;
     assert_eq!(done["status"], "completed");
     assert!(
@@ -787,4 +863,299 @@ async fn expired_local_transcription_discards_the_candidate_and_ignores_its_late
             .iter()
             .any(|entry| entry["method"] == "turn/start")
     );
+}
+
+#[tokio::test]
+async fn text_only_connect_is_lazy_and_explicit_start_owns_exactly_two_workers() {
+    let mut fixture = Fixture::start(true);
+    assert_eq!(
+        fixture.event("status", Some("ready")).await["realtime"],
+        false
+    );
+    assert!(
+        fixture
+            .hub
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    fixture
+        .message(json!({"type":"agent_task","task":"mock:tools"}))
+        .await;
+    assert_eq!(
+        fixture.event("agent_done", None).await["status"],
+        "completed"
+    );
+    assert!(
+        fixture
+            .hub
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    fixture.begin_voice().await;
+    assert!(
+        fixture
+            .hub
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
+    fixture
+        .message(json!({"type":"agent_task","task":"mock:tools"}))
+        .await;
+    time::timeout(Duration::from_secs(4), async {
+        loop {
+            let event = fixture.events.recv().await.unwrap();
+            assert!(
+                !(event["type"] == "status"
+                    && event["stage"] == "ready"
+                    && event["realtime"] == false),
+                "task completion must not announce that live voice is off"
+            );
+            if event["type"] == "agent_state" && event["stage"] == "ready" {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    fixture.message(json!({"type":"broadcast_stop"})).await;
+    let ended = fixture.event("broadcast_state", Some("ended")).await;
+    assert_eq!(ended["broadcast_id"], "broadcast-1");
+    assert_eq!(ended["reason"], "user");
+    assert_eq!(fixture.hub.stopped.load(Ordering::Acquire), 2);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn continuous_silent_pcm_does_not_keep_a_broadcast_alive() {
+    let mut fixture = Fixture::start_runtime(
+        true,
+        session::Scenario::Interview,
+        session::CustomBehavior::Dialogue,
+        "",
+        1,
+        false,
+    );
+    fixture.ready().await;
+    fixture.start_listening().await;
+    let input = fixture.input.clone();
+    let feeder = tokio::spawn(async move {
+        loop {
+            if input
+                .send(SessionInput::SystemAudio {
+                    broadcast_id: "broadcast-1".into(),
+                    data: vec![0; 480],
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let ended = fixture.event("broadcast_state", Some("ended")).await;
+    feeder.abort();
+    let _ = feeder.await;
+    assert_eq!(ended["reason"], "silence");
+    assert!(ended["farewell"].as_str().unwrap().contains("Эфир"));
+    assert!(fixture.hub.count("input_audio_buffer.append") > 3);
+    assert_eq!(fixture.hub.stopped.load(Ordering::Acquire), 2);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn native_stop_closes_workers_while_approval_drains_and_late_start_cannot_reopen() {
+    let mut fixture = Fixture::start_runtime(
+        true,
+        session::Scenario::Interview,
+        session::CustomBehavior::Dialogue,
+        "",
+        1,
+        false,
+    );
+    fixture.ready().await;
+    fixture.start_listening().await;
+    fixture
+        .message(json!({"type":"agent_task","task":"mock:approval file"}))
+        .await;
+    let approval = fixture.event("agent_approval", None).await;
+    time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        fixture.hub.stopped.load(Ordering::Acquire),
+        0,
+        "busy work prevents auto-stop"
+    );
+    for kind in [
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.committed",
+        "input_audio_buffer.speech_stopped",
+    ] {
+        fixture
+            .hub
+            .event(Source::System, json!({"type":kind,"item_id":"stop-race"}))
+            .await;
+    }
+    time::sleep(Duration::from_millis(15)).await;
+    fixture.control.stop("broadcast-1"); // Native cancellation works without a queued core command.
+    fixture
+        .hub
+        .event(
+            Source::System,
+            json!({"type":"conversation.item.input_audio_transcription.completed",
+        "item_id":"stop-race","transcript":"Late provider output after native stop"}),
+        )
+        .await;
+    assert_eq!(
+        fixture.event("broadcast_state", Some("ended")).await["reason"],
+        "user"
+    );
+    assert_eq!(fixture.hub.stopped.load(Ordering::Acquire), 2);
+    assert!(
+        !fixture.task.as_ref().unwrap().is_finished(),
+        "Codex approval must remain alive"
+    );
+    let appended = fixture.hub.count("input_audio_buffer.append");
+    fixture
+        .input
+        .send(SessionInput::SystemAudio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![1, 0],
+        })
+        .await
+        .unwrap();
+    fixture
+        .message(json!({"type":"broadcast_start","broadcast_id":"broadcast-2"}))
+        .await;
+    fixture.event("error", None).await;
+    assert_eq!(fixture.hub.count("input_audio_buffer.append"), appended);
+    fixture.message(json!({"type":"agent_approval","request_id":approval["request_id"],"decision":"decline"})).await;
+    let done = fixture.event("agent_done", None).await;
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["text"], "APPROVAL_DECLINE");
+    fixture.finish().await;
+    assert!(
+        !fixture
+            .audit()
+            .iter()
+            .any(|request| request["method"] == "turn/interrupt")
+    );
+}
+
+#[tokio::test]
+async fn microphone_mute_keeps_system_context_and_hint_decisions_active() {
+    let mut fixture = Fixture::start(true);
+    fixture.ready().await;
+    fixture.start_listening().await;
+    fixture.message(json!({"type":"mic_stop"})).await;
+    fixture
+        .hub
+        .wait_count("input_audio_buffer.append", 10)
+        .await;
+    let before = fixture.hub.count("input_audio_buffer.append");
+    fixture
+        .input
+        .send(SessionInput::Audio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![1, 0],
+        })
+        .await
+        .unwrap();
+    fixture
+        .input
+        .send(SessionInput::SystemAudio {
+            broadcast_id: "broadcast-1".into(),
+            data: vec![2, 0],
+        })
+        .await
+        .unwrap();
+    fixture
+        .hub
+        .wait_count("input_audio_buffer.append", before + 1)
+        .await;
+    assert_eq!(fixture.hub.count("input_audio_buffer.append"), before + 1);
+    fixture
+        .hub
+        .phrase(
+            Source::System,
+            "muted-question",
+            "Explain SQL join while my microphone is muted",
+        )
+        .await;
+    assert_eq!(fixture.event("transcript", None).await["source"], "system");
+    let request = fixture.gate().await;
+    assert_eq!(
+        request["response"]["tool_choice"]["name"],
+        "interview_decision"
+    );
+    fixture.decision(&request, false).await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn conservative_semantic_end_closes_both_workers_and_includes_restart_guidance() {
+    let mut fixture = Fixture::start_runtime(
+        true,
+        session::Scenario::Custom,
+        session::CustomBehavior::OnRequest,
+        "",
+        0,
+        true,
+    );
+    fixture.ready().await;
+    fixture.start_listening().await;
+    fixture
+        .hub
+        .phrase(
+            Source::System,
+            "resolved",
+            "All of our questions have been resolved",
+        )
+        .await;
+    fixture.event("transcript", None).await;
+    fixture
+        .hub
+        .phrase(
+            Source::System,
+            "finished",
+            "Our meeting is now finished and no further help is needed",
+        )
+        .await;
+    fixture.event("transcript", None).await;
+    let request = fixture.gate().await;
+    assert_eq!(request["response"]["metadata"]["purpose"], "broadcast_end");
+    fixture.hub.event(Source::System, json!({"type":"response.done","response":{
+        "id":"end-decision","metadata":request["response"]["metadata"],"status":"completed",
+        "output":[{"type":"function_call","name":"broadcast_end_decision","status":"completed",
+            "arguments":json!({"end":true,"confidence":0.99,"closure":"clear",
+                "needs_followup":false,"farewell":"До встречи!"}).to_string()}]
+    }})).await;
+    let ended = time::timeout(Duration::from_secs(8), async {
+        loop {
+            let value = fixture.events.recv().await.unwrap();
+            if value["type"] == "broadcast_state" && value["stage"] == "ended" {
+                break value;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended["reason"], "agent");
+    assert!(ended["farewell"].as_str().unwrap().contains("нажми „Эфир“"));
+    assert_eq!(fixture.hub.stopped.load(Ordering::Acquire), 2);
+    assert!(
+        !fixture
+            .audit()
+            .iter()
+            .any(|request| request["method"] == "turn/start")
+    );
+    fixture.finish().await;
 }

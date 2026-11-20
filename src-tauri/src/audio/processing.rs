@@ -1,5 +1,5 @@
 //! Local CPU processing outside the capture callback. Source peaks precede all filters.
-use super::{levels::AudioAnalyzer, AudioLevels};
+use super::{AudioLevels, levels::AudioAnalyzer};
 use nnnoiseless::DenoiseState;
 use std::f64::consts::PI;
 

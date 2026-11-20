@@ -7,7 +7,7 @@ async function openDemo(page, mode) {
   await expect(page.locator('html')).toHaveAttribute('data-ready', 'true');
 }
 
-test('text uses rendered Markdown and exactly six centered bottom controls', async ({ page }) => {
+test('text uses rendered Markdown and a centered mode and broadcast strip with seven icon controls', async ({ page }) => {
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   await openDemo(page, 'text');
@@ -18,10 +18,10 @@ test('text uses rendered Markdown and exactly six centered bottom controls', asy
   await expect(page.locator('#split-view')).toBeHidden();
   expect(await text.innerText()).not.toContain('##');
 
-  const controls = page.locator('#toolbar > button');
-  await expect(controls).toHaveCount(6);
+  const controls = page.locator('.toolbar-actions > button');
+  await expect(controls).toHaveCount(7);
   expect(await controls.evaluateAll((buttons) => buttons.map((button) => button.dataset.action)))
-    .toEqual(['screen', 'microphone', 'reconnect', 'settings', 'scroll-lock', 'window-mode']);
+    .toEqual(['screen', 'microphone', 'reconnect', 'settings', 'scroll-lock', 'window-mode', 'notifications']);
   for (const button of await controls.all()) {
     await expect(button.locator('svg')).toHaveCount(1);
     expect((await button.innerText()).trim()).toBe('');
@@ -32,9 +32,10 @@ test('text uses rendered Markdown and exactly six centered bottom controls', asy
   }
   const overlay = await page.locator('#overlay').boundingBox();
   const toolbar = await page.locator('#toolbar').boundingBox();
-  const first = await controls.first().boundingBox();
-  const last = await controls.last().boundingBox();
-  expect(Math.abs((first.x + last.x + last.width) / 2 - (overlay.x + overlay.width / 2))).toBeLessThan(2);
+  await expect(page.locator('#mode-switcher button')).toHaveCount(3);
+  await expect(page.locator('#mode-switcher [aria-pressed="true"]')).toHaveCount(1);
+  const strip = await page.locator('.toolbar-controls').boundingBox();
+  expect(Math.abs(strip.x + strip.width / 2 - (overlay.x + overlay.width / 2))).toBeLessThan(2);
   expect(Math.abs(toolbar.y + toolbar.height - (overlay.y + overlay.height - 1))).toBeLessThan(2);
   expect(errors).toEqual([]);
 });

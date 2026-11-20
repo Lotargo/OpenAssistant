@@ -14,6 +14,14 @@ export function modeSettings(config = {}) {
   return { custom, meeting, label: modeLabel(config), description };
 }
 
+export function broadcastStatus(state = {}) {
+  const labels = { idle: 'Эфир выключен', starting: 'Подключаю эфир', live: 'В эфире', stopping: 'Завершаю эфир', ended: 'Эфир завершён' };
+  const stage = Object.hasOwn(labels, state.stage) ? state.stage : 'idle';
+  return { stage, label: labels[stage], detail: typeof state.detail === 'string' ? state.detail : '',
+    active: ['starting', 'live', 'stopping'].includes(stage), live: stage === 'live', stopping: stage === 'stopping',
+    error: state.reason === 'error' ? state.detail || 'Эфир остановлен из-за ошибки.' : '' };
+}
+
 const effortNames = {
   none: 'Без рассуждений', minimal: 'Минимальная', low: 'Низкая', medium: 'Средняя',
   high: 'Высокая', xhigh: 'Очень высокая', max: 'Максимальная', ultra: 'Ультра',

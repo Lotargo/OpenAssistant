@@ -33,6 +33,7 @@ export function createAssistantTransport({ invoke, Channel, onEvent, onError } =
 
   return {
     get connected() { return sessionId !== null; },
+    get sessionId() { return sessionId; },
     get bufferedAmount() { return bufferedBytes; },
     async connect(config) {
       if (destroyed) throw new Error('Интерфейс закрыт.');
@@ -58,15 +59,15 @@ export function createAssistantTransport({ invoke, Channel, onEvent, onError } =
       return created;
     },
     send(message) { return enqueue('assistant_send', { message }); },
-    audio(buffer, source = 'microphone') {
-      if (!['microphone', 'system'].includes(source)) return false;
+    audio(buffer, source = 'microphone', broadcastId = null) {
+      if (!['microphone', 'system'].includes(source) || typeof broadcastId !== 'string' || !broadcastId || broadcastId.length > 80) return false;
       if (!(buffer instanceof ArrayBuffer) || !buffer.byteLength || sessionId === null || destroyed) return false;
       if (buffer.byteLength > 9600 || bufferedBytes + buffer.byteLength > MAX_AUDIO_BYTES) {
         onError?.(new Error('Передача аудио не успевает за микрофоном. Микрофон остановлен.'));
         return false;
       }
       const epoch = generation;
-      void enqueue('assistant_audio', { audio: Array.from(new Uint8Array(buffer)), source }, buffer.byteLength)
+      void enqueue('assistant_audio', { audio: Array.from(new Uint8Array(buffer)), source, broadcastId }, buffer.byteLength)
         .catch(error => { if (epoch === generation && !destroyed) onError?.(error); });
       return true;
     },

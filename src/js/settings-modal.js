@@ -58,7 +58,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
             <section id="section-modes" class="settings-section" role="tabpanel" aria-labelledby="tab-modes" hidden>
               <h2>Режимы</h2>
               <p class="settings-description">Выберите задачу ассистента и момент, когда ему нужно отвечать.</p>
-              <div class="agent-field"><label for="agent-scenario">Режим</label><select id="agent-scenario" data-agent-setting="scenario"><option value="assistant">Голосовой помощник</option><option value="interview">Собеседование</option><option value="custom">Свой режим</option></select></div>
+              <div class="agent-field"><label for="agent-scenario">Режим</label><select id="agent-scenario" data-agent-setting="scenario"><option value="assistant">Голосовой помощник</option><option value="interview">Совещание и собеседование</option><option value="custom">Свой режим</option></select></div>
               <p id="mode-description" class="agent-field-note mode-description"></p>
               <div id="agent-custom-fields" class="agent-custom-fields" hidden>
                 <div class="agent-field"><label for="agent-custom-name">Название режима</label><input id="agent-custom-name" data-agent-setting="custom_name" data-max-codepoints="64" type="text" maxlength="128" placeholder="Свой режим" aria-describedby="agent-custom-name-hint"/><p id="agent-custom-name-hint" class="agent-field-note">До 64 символов.</p></div>
@@ -69,7 +69,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
               <section id="voice-panel" class="agent-scenario-card" aria-labelledby="voice-state">
                 <div class="agent-listening-heading"><span class="agent-listening-dot" aria-hidden="true"></span><strong id="voice-state" role="status">Микрофон выключен</strong></div>
                 <p id="voice-detail" class="agent-field-note">Ответы на ваши реплики появляются в основной панели.</p>
-                <div class="agent-actions"><button id="voice-start" class="action-button" type="button">Включить микрофон</button><button id="voice-stop" class="action-button secondary" type="button">Выключить</button></div>
+                <div class="agent-actions"><button id="voice-start" class="action-button" type="button">Включить эфир</button><button id="voice-stop" class="action-button secondary" type="button">Завершить эфир</button></div>
                 <p id="voice-error" class="settings-message" role="status" hidden></p>
               </section>
               <section id="interview-panel" class="agent-scenario-card" aria-labelledby="interview-state" hidden>
@@ -77,7 +77,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
                 <p id="interview-detail" class="agent-field-note">Подсказки по вопросам и задачам, обращённым к вам.</p>
                 <p id="interview-source" class="agent-source-attribution"></p>
                 <p id="interview-speaker-status" class="agent-field-note"></p>
-                <div class="agent-actions"><button id="interview-start" class="action-button" type="button">Начать прослушивание</button><button id="interview-stop" class="action-button secondary" type="button">Остановить</button></div>
+                <div class="agent-actions"><button id="interview-start" class="action-button" type="button">Включить эфир</button><button id="interview-stop" class="action-button secondary" type="button">Завершить эфир</button></div>
                 <p id="interview-error" class="settings-message" role="status" hidden></p>
               </section>
             </section>
@@ -186,6 +186,12 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
                 <div class="settings-control"><input id="setting-max-height" data-setting="maxHeightPercent" type="range" min="40" max="85" step="1"/><output for="setting-max-height" data-value="maxHeightPercent"></output></div>
               </div>
               <p class="settings-hint">Нижняя граница остаётся на месте: панель растёт вверх. Код и пояснения прокручиваются независимо.</p>
+              <section class="behavior-broadcast" aria-labelledby="behavior-broadcast-title">
+                <h3 id="behavior-broadcast-title">Эфир</h3>
+                <p class="agent-field-note">После завершения эфир включается вручную.</p>
+                <div class="agent-field"><label for="agent-silence-timeout">Завершать после тишины</label><select id="agent-silence-timeout" data-agent-setting="silence_timeout_secs"><option value="0">Не завершать</option><option value="60">1 минута</option><option value="180">3 минуты</option><option value="300">5 минут</option><option value="600">10 минут</option><option value="900">15 минут</option><option value="1800">30 минут</option><option value="3600">1 час</option></select></div>
+                <div class="settings-row"><div class="field-copy"><label for="agent-auto-end">Завершение ассистентом</label><small>Ассистент может закончить эфир, когда разговор завершён.</small></div><button id="agent-auto-end" class="setting-toggle" data-agent-setting="agent_auto_end" type="button" aria-label="Завершение эфира ассистентом" aria-pressed="true"><span data-toggle-state>Включено</span></button></div>
+              </section>
             </section>
             <section id="section-journal" class="settings-section" role="tabpanel" aria-labelledby="tab-journal" hidden>
               <h2>Журнал</h2>

@@ -41,7 +41,7 @@ test('Codex connects without keys and streams tool activity, code and guidance t
   await expect(page.locator('#code-content')).toContainText('println!("42")');
   await expect(page.locator('#notes-content')).toContainText('Проверка завершилась с кодом 0.');
   await expect(page.locator('#code-content .line > span[style]')).not.toHaveCount(0);
-  await expect(page.locator('#toolbar > button')).toHaveCount(6);
+  await expect(page.locator('.toolbar-actions > button')).toHaveCount(7);
   await page.screenshot({ path: testInfo.outputPath('codex-result.png'), animations: 'disabled' });
 
   settings = await openAgent(page);
@@ -125,23 +125,26 @@ test('parallel tasks share a session, keep separate results and interruption tar
   expect(await page.evaluate(() => window.__nativeContract.calls.filter(call => call.name === 'assistant_disconnect').at(-1)?.args.sessionId)).toBe(sessionId);
 });
 
-test('Realtime startup failure leaves text tasks available on the same Codex session', async ({ page }) => {
-  let settings;
-  await openNative(page, { autoReady: false });
-  settings = await openAgent(page);
-  await setPressed(settings.locator('#agent-realtime'), true);
-  await settings.locator('#agent-connect').click();
-  await expect.poll(() => page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(1);
-  const sessionId = await page.evaluate(() => window.__nativeContract.sessionIds[0]);
+test('Realtime startup failure preserves a running text task and permits later text work', async ({ page }) => {
+  await openNative(page, { autoVoiceReady: false });
+  const sessionId = await connectAgent(page, { realtime: true });
+  const task = await sendTask(page, 'Текстовая задача уже выполняется');
+  await page.locator('#broadcast-btn').click();
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.broadcastStarts.length)).toBe(1);
   await emitSession(page, sessionId, { type: 'status', stage: 'voice_error', detail: 'Голосовой канал временно недоступен', realtime: false, agent_available: true });
-  await emitSession(page, sessionId, { type: 'agent_state', stage: 'ready', detail: 'Codex подключён' });
-  await expect(settings.locator('#agent-connect')).toHaveText('Переподключить');
+  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
+  const settings = await openAgent(page);
   await expect(settings.locator('#agent-error')).toContainText('Голосовой канал временно недоступен');
-  const task = await sendTask(page, 'Продолжить без голоса');
-  expect(await page.evaluate(() => window.__nativeContract.sessionIds)).toEqual([sessionId]);
+  expect(await page.evaluate(() => ({ sessions: window.__nativeContract.sessionIds, task: window.__nativeContract.lastTask().status })))
+    .toEqual({ sessions: [sessionId], task: 'running' });
   await page.evaluate(taskId => window.__nativeContract.finishTask(taskId, 'Текстовая задача выполнена.'), task.task_id);
   await expect(page.locator('#text-content')).toHaveText('Текстовая задача выполнена.');
-  await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-pressed', 'true');
+  const next = await sendTask(page, 'Продолжить без голоса');
+  expect(next.sessionId).not.toBe(sessionId);
+  await page.evaluate(taskId => window.__nativeContract.finishTask(taskId, 'Новая текстовая задача выполнена.'), next.task_id);
+  await expect(page.locator('#text-content')).toHaveText('Новая текстовая задача выполнена.');
+  await expect(page.locator('[data-action="microphone"]')).toBeDisabled();
+  expect(await page.evaluate(() => window.__nativeContract.captureIds)).toEqual([]);
 });
 
 test('reconnecting fences late events from the old session', async ({ page }) => {
@@ -217,7 +220,7 @@ test('startup agent error releases connecting controls and permits a clean retry
   await expect.poll(() => page.evaluate(() => window.__nativeContract.sessionIds.length)).toBe(2);
   const nextId = await page.evaluate(() => window.__nativeContract.sessionIds.at(-1));
   await emitSession(page, nextId, { type: 'agent_state', stage: 'ready', detail: 'Codex подключён' });
-  await emitSession(page, nextId, { type: 'status', stage: 'ready', detail: 'Realtime подключён', realtime: true });
+  await emitSession(page, nextId, { type: 'status', stage: 'ready', detail: 'Codex · текстовый режим', realtime: false });
   await expect(settings.locator('#agent-connect')).toBeEnabled();
   await expect(settings.locator('#agent-connect')).toHaveText('Переподключить');
   await expect(settings.locator('#agent-error')).toBeHidden();

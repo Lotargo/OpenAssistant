@@ -12,6 +12,7 @@ fn fake_worker(id: u64, mode: CaptureMode) -> Arc<Worker> {
     Arc::new(Worker {
         id,
         mode,
+        stream_epoch: 0,
         control,
         thread: Mutex::new(Some(thread)),
     })
@@ -107,9 +108,11 @@ fn test_mode_feeds_levels_but_never_emits_pcm() {
         &send
     ));
     let events = lock(&events);
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, AudioEvent::Levels { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AudioEvent::Levels { .. }))
+    );
     assert!(!events.iter().any(|e| matches!(e, AudioEvent::Pcm { .. })));
     assert!(packets.samples.is_empty());
 }
@@ -136,16 +139,18 @@ fn queued_test_ticket_is_cancelled_before_any_native_device_access() {
 }
 #[test]
 fn malformed_device_selection_is_rejected_without_opening_a_microphone() {
-    assert!(AudioState::default()
-        .start(
-            AudioConfig {
-                device_id: Some(String::new()),
-                mode: CaptureMode::Test,
-                noise_suppression: false,
-            },
-            |_| panic!("Invalid device must not capture")
-        )
-        .is_err());
+    assert!(
+        AudioState::default()
+            .start(
+                AudioConfig {
+                    device_id: Some(String::new()),
+                    mode: CaptureMode::Test,
+                    noise_suppression: false,
+                },
+                |_| panic!("Invalid device must not capture")
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -306,4 +311,41 @@ fn system_channel_keeps_capture_contract_and_reports_only_source_not_identity() 
         assert!(system.get("speaker").is_none());
         assert!(system.get("event").is_none(), "The DTO must remain flat");
     }
+}
+
+#[test]
+fn broadcast_stop_fences_queued_stream_and_delayed_join_spares_new_stream_and_test() {
+    let state = AudioState::default();
+    let queued = state.start_ticket(CaptureMode::Stream);
+    let test_ticket = state.start_ticket(CaptureMode::Test);
+    let old = fake_worker(801, CaptureMode::Stream);
+    lock(&state.inner.slots).current = Some(old.clone());
+    let stop = state.invalidate_stream();
+    assert!(!queued.valid(&state.inner, CaptureMode::Stream));
+    assert!(test_ticket.valid(&state.inner, CaptureMode::Test));
+    let result = state.start_with_ticket(
+        AudioConfig {
+            device_id: Some("not-a-device".into()),
+            mode: CaptureMode::Stream,
+            noise_suppression: false,
+        },
+        queued,
+        |_| panic!("cancelled queued stream reached a callback"),
+    );
+    assert!(result.unwrap_err().contains("отменён"));
+
+    let mut fresh = fake_worker(802, CaptureMode::Stream);
+    Arc::get_mut(&mut fresh).unwrap().stream_epoch =
+        state.inner.stream_epoch.load(Ordering::Acquire);
+    let test = fake_worker(803, CaptureMode::Test);
+    {
+        let mut slots = lock(&state.inner.slots);
+        slots.current = Some(fresh.clone());
+        slots.starting = Some(test.clone());
+    }
+    stop.join().unwrap();
+    assert!(!old.control.live.load(Ordering::Acquire));
+    assert_eq!(fresh.control.stop.load(Ordering::Acquire), 0);
+    assert_eq!(test.control.stop.load(Ordering::Acquire), 0);
+    state.stop(None).unwrap();
 }

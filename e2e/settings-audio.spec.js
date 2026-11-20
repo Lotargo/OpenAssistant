@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { openNative, settingsPage, setPressed } from './helpers/native.js';
+import { openNative, settingsPage, setPressed, startBroadcast } from './helpers/native.js';
 
 async function openAudio(page) {
   await page.locator('[data-action="settings"]').click();
@@ -195,7 +195,7 @@ test('closing settings cancels a microphone check while native start is still pe
 
 test('closing settings and losing focus keep live dictation running, but local testing stays disabled', async ({ page }) => {
   await openNative(page);
-  await page.locator('[data-action="microphone"]').click();
+  await startBroadcast(page);
   await expect(page.locator('[data-action="microphone"]')).toHaveAttribute('aria-pressed', 'false');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.audioStarts.at(-1)?.mode)).toBe('stream');
   const settings = await openAudio(page);
@@ -306,7 +306,7 @@ test('noise toggle preserves pending intent through native latency and reverts o
   await settings.keyboard.press('Escape');
 });
 
-test('startup remains empty and two audio decorations use the free toolbar edges around six centered controls', async ({ page }) => {
+test('startup remains empty and two audio decorations use the free toolbar edges around the centered broadcast controls', async ({ page }) => {
   await openNative(page);
   await expect(page.locator('#text-content')).toHaveText('');
   await expect(page.locator('#notes-content')).toHaveText('');
@@ -328,25 +328,25 @@ test('startup remains empty and two audio decorations use the free toolbar edges
         return { x, y, width, height };
       };
       return {
-        toolbar: box('#toolbar'), first: box('#toolbar > button:first-of-type'),
-        last: box('#toolbar > button:last-of-type'),
+        toolbar: box('#toolbar'), controls: box('.toolbar-controls'),
+        icons: box('.toolbar-actions'),
         left: box('[data-toolbar-audio="left"]'), right: box('[data-toolbar-audio="right"]'),
       };
     });
-    expect(Math.abs((bounds.first.x + bounds.last.x + bounds.last.width) / 2 - width / 2)).toBeLessThan(1);
+    expect(Math.abs(bounds.controls.x + bounds.controls.width / 2 - width / 2)).toBeLessThan(1);
     if (width > 360) {
       expect(bounds.left.width).toBeGreaterThan(0);
       expect(bounds.right.width).toBeGreaterThan(0);
       expect(bounds.left.x).toBeGreaterThanOrEqual(bounds.toolbar.x);
-      expect(bounds.left.x + bounds.left.width).toBeLessThanOrEqual(bounds.first.x);
-      expect(bounds.right.x).toBeGreaterThanOrEqual(bounds.last.x + bounds.last.width);
+      expect(bounds.left.x + bounds.left.width).toBeLessThanOrEqual(bounds.controls.x);
+      expect(bounds.right.x).toBeGreaterThanOrEqual(bounds.controls.x + bounds.controls.width);
       expect(bounds.right.x + bounds.right.width).toBeLessThanOrEqual(bounds.toolbar.x + bounds.toolbar.width);
     } else {
-      // Narrow windows reserve the available width for all six controls.
+      // Narrow windows reserve the available width for all seven icons and the broadcast controls.
       expect(bounds.left.width).toBe(0);
       expect(bounds.right.width).toBe(0);
-      expect(bounds.first.x).toBeGreaterThanOrEqual(0);
-      expect(bounds.last.x + bounds.last.width).toBeLessThanOrEqual(width);
+      expect(bounds.controls.x).toBeGreaterThanOrEqual(0);
+      expect(bounds.controls.x + bounds.controls.width).toBeLessThanOrEqual(width);
     }
   }
   expect(await page.evaluate(() => ({

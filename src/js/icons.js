@@ -6,6 +6,8 @@ const paths = {
   microphone: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/>',
   'microphone-muted': '<path d="m3 3 18 18M9 9v3a3 3 0 0 0 5.1 2.1M9 5V4a3 3 0 0 1 6 0v6M5 10v2a7 7 0 0 0 12 4.9M19 10v2a7 7 0 0 1-.5 2.6M12 19v3M8 22h8"/>',
   reconnect: '<path d="M20 8a8 8 0 1 0 0 8M20 3v5h-5"/>',
+  notifications: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/>',
+  'notifications-off': '<path d="m3 3 18 18M6 8c0 7-3 7-3 9h12M9 3a6 6 0 0 1 9 5c0 2 .3 3.5 .8 4.7M10 21h4"/>',
   settings: '<path d="M4 6h2m4 0h10M4 12h10m4 0h2M4 18h4m4 0h8"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/>',
   lock: '<rect x="5" y="10" width="14" height="12" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/>',
   unlock: '<rect x="5" y="10" width="14" height="12" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0"/>',

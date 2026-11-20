@@ -4,11 +4,13 @@
 use crate::{
     agent,
     auth::{self, SafeError},
-    bridge, codex, custom,
+    bridge,
+    broadcast::{self, Broadcast, EndReason},
+    codex, custom,
     interview::{Evaluation, Interview, Source},
     interview_speakers::{SpeakerTracker, speaker_label},
     provider,
-    session::{self, Parsed, SessionConfig, SessionInput},
+    session::{self, BroadcastControl, Parsed, SessionConfig, SessionInput},
     speakers::{self, SpeakerEvent},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -36,6 +38,7 @@ enum VoiceOutput {
 struct Voice {
     commands: mpsc::Sender<Value>,
     task: JoinHandle<()>,
+    lifecycle: Option<(BroadcastControl, String)>,
 }
 impl Drop for Voice {
     fn drop(&mut self) {
@@ -65,12 +68,30 @@ impl Voice {
                     .await;
             }
         });
-        Self { commands, task }
+        Self {
+            commands,
+            task,
+            lifecycle: None,
+        }
+    }
+    fn stopped(&self) -> bool {
+        self.lifecycle
+            .as_ref()
+            .is_some_and(|(control, id)| control.is_stopped(id))
     }
     fn send(&self, value: Value) -> Result<(), SafeError> {
-        self.commands.try_send(value).map_err(|_| {
-            SafeError::new("Передача звука не успевает за захватом; прослушивание остановлено")
-        })
+        // Native stop aborts workers independently of this event queue. A queued
+        // transcript/clear must not turn that expected cancellation into a Codex failure.
+        if self.stopped() {
+            return Ok(());
+        }
+        match self.commands.try_send(value) {
+            Ok(()) => Ok(()),
+            Err(_) if self.stopped() => Ok(()),
+            Err(_) => Err(SafeError::new(
+                "Передача звука не успевает за захватом; прослушивание остановлено",
+            )),
+        }
     }
 }
 async fn emit(events: &mpsc::Sender<Value>, value: Value) -> Result<(), SafeError> {
@@ -268,7 +289,7 @@ impl Capture {
         let Some(id) = event["item_id"].as_str() else {
             return false;
         };
-        if !self.active[i] || !self.armed[i] || self.speech_item[i].as_deref() != Some(id) {
+        if !self.armed[i] || self.speech_item[i].as_deref() != Some(id) {
             return false;
         }
         self.speaking[i] = false;
@@ -295,7 +316,6 @@ impl Capture {
         event["item_id"]
             .as_str()
             .is_some_and(|id| self.items[i].remove(id).is_some())
-            && self.active[i]
             && self.armed[i]
     }
     fn awaiting_transcripts(&self) -> bool {
@@ -367,18 +387,13 @@ async fn pause(
     capture: &mut Capture,
     voices: &[Voice],
     decisions: &mut Decisions,
-    agent: &agent::Handle,
-    hints: &mut HashSet<String>,
+    _agent: &agent::Handle,
+    _hints: &mut HashSet<String>,
 ) -> Result<(), SafeError> {
     policy.stop();
     capture.reset();
     decisions.cancel(voices);
     let _ = clear_voices(voices, capture);
-    for id in hints.drain() {
-        let _ = agent
-            .commands
-            .try_send(agent::Command::Interrupt { id: Some(id) });
-    }
     state(events, "idle", "Прослушивание остановлено").await
 }
 fn route_audio(
@@ -411,6 +426,7 @@ pub async fn run(
     config: SessionConfig,
     input: mpsc::Receiver<SessionInput>,
     events: mpsc::Sender<Value>,
+    control: BroadcastControl,
 ) -> Result<(), SafeError> {
     let options = codex::SpawnOptions::new(config.workspace.clone());
     let custom_instructions = config.custom_instructions().map(str::to_owned);
@@ -423,8 +439,58 @@ pub async fn run(
             Voice::start(source, model, custom_instructions.clone(), events)
         },
         Some(speakers::default_asset_dir()),
+        control,
     )
     .await
+}
+
+fn register_voice(control: &BroadcastControl, id: &str, mut voice: Voice) -> Voice {
+    voice.lifecycle = Some((control.clone(), id.to_owned()));
+    control.register(id, voice.task.abort_handle());
+    voice
+}
+async fn close_voices(voices: &mut Vec<Voice>) {
+    for voice in voices.iter() {
+        voice.task.abort();
+    }
+    for mut voice in std::mem::take(voices) {
+        let _ = (&mut voice.task).await;
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn finish_broadcast(
+    broadcast: &mut Broadcast,
+    policy: &mut Interview,
+    capture: &mut Capture,
+    voices: &mut Vec<Voice>,
+    decisions: &mut Decisions,
+    events: &mpsc::Sender<Value>,
+    reason: EndReason,
+    farewell: Option<String>,
+) -> Result<(), SafeError> {
+    policy.stop();
+    capture.reset();
+    capture.ready = [false; 2];
+    capture.active = [false; 2];
+    decisions.cancel(voices);
+    close_voices(voices).await;
+    state(events, "idle", "Эфир завершён").await?;
+    for event in broadcast.finish(reason, farewell) {
+        emit(events, event).await?;
+    }
+    Ok(())
+}
+fn busy(
+    capture: &Capture,
+    decisions: &Decisions,
+    hints: &HashSet<String>,
+    jobs: &HashMap<String, bool>,
+) -> bool {
+    !hints.is_empty()
+        || !jobs.is_empty()
+        || decisions.pending.is_some()
+        || capture.speaking.iter().any(|value| *value)
+        || capture.awaiting_transcripts()
 }
 
 async fn run_inner<F>(
@@ -434,6 +500,7 @@ async fn run_inner<F>(
     options: codex::SpawnOptions,
     voice_factory: F,
     speaker_assets: Option<PathBuf>,
+    control: BroadcastControl,
 ) -> Result<(), SafeError>
 where
     F: Fn(Source, String, mpsc::Sender<VoiceOutput>) -> Voice + Send + Sync,
@@ -446,74 +513,142 @@ where
         config.requires_explicit_help(),
         config.custom_instructions().map(str::to_owned),
     );
+    let mut broadcast = Broadcast::new(
+        config.silence_timeout_secs,
+        config.agent_auto_end,
+        config.custom_instructions().map(str::to_owned),
+    );
     let mut capture = Capture::default();
     let mut decisions = Decisions::default();
     let mut hints = HashSet::new();
     let mut jobs = HashMap::new();
     let mut agent_open = true;
-    let mut voice_attempted = false;
+    let mut agent_ready = false;
     let mut sequence = 0u64;
     let mut quiet_since = Instant::now();
     let mut tick = time::interval(Duration::from_millis(150));
     let result=async {
         emit(&events,json!({"type":"status","stage":"connecting","detail":"Подключение Codex","realtime":false})).await?;
-        state(&events,"idle","Собеседование · прослушивание выключено").await?;
+        state(&events,"idle","Прослушивание выключено").await?;
         loop {
             tokio::select! {
                 _=events.closed()=>return Ok(()),
                 command=input.recv()=>{
                     let Some(command)=command else {return Ok(());};
-                    let audio_source=if matches!(&command,SessionInput::SystemAudio(_)){Source::System}else{Source::Microphone};
+                    let source=if matches!(&command,SessionInput::SystemAudio{..}){Source::System}else{Source::Microphone};
                     match command {
-                        SessionInput::Audio(bytes)|SessionInput::SystemAudio(bytes)=>{
-                            if let Err(error)=route_audio(audio_source,bytes,&mut capture,&voices,policy.is_listening()) {
-                                pause(&events,&mut policy,&mut capture,&voices,&mut decisions,&agent,&mut hints).await?;
-                                capture.ready=[false;2];voices.clear();
-                                emit(&events,json!({"type":"status","stage":"voice_error","realtime":false,"detail":error.to_string()})).await?;
+                        SessionInput::Audio{broadcast_id,data}|SessionInput::SystemAudio{broadcast_id,data}=>{
+                            if !broadcast.accepts_audio(&broadcast_id) {continue;}
+                            if let Err(error)=route_audio(source,data,&mut capture,&voices,policy.is_listening()) {
+                                finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::Error,Some(error.to_string())).await?;
                             }
-                        },
+                        }
                         SessionInput::Message(value)=>{
+                            if !value.is_object() || serde_json::to_vec(&value).map(|bytes|bytes.len()).unwrap_or(usize::MAX)>bridge::MAX_LOCAL_MESSAGE {
+                                emit(&events,bridge::error("Некорректная команда эфира")).await?;continue;
+                            }
                             let kind=value["type"].as_str().unwrap_or("");
+                            if matches!(kind,"mic_start"|"mic_stop"|"system_start"|"system_stop"|"interview_start"|"interview_stop") {
+                                let id=match broadcast::identifier(&value) {Ok(id)=>id,Err(error)=>{emit(&events,bridge::error(&error.to_string())).await?;continue;}};
+                                if !broadcast.accepts_audio(&id) {continue;}
+                            }
                             match kind {
                                 "interview_start"=>{
-                                    if !capture.ready.iter().all(|v|*v) || !capture.active.iter().all(|v|*v) {
-                                        emit(&events,bridge::error("Для собеседования нужны оба источника звука и готовое подключение")).await?;
-                                    } else {
-                                        if policy.is_listening() {continue;}
+                                    if !capture.ready.iter().all(|value|*value) || !capture.active[Source::System.index()] {
+                                        emit(&events,bridge::error("Для двухканального режима нужен готовый звук встречи")).await?;
+                                    } else if !policy.is_listening() {
                                         policy.start();capture.reset();decisions.cancel(&voices);clear_voices(&voices,&mut capture)?;
                                         match capture.speakers.start(speaker_assets.as_deref()) {
                                             Ok(true)=>emit(&events,json!({"type":"speaker_state","status":"loading","detail":"Загружаю локальную модель группировки голосов"})).await?,
                                             Ok(false)=>{},
                                             Err(detail)=>emit(&events,json!({"type":"speaker_state","status":"unavailable","detail":detail})).await?,
                                         }
-                                        quiet_since=Instant::now();
-                                        state(&events,"listening","Слушаю микрофон и участников встречи").await?;
+                                        quiet_since=Instant::now();broadcast.activity(quiet_since);
+                                        state(&events,"listening","Слушаю участников встречи и включённый микрофон").await?;
                                     }
                                 }
                                 "interview_stop"=>{
                                     pause(&events,&mut policy,&mut capture,&voices,&mut decisions,&agent,&mut hints).await?;
+                                    broadcast.activity(Instant::now());
                                 }
                                 "mic_start"|"system_start"=>{
                                     let source=if kind=="mic_start"{Source::Microphone}else{Source::System};
                                     capture.active[source.index()]=true;
-
+                                    if policy.is_listening() {
+                                        capture.clear(source,&voices[source.index()])?;
+                                    }
+                                    broadcast.activity(Instant::now());
                                 }
-                                "mic_stop"|"system_stop"=>{
-                                    let source=if kind=="mic_stop"{Source::Microphone}else{Source::System};
-                                    capture.active[source.index()]=false;
-                                    capture.armed[source.index()]=false;
+                                "mic_stop"=>{
+                                    // Mute affects only the local source. The meeting context, loopback,
+                                    // semantic decisions and Codex tasks stay alive.
+                                    capture.active[0]=false;
+                                    capture.speaking[0]=false;
+                                    if let Some(id)=capture.speech_item[0].as_ref()
+                                        && let Some(deadline)=capture.items[0].get_mut(id) {
+                                        *deadline=Some(Instant::now()+TRANSCRIPT_TIMEOUT);
+                                    }
+                                    if policy.is_listening() && let Some(voice)=voices.first() {
+                                        for _ in 0..10 {
+                                            let event_id=capture.event_id(Source::Microphone,"audio");
+                                            voice.send(json!({"type":"input_audio_buffer.append","event_id":event_id,"audio":STANDARD.encode([0u8;4800])}))?;
+                                        }
+                                    }
+                                    broadcast.activity(Instant::now());
+                                }
+                                "system_stop"=>{
+                                    capture.active[1]=false;capture.armed[1]=false;
                                     if policy.is_listening() {pause(&events,&mut policy,&mut capture,&voices,&mut decisions,&agent,&mut hints).await?;}
+                                    broadcast.activity(Instant::now());
                                 }
                                 _=>match session::parse_message(value,&mut sequence) {
                                     Ok(Parsed::Disconnect)=>return Ok(()),
+                                    Ok(Parsed::BroadcastStart(id))=>{
+                                        match broadcast.start(id.clone()) {
+                                            Ok(Some(event))=>{
+                                                emit(&events,event).await?;
+                                                if !control.begin(&id) {
+                                                    finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::User,None).await?;
+                                                } else if !config.realtime {
+                                                    finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::Error,Some("Голосовой режим выключен в настройках.".into())).await?;
+                                                } else if agent_ready {
+                                                    voices.push(register_voice(&control,broadcast.id().unwrap(),voice_factory(Source::Microphone,config.realtime_model.clone(),voice_tx.clone())));
+                                                    voices.push(register_voice(&control,broadcast.id().unwrap(),voice_factory(Source::System,config.realtime_model.clone(),voice_tx.clone())));
+                                                }
+                                            }
+                                            Ok(None)=>{},
+                                            Err(error)=>emit(&events,bridge::error(&error.to_string())).await?,
+                                        }
+                                    }
+                                    Ok(Parsed::BroadcastStop(id))=>{
+                                        if broadcast.accepts(&id) {
+                                            control.stop(&id);
+                                            finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::User,None).await?;
+                                        }
+                                    }
                                     Ok(Parsed::Agent(command))=>{
-                                        if agent.commands.try_send(command).is_err() {emit(&events,bridge::error("Codex недоступен")).await?;}
+                                        let id=match &command {
+                                            agent::Command::Run{id,..}|agent::Command::Hint{id,..}=>Some(id.clone()),
+                                            _=>None,
+                                        };
+                                        if broadcast.ended() && id.is_some() {
+                                            emit(&events,bridge::error("Эфир завершён. Дождись текущих задач и подключись заново.")).await?;continue;
+                                        }
+                                        if agent.commands.try_send(command).is_err() {
+                                            emit(&events,bridge::error("Codex недоступен")).await?;
+                                        } else if let Some(id)=id {
+                                            jobs.insert(id,true);broadcast.activity(Instant::now());
+                                        }
                                     }
                                     Ok(Parsed::Voice(bridge::Input::Text(Some(text))))=>{
-                                        sequence=sequence.wrapping_add(1);
-                                        if agent.commands.try_send(agent::Command::Run{id:format!("interview-manual-{sequence}"),task:text}).is_err() {
-                                            emit(&events,bridge::error("Codex недоступен")).await?;
+                                        if broadcast.ended() {
+                                            emit(&events,bridge::error("Эфир завершён. Подключись заново для новой задачи.")).await?;continue;
                                         }
+                                        sequence=sequence.wrapping_add(1);
+                                        let id=format!("interview-manual-{sequence}");
+                                        let command=agent::Command::Run{id:id.clone(),task:text.clone()};
+                                        if agent.commands.try_send(command).is_err() {emit(&events,bridge::error("Codex недоступен")).await?;}
+                                        else {jobs.insert(id,true);broadcast.transcript("user",&text,Instant::now());}
                                     }
                                     Ok(_)=>{},
                                     Err(error)=>emit(&events,bridge::error(&error.to_string())).await?,
@@ -525,31 +660,34 @@ where
                 output=agent_rx.recv(),if agent_open=>{
                     match output {
                         Some(agent::Output::Ui(value))=>{
-                            if value["type"]=="agent_state" && value["stage"]=="ready" && !voice_attempted {
-                                voice_attempted=true;
-                                if config.realtime {
-                                    voices.push(voice_factory(Source::Microphone,config.realtime_model.clone(),voice_tx.clone()));
-                                    voices.push(voice_factory(Source::System,config.realtime_model.clone(),voice_tx.clone()));
-                                } else {
-                                    emit(&events,json!({"type":"status","stage":"ready","detail":"Codex · текстовый режим","realtime":false})).await?;
-                                }
-                            }
+                            let ready=!agent_ready && value["type"]=="agent_state" && value["stage"]=="ready";
                             if value["type"]=="agent_task_started" && let Some(id)=value["task_id"].as_str() {
-                                jobs.insert(id.to_owned(),true);
-                            }
-                            if value["type"]=="agent_done" && let Some(id)=value["task_id"].as_str() {
-                                jobs.remove(id);
+                                jobs.insert(id.to_owned(),true);broadcast.activity(Instant::now());
                             }
                             emit(&events,value).await?;
+                            if ready {
+                                agent_ready=true;
+                                emit(&events,json!({"type":"status","stage":"ready","detail":"Codex готов · эфир выключен","realtime":false})).await?;
+                                if broadcast.is_starting() && config.realtime && voices.is_empty() {
+                                    voices.push(register_voice(&control,broadcast.id().unwrap(),voice_factory(Source::Microphone,config.realtime_model.clone(),voice_tx.clone())));
+                                    voices.push(register_voice(&control,broadcast.id().unwrap(),voice_factory(Source::System,config.realtime_model.clone(),voice_tx.clone())));
+                                }
+                            }
                         }
-                        Some(agent::Output::Completed{id,..})=>{
-                            jobs.remove(&id);
-                            hints.remove(&id);
+                        Some(agent::Output::Completed{id,text,status})=>{
+                            jobs.remove(&id);hints.remove(&id);
+                            if status=="completed" {broadcast.transcript("assistant",&text,Instant::now());}
+                            else {broadcast.activity(Instant::now());}
                             if policy.is_listening() && hints.is_empty() {
                                 state(&events,"listening","Подсказка готова · продолжаю слушать").await?;
                             }
                         }
-                        None=>{agent_open=false;pause(&events,&mut policy,&mut capture,&voices,&mut decisions,&agent,&mut hints).await?;capture.ready=[false;2];voices.clear();}
+                        None=>{
+                            agent_open=false;jobs.clear();hints.clear();
+                            if broadcast.is_live() || broadcast.is_starting() {
+                                finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::Error,Some("Codex отключён. Эфир остановлен.".into())).await?;
+                            }
+                        }
                     }
                 }
                 output=capture.speakers.recv(),if capture.speakers.receiving() && policy.is_listening()=>{
@@ -570,30 +708,37 @@ where
                 }
                 output=voice_rx.recv(),if !voices.is_empty()=>{
                     let Some(output)=output else {return Err(SafeError::new("Распознавание речи остановлено"));};
+                    if broadcast.id().is_some_and(|id|control.is_stopped(id)) {
+                        finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::User,None).await?;
+                        if jobs.is_empty() {return Ok(());}
+                        continue;
+                    }
                     match output {
                         VoiceOutput::Failed(source,message)=>{
-                            pause(&events,&mut policy,&mut capture,&voices,&mut decisions,&agent,&mut hints).await?;
-                            capture.ready=[false;2];voices.clear();
                             emit(&events,json!({"type":"status","stage":"voice_error","realtime":false,"detail":format!("{}: {}",source.label(),message)})).await?;
+                            finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::Error,None).await?;
                         }
                         VoiceOutput::Event(source,value)=>{
+                            if source==Source::System && broadcast.provider_event(&value,Instant::now(),busy(&capture,&decisions,&hints,&jobs)) {continue;}
                             let i=source.index();
                             match value["type"].as_str().unwrap_or("") {
                                 "session.updated"=>{
                                     capture.ready[i]=true;
-                                    if capture.ready.iter().all(|v|*v) {
-                                        emit(&events,json!({"type":"status","stage":"ready","detail":"Собеседование · два источника готовы","realtime":true})).await?;
+                                    if capture.ready.iter().all(|value|*value) {
+                                        emit(&events,json!({"type":"status","stage":"ready","detail":"Эфир · два источника готовы","realtime":true})).await?;
+                                        if let Some(event)=broadcast.live(Instant::now()) {emit(&events,event).await?;}
                                     }
                                 }
-                                "input_audio_buffer.cleared"=>{
-                                    capture.cleared(source,policy.is_listening());
-                                }
+                                "input_audio_buffer.cleared"=>capture.cleared(source,policy.is_listening()),
                                 "input_audio_buffer.speech_started"=>{
-                                    if capture.started(source,&value) && source==Source::Microphone {
-                                            emit(&events,json!({"type":"mic_state","stage":"speech","detail":"Слушаю вашу речь"})).await?;
+                                    if capture.started(source,&value) {
+                                        broadcast.activity(Instant::now());
+                                        if source==Source::Microphone {emit(&events,json!({"type":"mic_state","stage":"speech","detail":"Слушаю вашу речь"})).await?;}
                                     }
                                 }
-                                "input_audio_buffer.speech_stopped"=>{if capture.stopped(source,&value){quiet_since=Instant::now();}}
+                                "input_audio_buffer.speech_stopped"=>{
+                                    if capture.stopped(source,&value) {quiet_since=Instant::now();broadcast.activity(quiet_since);}
+                                }
                                 "input_audio_buffer.committed"=>capture.committed(source,&value),
                                 "conversation.item.input_audio_transcription.completed"=>{
                                     let accepted=capture.take_item(source,&value);
@@ -601,26 +746,24 @@ where
                                         let event_id=capture.event_id(source,"delete");
                                         voices[i].send(json!({"type":"conversation.item.delete","item_id":id,"event_id":event_id}))?;
                                     }
-                                    if accepted && let Some(text)=value["transcript"].as_str()
-                                        && let Some(turn)=policy.observe(source,text,None) {
-                                        quiet_since=Instant::now();
-                                        let item_id=value["item_id"].as_str().unwrap_or("");
-                                        let speaker=if source==Source::System {
-                                            capture.speakers.transcribed(item_id,turn.id)
-                                        } else {None};
-                                        if source==Source::System {policy.assign_speaker(turn.id,speaker.clone());}
-                                        let label=if source==Source::System {speaker_label(speaker.as_deref())}else{source.label().to_owned()};
-                                        emit(&events,json!({"type":"transcript","text":turn.text,"source":source.key(),
-                                            "item_id":item_id,"speaker":speaker,"speaker_label":label,"utterance_id":turn.id})).await?;
+                                    if accepted && let Some(text)=value["transcript"].as_str() {
+                                        broadcast.transcript(source.key(),text,Instant::now());
+                                        if let Some(turn)=policy.observe(source,text,None) {
+                                            quiet_since=Instant::now();
+                                            let item_id=value["item_id"].as_str().unwrap_or("");
+                                            let speaker=if source==Source::System {capture.speakers.transcribed(item_id,turn.id)} else {None};
+                                            if source==Source::System {policy.assign_speaker(turn.id,speaker.clone());}
+                                            let label=if source==Source::System {speaker_label(speaker.as_deref())}else{source.label().to_owned()};
+                                            emit(&events,json!({"type":"transcript","text":turn.text,"source":source.key(),
+                                                "item_id":item_id,"speaker":speaker,"speaker_label":label,"utterance_id":turn.id})).await?;
+                                        }
                                     }
                                 }
                                 "conversation.item.input_audio_transcription.failed"=>{
                                     if capture.take_item(source,&value) {policy.clear_pending();decisions.cancel(&voices);}
-                                    state(&events,"listening","Фраза не распознана · продолжаю слушать").await?;
+                                    if policy.is_listening() {state(&events,"listening","Фраза не распознана · продолжаю слушать").await?;}
                                 }
-                                "response.created"=>{
-                                    if source==Source::System {decisions.created(&value,&voices);}
-                                }
+                                "response.created"=>{if source==Source::System {decisions.created(&value,&voices);}}
                                 "response.done"=>{
                                     if source==Source::System && decisions.pending.as_ref().is_some_and(|waiting|value["response"]["metadata"]["gate_id"].as_str()==Some(waiting.evaluation.id.to_string().as_str())) {
                                         let waiting=decisions.pending.take().unwrap();
@@ -629,12 +772,12 @@ where
                                             Ok(Some(task))=>{
                                                 let id=format!("interview-hint-{}",waiting.evaluation.id);
                                                 if agent.commands.try_send(agent::Command::Hint{id:id.clone(),task}).is_ok() {
-                                                    hints.insert(id);
+                                                    hints.insert(id.clone());jobs.insert(id,true);broadcast.activity(Instant::now());
                                                     state(&events,"helping","Готовлю подсказку по вопросу встречи").await?;
                                                 } else {state(&events,"listening","Codex занят · продолжаю слушать").await?;}
                                             }
-                                            Ok(None)=>{if policy.is_listening(){state(&events,"listening","Слушаю · подсказка пока не нужна").await?;}},
-                                            Err(message)=>{if policy.is_listening(){state(&events,"listening",&format!("{message} · продолжаю слушать")).await?;}},
+                                            Ok(None)=>{if policy.is_listening(){state(&events,"listening","Слушаю · подсказка пока не нужна").await?;}}
+                                            Err(message)=>{if policy.is_listening(){state(&events,"listening",&format!("{message} · продолжаю слушать")).await?;}}
                                         }
                                     }
                                 }
@@ -646,14 +789,10 @@ where
                                         if let Some(waiting)=&decisions.pending {policy.abandon(&waiting.evaluation);}
                                         decisions.cancel(&voices);
                                         if policy.is_listening() {state(&events,"listening","Не удалось оценить фразу · продолжаю слушать").await?;}
-                                    } else if event_id.starts_with("interview-delete-") || event_id.starts_with("interview-cancel-")
-                                        || event_id.starts_with("interview-gate-") {
-                                        // Late/cosmetic requests cannot abandon a newer decision.
+                                    } else if event_id.starts_with("interview-delete-") || event_id.starts_with("interview-cancel-") || event_id.starts_with("interview-gate-") {
+                                        // Late/cosmetic requests cannot affect another decision.
                                     } else {
-                                        pause(&events,&mut policy,&mut capture,&voices,&mut decisions,&agent,&mut hints).await?;
-                                        capture.ready=[false;2];voices.clear();
-                                        emit(&events,json!({"type":"status","stage":"voice_error","realtime":false,
-                                            "detail":"Realtime отклонил передачу звука · прослушивание остановлено"})).await?;
+                                        finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::Error,Some("Realtime отклонил передачу звука. Эфир остановлен.".into())).await?;
                                     }
                                 }
                                 _=>{}
@@ -672,21 +811,46 @@ where
                         if policy.is_listening(){state(&events,"listening","Решение задержалось · продолжаю слушать").await?;}
                     }
                     if policy.is_listening() && decisions.pending.is_none() && hints.is_empty() && jobs.is_empty()
-                        && !capture.speaking.iter().any(|v|*v) && !capture.awaiting_transcripts()
+                        && !capture.speaking.iter().any(|value|*value) && !capture.awaiting_transcripts()
                         && quiet_since.elapsed()>=QUIET_TIME
                         && let Some(evaluation)=policy.evaluate() {
                             voices[1].send(evaluation.request.clone())?;
                             decisions.pending=Some(Pending{evaluation,deadline:Instant::now()+DECISION_TIMEOUT,response_id:None});
                             state(&events,"evaluating","Определяю, нужна ли подсказка").await?;
                     }
+                    let active=busy(&capture,&decisions,&hints,&jobs);
+                    if !broadcast.ended() && broadcast.id().is_some_and(|id|control.is_stopped(id)) {
+                        finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,EndReason::User,None).await?;
+                    } else if let Some((reason,farewell))=broadcast.tick(Instant::now(),active) {
+                        finish_broadcast(&mut broadcast,&mut policy,&mut capture,&mut voices,&mut decisions,&events,reason,farewell).await?;
+                    } else if let Some(request)=broadcast.semantic_request(Instant::now(),active)
+                        && let Some(voice)=voices.get(1) {
+                        voice.send(request)?;
+                    }
                 }
             }
+            for command in broadcast.take_outbound() {
+                if let Some(voice)=voices.get(1) {voice.send(command)?;}
+            }
+            if broadcast.ended() && jobs.is_empty() && hints.is_empty() {return Ok(());}
         }
     }.await;
+    let stopped = broadcast.id().is_some_and(|id| control.is_stopped(id));
+    control.cancel_all();
     capture.reset();
-    voices.clear();
+    close_voices(&mut voices).await;
+    if result.is_err() {
+        let reason = if stopped {
+            EndReason::User
+        } else {
+            EndReason::Error
+        };
+        for event in broadcast.finish(reason, None) {
+            let _ = emit(&events, event).await;
+        }
+    }
     agent.shutdown().await;
-    result
+    if stopped { Ok(()) } else { result }
 }
 
 #[cfg(test)]
