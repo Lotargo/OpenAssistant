@@ -48,7 +48,10 @@ function renderControls(next = runtime) {
   const lock = document.querySelector('[data-action="scroll-lock"]');
   const reconnect = document.querySelector('[data-action="reconnect"]');
   mic.setAttribute('aria-pressed', String(Boolean(runtime.microphoneMuted)));
-  mic.setAttribute('aria-label', runtime.microphoneMuted ? 'Включить микрофон' : 'Выключить микрофон');
+  const interview = runtime.agentConfig?.scenario === 'interview' || runtime.systemAudioActive;
+  mic.setAttribute('aria-label', interview
+    ? runtime.microphoneMuted ? 'Начать прослушивание собеседования' : 'Остановить прослушивание собеседования'
+    : runtime.microphoneMuted ? 'Включить микрофон' : 'Выключить микрофон');
   setButtonIcon(mic, runtime.microphoneMuted ? 'microphone-muted' : 'microphone');
   setButtonIcon(screenButton, 'screen');
   setButtonIcon(reconnect, 'reconnect');
@@ -127,9 +130,12 @@ async function start() {
       toolbarAudioIndicator.setVisible(active);
     },
     onAudioLevels(levels) {
-      runtime = { ...runtime, microphoneLevels: levels };
-      microphoneIndicator.update(levels, runtime);
-      toolbarAudioIndicator.update(levels, runtime);
+      if (levels?.source === 'system') runtime = { ...runtime, systemAudioLevels: levels };
+      else {
+        runtime = { ...runtime, microphoneLevels: levels };
+        microphoneIndicator.update(levels, runtime);
+      }
+      toolbarAudioIndicator.update(runtime.microphoneLevels, runtime);
       modal?.updateAudioLevels(levels);
     },
     onScroll: scrollPanel,

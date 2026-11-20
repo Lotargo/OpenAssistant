@@ -174,6 +174,7 @@ struct SettingsEvent {
 fn retire_webview_session(app: &AppHandle) {
     // Revoke capture immediately, including a start still waiting for the device.
     app.state::<audio::AudioState>().invalidate();
+    app.state::<audio::SystemAudioState>().invalidate();
     app.state::<assistant::AssistantState>().invalidate_view();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -295,6 +296,8 @@ pub fn run() {
         .manage(OverlayState::default())
         .manage(assistant::AssistantState::default())
         .manage(audio::AudioState::default())
+        .manage(audio::SystemAudioState::default())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
@@ -339,10 +342,17 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            audio_commands::system_audio_state,
+            audio_commands::system_audio_start,
+            audio_commands::system_audio_stop,
             audio_commands::audio_input_state,
             audio_commands::audio_start,
             audio_commands::audio_stop,
             audio_commands::audio_set_noise_suppression,
+            assistant::assistant_models,
+            assistant::assistant_choose_workspace,
+            assistant::assistant_workspace_state,
+            assistant::assistant_cleanup_workspaces,
             assistant::assistant_status,
             assistant::assistant_connect,
             assistant::assistant_send,
@@ -362,6 +372,11 @@ pub fn run() {
             update_hit_rects
         ])
         .setup(|app| {
+            tauri::async_runtime::spawn(async {
+                if let Err(error) = assistant::cleanup_stale_workspaces().await {
+                    eprintln!("Temporary workspace cleanup deferred: {error}");
+                }
+            });
             let window = app
                 .get_webview_window("main")
                 .ok_or("Overlay window was not created")?;
@@ -378,6 +393,9 @@ pub fn run() {
             let audio = handle.state::<audio::AudioState>();
             audio.invalidate();
             let _ = audio.stop(None);
+            let system = handle.state::<audio::SystemAudioState>();
+            system.invalidate();
+            let _ = system.stop(None);
             tauri::async_runtime::block_on(handle.state::<assistant::AssistantState>().shutdown());
         }
     });

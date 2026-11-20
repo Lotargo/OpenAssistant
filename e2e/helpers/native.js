@@ -113,6 +113,12 @@ export async function openNative(page, options = {}) {
       { id: 'fixture-default', name: 'Fixture Microphone', is_default: true },
       { id: 'fixture-usb', name: 'USB Microphone', is_default: false },
     ];
+    let systemAudioDevices = options.systemAudioDevices || [
+      { id: 'fixture-speakers', name: 'Meeting Speakers', is_default: true },
+      { id: 'fixture-headphones', name: 'Meeting Headphones', is_default: false },
+    ];
+    let workspaceState = options.workspaceState || null;
+    const workspaceChoices = [...(options.workspaceChoices || [])];
     let state = {
       revision: 1, microphoneMuted: true, screenCaptureEnabled: false,
       scrollLocked: false, settingsOpen: false, windowMode: 'overlay', connectionStatus: 'idle',
@@ -130,13 +136,17 @@ export async function openNative(page, options = {}) {
     const sessions = new Map();
     const tasks = new Map();
     const captures = new Map();
-    const models = [
-      { id: 'fixture-codex', display_name: 'Fixture Codex', is_default: true, reasoning_efforts: ['medium', 'high'] },
-      { id: 'fixture-codex-small', display_name: 'Fixture Small', is_default: false, reasoning_efforts: ['low', 'medium'] },
+    let models = options.models || [
+      { id: 'fixture-codex', display_name: 'Fixture Codex', description: 'General fixture model', is_default: true, reasoning_efforts: ['medium', 'high'], default_effort: 'medium' },
+      { id: 'fixture-codex-small', display_name: 'Fixture Small', description: 'Small fixture model', is_default: false, reasoning_efforts: ['low', 'medium'], default_effort: 'low' },
     ];
     const harness = {
       calls: [], resizes: [], saves: [], agentSaves: [], windowModeSaves: [], dragStarts: [], sessionIds: [], events: [],
       messages: [], audio: [], audioStarts: [], audioStops: [], audioNoiseChanges: [], audioSaves: [], captureIds: [], pending, applyResizes: true,
+      systemAudioStarts: [], systemAudioStops: [], workspaceChoices,
+      setModels(next) { models = structuredClone(next); },
+      queueWorkspaceChoice(path) { workspaceChoices.push(path); },
+      getWorkspaceState() { return structuredClone(workspaceState); },
       getState() { return { ...state }; },
       invalidateAudioTest() {
         for (const capture of captures.values()) {
@@ -152,15 +162,16 @@ export async function openNative(page, options = {}) {
         await window.__setSettingsNativeOpen(false);
       },
       setAudioDevices(devices) { audioDevices = structuredClone(devices); },
+      setSystemAudioDevices(devices) { systemAudioDevices = structuredClone(devices); },
       emitAudio(captureId, event) {
         const capture = captures.get(captureId);
         if (!capture) throw new Error('Unknown fixture capture ' + captureId);
         const callback = callbacks.get(capture.channel.id);
         if (!callback) throw new Error('Audio Channel callback is not registered');
-        callback({ message: { capture_id: captureId, ...event }, index: capture.index++ });
+        callback({ message: { capture_id: captureId, ...(capture.source === 'system' ? { source: 'system' } : {}), ...event }, index: capture.index++ });
       },
-      lastCapture() {
-        const capture = [...captures.values()].at(-1);
+      lastCapture(source = 'microphone') {
+        const capture = [...captures.values()].filter(item => item.source === source).at(-1);
         return capture ? { id: capture.id, channelId: capture.channel.id, mode: capture.mode, active: capture.active, noiseSuppression: capture.noiseSuppression } : null;
       },
       delayNext(name) { delayed.set(name, (delayed.get(name) || 0) + 1); },
@@ -193,9 +204,11 @@ export async function openNative(page, options = {}) {
       readySession(sessionId) {
         const session = sessions.get(sessionId);
         harness.emitSession(sessionId, { type: 'agent_models', models });
+        harness.emitSession(sessionId, { type: 'workspace_state', ...workspaceState });
         harness.emitSession(sessionId, {
           type: 'agent_state', stage: 'ready', detail: 'Codex подключён',
-          workspace: session.config.workspace, model: 'fixture-codex', effort: 'medium',
+          workspace: session.workspace, workspace_mode: session.config.workspace_mode || 'temporary',
+          model: session.config.model || models.find(model => model.is_default)?.id || '', effort: session.config.effort || 'medium',
         });
         harness.emitSession(sessionId, {
           type: 'status', stage: session.config.realtime ? 'ready' : 'disabled',
@@ -261,20 +274,26 @@ export async function openNative(page, options = {}) {
           return null;
         case 'audio_input_state':
           return { devices: structuredClone(audioDevices), available: audioDevices.length > 0 };
-        case 'audio_start': {
-          const device = args.deviceId ? audioDevices.find(item => item.id === args.deviceId)
-            : audioDevices.find(item => item.is_default);
-          if (!device) throw new Error('Выбранный микрофон недоступен.');
+        case 'system_audio_state':
+          return { devices: structuredClone(systemAudioDevices), available: systemAudioDevices.length > 0 };
+        case 'audio_start':
+        case 'system_audio_start': {
+          const source = name === 'system_audio_start' ? 'system' : 'microphone';
+          const devices = source === 'system' ? systemAudioDevices : audioDevices;
+          const device = args.deviceId ? devices.find(item => item.id === args.deviceId)
+            : devices.find(item => item.is_default);
+          if (!device) throw new Error(source === 'system' ? 'Устройство вывода недоступно.' : 'Выбранный микрофон недоступен.');
           const id = nextCapture++;
           for (const previous of captures.values()) {
-            if (previous.active) {
+            if (previous.active && previous.source === source) {
               previous.active = false;
               harness.emitAudio(previous.id, { type: 'stopped', reason: 'replaced' });
             }
           }
-          captures.set(id, { id, channel: args.onEvent, index: 0, active: true, mode: args.mode, noiseSuppression: args.noiseSuppression });
+          captures.set(id, { id, source, channel: args.onEvent, index: 0, active: true, mode: args.mode, noiseSuppression: args.noiseSuppression });
           harness.captureIds.push(id);
-          harness.audioStarts.push({ captureId: id, mode: args.mode, deviceId: args.deviceId, noiseSuppression: args.noiseSuppression });
+          const starts = source === 'system' ? harness.systemAudioStarts : harness.audioStarts;
+          starts.push({ captureId: id, mode: args.mode, deviceId: args.deviceId, noiseSuppression: args.noiseSuppression });
           queueMicrotask(() => harness.emitAudio(id, { type: 'started', device_id: device.id, device_name: device.name }));
           return id;
         }
@@ -285,20 +304,34 @@ export async function openNative(page, options = {}) {
           harness.audioNoiseChanges.push({ captureId: args.captureId, enabled: args.enabled });
           return null;
         }
-        case 'audio_stop': {
-          harness.audioStops.push(args.captureId);
+        case 'audio_stop':
+        case 'system_audio_stop': {
+          const source = name === 'system_audio_stop' ? 'system' : 'microphone';
+          (source === 'system' ? harness.systemAudioStops : harness.audioStops).push(args.captureId);
           const capture = captures.get(args.captureId);
-          if (capture?.active) {
+          if (capture?.active && capture.source === source) {
             capture.active = false;
             harness.emitAudio(capture.id, { type: 'stopped', reason: 'requested' });
           }
           return null;
         }
+        case 'assistant_models': return { models: structuredClone(models) };
+        case 'assistant_choose_workspace': return workspaceChoices.length ? workspaceChoices.shift() : null;
+        case 'assistant_workspace_state': return structuredClone(workspaceState);
+        case 'assistant_cleanup_workspaces': {
+          const active = workspaceState?.temporary && workspaceState.cleanup_status === 'active' ? 1 : 0;
+          const removed = workspaceState?.temporary && workspaceState.cleanup_status === 'pending' ? 1 : 0;
+          if (removed) workspaceState = { ...workspaceState, cleanup_status: 'removed' };
+          return { removed, pending: 0, active };
+        }
         case 'assistant_status':
           return { codex_available: true, oauth: 'available', workspace: 'F:\\fixture-workspace', mode: 'real' };
         case 'assistant_connect': {
           const id = nextSession++;
-          sessions.set(id, { channel: args.onEvent, index: 0, config: structuredClone(args.config), active: true });
+          const temporary = args.config.workspace_mode !== 'project';
+          const workspace = temporary ? 'F:\\fixture-temporary\\session-' + id : args.config.workspace;
+          workspaceState = { workspace_mode: temporary ? 'temporary' : 'project', path: workspace, temporary, cleanup_status: 'active' };
+          sessions.set(id, { channel: args.onEvent, index: 0, config: structuredClone(args.config), workspace, active: true });
           harness.sessionIds.push(id);
           if (options.autoReady !== false) queueMicrotask(() => harness.readySession(id));
           return id;
@@ -334,11 +367,17 @@ export async function openNative(page, options = {}) {
         }
         case 'assistant_audio':
           if (!sessions.get(args.sessionId)?.active) throw new Error('Session is closed');
-          harness.audio.push({ sessionId: args.sessionId, bytes: args.audio.length });
+          harness.audio.push({ sessionId: args.sessionId, bytes: args.audio.length, source: args.source || 'microphone' });
           return null;
-        case 'assistant_disconnect':
-          if (sessions.has(args.sessionId)) sessions.get(args.sessionId).active = false;
+        case 'assistant_disconnect': {
+          const session = sessions.get(args.sessionId);
+          if (session) session.active = false;
+          if (session && workspaceState?.path === session.workspace) {
+            workspaceState = { ...workspaceState, cleanup_status: workspaceState.temporary ? 'removed' : 'preserved' };
+            harness.emitSession(args.sessionId, { type: 'workspace_state', ...workspaceState });
+          }
           return null;
+        }
         case 'plugin:store|load': return 1;
         case 'plugin:store|get': return [values.get(args.key) ?? null, values.has(args.key)];
         case 'plugin:store|set':

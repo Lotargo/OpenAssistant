@@ -13,6 +13,8 @@ const COMMANDS = new Set([
   'set_microphone_noise_suppression', 'set_scroll_locked', 'set_screen_capture_enabled',
   'reconnect_session', 'disconnect_session', 'agent_task', 'select_agent_task',
   'agent_interrupt', 'agent_approval', 'agent_input',
+  'refresh_models', 'choose_workspace', 'clear_temporary_workspace',
+  'start_interview', 'stop_interview', 'set_system_audio_device',
 ]);
 const copy = value => value == null ? value : structuredClone(value);
 const errorText = error => String(error?.message ?? error).slice(0, 8000);
@@ -168,7 +170,7 @@ export async function createSettingsProxy({
   let activityVersion = 0;
   let hostId = null;
   let stateSequence = -1;
-  let audioSequence = -1;
+  let audioSequences = { microphone: -1, system: -1 };
   let sessionGeneration = 0;
   let destroyed = false;
   let runtime = {};
@@ -183,14 +185,16 @@ export async function createSettingsProxy({
     if (hostId !== packet.hostId) {
       hostId = packet.hostId;
       stateSequence = -1;
-      audioSequence = -1;
+      audioSequences = { microphone: -1, system: -1 };
     }
     if (packet.sequence <= stateSequence) return;
     stateSequence = packet.sequence;
-    const previousLevels = runtime.microphoneLevels;
+    const previous = runtime;
     runtime = copy(packet.runtime || {});
-    if (packet.sequence < audioSequence) runtime.microphoneLevels = previousLevels;
-    else audioSequence = packet.sequence;
+    for (const [source, field] of [['microphone', 'microphoneLevels'], ['system', 'systemAudioLevels']]) {
+      if (packet.sequence < audioSequences[source]) runtime[field] = previous[field];
+      else audioSequences[source] = packet.sequence;
+    }
     appearance = copy(packet.settings || {});
     sessionGeneration = packet.sessionGeneration ?? 0;
     const previousOpen = openRequest;
@@ -245,10 +249,12 @@ export async function createSettingsProxy({
       if (!destroyed && payload?.clientId === clientId) applySnapshot(payload);
     }));
     unlisteners.push(await events.listen(AUDIO, ({ payload }) => {
+      const source = payload?.levels?.source === 'system' ? 'system' : 'microphone';
       if (destroyed || payload?.clientId !== clientId || payload.hostId !== hostId
-        || !Number.isSafeInteger(payload.sequence) || payload.sequence <= audioSequence) return;
-      audioSequence = payload.sequence;
-      runtime = { ...runtime, microphoneLevels: copy(payload.levels) };
+        || !Number.isSafeInteger(payload.sequence) || payload.sequence <= audioSequences[source]) return;
+      audioSequences[source] = payload.sequence;
+      const field = source === 'system' ? 'systemAudioLevels' : 'microphoneLevels';
+      runtime = { ...runtime, [field]: copy(payload.levels) };
       onAudioLevels?.(copy(payload.levels));
     }));
     unlisteners.push(await events.listen(HOST_READY, ({ payload }) => {

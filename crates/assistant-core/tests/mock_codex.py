@@ -59,8 +59,8 @@ def thread_value(thread_id):
 
 def thread_result(thread_id):
     return {"thread": thread_value(thread_id), "model": "mock-codex", "modelProvider": "openai",
-            "cwd": THREADS[thread_id]["cwd"], "approvalPolicy": "on-request",
-            "sandbox": {"type": "workspaceWrite", "writableRoots": [THREADS[thread_id]["cwd"]], "networkAccess": True},
+            "cwd": THREADS[thread_id]["cwd"], "approvalPolicy": THREADS[thread_id].get("approval", "on-request"),
+            "sandbox": ({"type": "readOnly", "networkAccess": False} if THREADS[thread_id].get("read_only") else {"type": "workspaceWrite", "writableRoots": [THREADS[thread_id]["cwd"]], "networkAccess": True}),
             "reasoningEffort": "medium"}
 
 
@@ -193,7 +193,7 @@ def dispatch(message):
     elif method in ("thread/start", "thread/fork"):
         thread_id = next_id("thread")
         parent = THREADS.get(params.get("threadId"), {})
-        THREADS[thread_id] = {"cwd": params.get("cwd") or parent.get("cwd") or str(Path.cwd())}
+        THREADS[thread_id] = {"cwd": params.get("cwd") or parent.get("cwd") or str(Path.cwd()), "read_only": params.get("sandbox") == "read-only", "approval": params.get("approvalPolicy", "on-request")}
         reply(request_id, thread_result(thread_id))
         notify("thread/started", {"thread": thread_value(thread_id)})
     elif method == "turn/start":

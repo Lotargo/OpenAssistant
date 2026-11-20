@@ -2,15 +2,22 @@
 use assistant_core::{
     bridge::{MAX_AUDIO_BYTES, MAX_LOCAL_MESSAGE},
     session::{self, SessionConfig, SessionInput},
+    workspace::{
+        self, CleanupReport, CleanupStatus, WorkspaceLease, WorkspaceMode, WorkspaceStatus,
+    },
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::Duration,
 };
-use tauri::{ipc::Channel, State};
+use tauri::{ipc::Channel, AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -24,6 +31,8 @@ pub struct AssistantState {
     session: Mutex<Option<NativeSession>>,
     next_id: AtomicU64,
     view_epoch: AtomicU64,
+    catalog: Mutex<()>,
+    last_workspace: Arc<StdMutex<Option<WorkspaceStatus>>>,
 }
 
 struct NativeSession {
@@ -32,6 +41,9 @@ struct NativeSession {
     input: mpsc::Sender<SessionInput>,
     run: JoinHandle<()>,
     forward: JoinHandle<()>,
+    workspace: Arc<WorkspaceLease>,
+    last_workspace: Arc<StdMutex<Option<WorkspaceStatus>>>,
+    on_event: Option<Channel<Value>>,
 }
 
 impl NativeSession {
@@ -49,6 +61,10 @@ impl NativeSession {
         }
         self.forward.abort();
         let _ = (&mut self.forward).await;
+        let status = cleanup_workspace(self.workspace.clone(), &self.last_workspace).await;
+        if let Some(channel) = &self.on_event {
+            let _ = channel.send(workspace_event(&status));
+        }
     }
 }
 
@@ -59,6 +75,43 @@ impl Drop for NativeSession {
         self.run.abort();
         self.forward.abort();
     }
+}
+
+fn workspace_event(status: &WorkspaceStatus) -> Value {
+    let mut value = serde_json::to_value(status).expect("workspace status is serializable");
+    value["type"] = json!("workspace_state");
+    value
+}
+
+fn remember_workspace(target: &Arc<StdMutex<Option<WorkspaceStatus>>>, status: WorkspaceStatus) {
+    *target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
+}
+
+async fn cleanup_workspace(
+    workspace: Arc<WorkspaceLease>,
+    target: &Arc<StdMutex<Option<WorkspaceStatus>>>,
+) -> WorkspaceStatus {
+    let fallback = workspace.clone();
+    let status = match tokio::task::spawn_blocking(move || workspace.cleanup()).await {
+        Ok(status) => status,
+        Err(_) => {
+            let mut status = fallback.status();
+            status.cleanup_status = CleanupStatus::Pending;
+            status.message = Some("Workspace cleanup could not finish; it will be retried.".into());
+            status
+        }
+    };
+    remember_workspace(target, status.clone());
+    status
+}
+
+pub async fn cleanup_stale_workspaces() -> Result<CleanupReport, String> {
+    tokio::task::spawn_blocking(workspace::cleanup_stale)
+        .await
+        .map_err(|_| "Could not inspect temporary workspaces.".to_owned())?
+        .map_err(|error| error.to_string())
 }
 
 impl AssistantState {
@@ -91,7 +144,9 @@ impl AssistantState {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectOptions {
+    workspace_mode: WorkspaceMode,
     workspace: String,
+    scenario: session::Scenario,
     model: String,
     effort: String,
     web_search: bool,
@@ -103,7 +158,9 @@ pub struct ConnectOptions {
 impl Default for ConnectOptions {
     fn default() -> Self {
         Self {
+            workspace_mode: WorkspaceMode::Temporary,
             workspace: String::new(),
+            scenario: session::Scenario::default(),
             model: String::new(),
             effort: String::new(),
             web_search: true,
@@ -114,14 +171,6 @@ impl Default for ConnectOptions {
     }
 }
 
-fn default_workspace() -> PathBuf {
-    std::env::current_dir()
-        .ok()
-        .filter(|path| path.is_dir())
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn optional_setting(value: String, name: &str, limit: usize) -> Result<Option<String>, String> {
     let value = value.trim();
     if value.len() > limit || value.chars().any(char::is_control) {
@@ -130,35 +179,138 @@ fn optional_setting(value: String, name: &str, limit: usize) -> Result<Option<St
     Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
-fn options(config: ConnectOptions) -> Result<SessionConfig, String> {
+fn options(config: ConnectOptions) -> Result<(SessionConfig, Arc<WorkspaceLease>), String> {
     if config.workspace.len() > 4096 || config.workspace.chars().any(char::is_control) {
         return Err("Invalid workspace path".into());
     }
-    let path = if config.workspace.trim().is_empty() {
-        default_workspace()
-    } else {
-        PathBuf::from(config.workspace.trim())
-    };
-    if !path.is_absolute() || !path.is_dir() {
-        return Err("Выбери существующую рабочую папку с абсолютным путём.".into());
-    }
     if !assistant_core::provider::allowed_model(&config.realtime_model) {
-        return Err("Неподдерживаемая модель Realtime.".into());
+        return Err("Unsupported Realtime model.".into());
     }
-    Ok(SessionConfig {
-        workspace: path,
-        model: optional_setting(config.model, "model", 128)?,
-        effort: optional_setting(config.effort, "effort", 32)?,
+    let model = optional_setting(config.model, "model", 128)?;
+    let effort = optional_setting(config.effort, "effort", 32)?;
+    let project =
+        (!config.workspace.trim().is_empty()).then(|| PathBuf::from(config.workspace.trim()));
+    let workspace = Arc::new(
+        WorkspaceLease::open(config.workspace_mode, project.as_deref())
+            .map_err(|error| error.to_string())?,
+    );
+    let session = SessionConfig {
+        workspace: workspace.path().to_owned(),
+        scenario: config.scenario,
+        model,
+        effort,
         web_search: config.web_search,
         parallel: config.parallel,
         realtime: config.realtime,
         realtime_model: config.realtime_model,
-    })
+    };
+    Ok((session, workspace))
 }
 
 #[tauri::command]
-pub async fn assistant_status() -> Result<Value, String> {
-    Ok(session::status(&default_workspace()).await)
+pub async fn assistant_status(state: State<'_, AssistantState>) -> Result<Value, String> {
+    let current = state
+        .last_workspace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let path = current
+        .as_ref()
+        .map(|value| value.path.clone())
+        .unwrap_or_default();
+    let mut status = session::status(&path).await;
+    status["workspace_mode"] = json!(current.as_ref().map(|value| value.mode).unwrap_or_default());
+    status["workspace_state"] = json!(current);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn assistant_models(state: State<'_, AssistantState>) -> Result<Value, String> {
+    let _request = state.catalog.lock().await;
+    // Catalog inspection is independent of the current agent and selected project.
+    let workspace =
+        tokio::task::spawn_blocking(|| WorkspaceLease::open(WorkspaceMode::Temporary, None))
+            .await
+            .map_err(|_| "Could not prepare a model catalog workspace.".to_owned())?
+            .map_err(|error| error.to_string())?;
+    let options = assistant_core::codex::SpawnOptions::new(workspace.path());
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        assistant_core::agent::available_models(options),
+    )
+    .await
+    .map_err(|_| "Codex model catalog timed out.".to_owned())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let _ = tokio::task::spawn_blocking(move || workspace.cleanup()).await;
+    result
+}
+
+#[tauri::command]
+pub fn assistant_workspace_state(state: State<'_, AssistantState>) -> Option<WorkspaceStatus> {
+    state
+        .last_workspace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+#[tauri::command]
+pub async fn assistant_cleanup_workspaces(
+    state: State<'_, AssistantState>,
+) -> Result<CleanupReport, String> {
+    let report = cleanup_stale_workspaces().await?;
+    let mut status = state
+        .last_workspace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(current) = status.as_mut() {
+        if current.temporary
+            && current.cleanup_status == CleanupStatus::Pending
+            && matches!(current.path.try_exists(), Ok(false))
+        {
+            current.cleanup_status = CleanupStatus::Removed;
+            current.message = None;
+        }
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn assistant_choose_workspace(
+    app: AppHandle,
+    state: State<'_, AssistantState>,
+) -> Result<Option<String>, String> {
+    let epoch = state.view_epoch.load(Ordering::Acquire);
+    let result = tokio::task::spawn_blocking(move || {
+        let parent = app
+            .get_webview_window("settings")
+            .filter(|window| window.is_visible().unwrap_or(false))
+            .or_else(|| app.get_webview_window("main"));
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("OpenAssistant: project folder");
+        if let Some(parent) = &parent {
+            dialog = dialog.set_parent(parent);
+        }
+        dialog
+            .blocking_pick_folder()
+            .map(|selection| {
+                let path = selection
+                    .into_path()
+                    .map_err(|_| "The selected folder has no local path.".to_owned())?;
+                workspace::project_path(&path)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|_| "Could not open the folder picker.".to_owned())??;
+    if epoch != state.view_epoch.load(Ordering::Acquire) {
+        return Err("The interface reloaded before folder selection finished.".into());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -169,7 +321,9 @@ pub async fn assistant_connect(
 ) -> Result<u64, String> {
     let view_epoch = state.view_epoch.load(Ordering::Acquire);
     // Validate before replacing an existing session.
-    let config = options(config)?;
+    let (config, workspace) = tokio::task::spawn_blocking(move || options(config))
+        .await
+        .map_err(|_| "Could not prepare the workspace.".to_owned())??;
     let mut slot = state.session.lock().await;
     if let Some(previous) = slot.take() {
         previous.stop().await;
@@ -181,6 +335,15 @@ pub async fn assistant_connect(
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_SIZE);
     let (events_tx, mut events_rx) = mpsc::channel(EVENT_QUEUE_SIZE);
     let final_events = events_tx.clone();
+    let initial_workspace = workspace.status();
+    remember_workspace(&state.last_workspace, initial_workspace.clone());
+    events_tx
+        .send(workspace_event(&initial_workspace))
+        .await
+        .map_err(|_| "Session output is unavailable".to_owned())?;
+    let run_workspace = workspace.clone();
+    let last_workspace = state.last_workspace.clone();
+    let cleanup_channel = on_event.clone();
     let run = tokio::spawn(async move {
         if let Err(error) = session::run(config, input_rx, events_tx).await {
             // SafeError contains fixed/sanitized text, never provider bodies.
@@ -188,6 +351,8 @@ pub async fn assistant_connect(
                 .send(json!({"type":"agent_error","message":error.to_string()}))
                 .await;
         }
+        let cleaned = cleanup_workspace(run_workspace, &last_workspace).await;
+        let _ = final_events.send(workspace_event(&cleaned)).await;
         let _ = final_events
             .send(json!({"type":"session_closed","message":"Сессия закрыта."}))
             .await;
@@ -209,6 +374,9 @@ pub async fn assistant_connect(
         input: input_tx,
         run,
         forward,
+        workspace,
+        last_workspace: state.last_workspace.clone(),
+        on_event: Some(cleanup_channel),
     });
     Ok(id)
 }
@@ -232,6 +400,10 @@ fn valid_message(message: &Value) -> Result<(), String> {
         "text",
         "mic_start",
         "mic_stop",
+        "system_start",
+        "system_stop",
+        "interview_start",
+        "interview_stop",
     ];
     if !message
         .get("type")
@@ -280,15 +452,21 @@ pub async fn assistant_audio(
     state: State<'_, AssistantState>,
     session_id: u64,
     audio: Vec<u8>,
+    source: Option<String>,
 ) -> Result<(), String> {
     if audio.is_empty() || audio.len() > MAX_AUDIO_BYTES || !audio.len().is_multiple_of(2) {
         return Err("Некорректный PCM16 аудиофрагмент.".into());
     }
+    let packet = match source.as_deref().unwrap_or("microphone") {
+        "microphone" => SessionInput::Audio(audio),
+        "system" => SessionInput::SystemAudio(audio),
+        _ => return Err("Неизвестный источник звука.".into()),
+    };
     // Audio must never wait behind an unbounded queue. Let the frontend stop the
     // microphone explicitly on backpressure rather than accumulate stale speech.
     active_input(&state, session_id)
         .await?
-        .try_send(SessionInput::Audio(audio))
+        .try_send(packet)
         .map_err(|_| "Передача аудио не успевает за микрофоном или сессия закрыта.".into())
 }
 
@@ -326,6 +504,9 @@ mod tests {
             input,
             run,
             forward,
+            workspace: Arc::new(WorkspaceLease::open(WorkspaceMode::Temporary, None).unwrap()),
+            last_workspace: state.last_workspace.clone(),
+            on_event: None,
         });
     }
 
@@ -361,17 +542,21 @@ mod tests {
 
     #[test]
     fn options_keep_default_provider_and_reject_control_characters() {
-        let config = options(ConnectOptions::default()).unwrap();
+        let (config, workspace) = options(ConnectOptions::default()).unwrap();
         assert!(config.workspace.is_dir());
         assert!(config.model.is_none());
         assert!(config.effort.is_none());
         assert!(config.realtime);
+        assert_eq!(workspace.status().mode, WorkspaceMode::Temporary);
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+        assert_eq!(workspace.cleanup().cleanup_status, CleanupStatus::Removed);
         assert!(options(ConnectOptions {
             model: "model\nsecret".into(),
             ..Default::default()
         })
         .is_err());
         assert!(options(ConnectOptions {
+            workspace_mode: WorkspaceMode::Project,
             workspace: "relative".into(),
             ..Default::default()
         })
@@ -383,3 +568,7 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "assistant_workspace_tests.rs"]
+mod workspace_tests;

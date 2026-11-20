@@ -36,6 +36,11 @@ impl Fixture {
             web_search: false,
             parallel: false,
         };
+        let options = self.options(flag);
+        let (tx, rx) = mpsc::channel(128);
+        (Handle::spawn(config, options, tx), rx)
+    }
+    fn options(&self, flag: &str) -> SpawnOptions {
         let mut options = SpawnOptions::new(&self.root);
         options.executable = Some(PathBuf::from(if cfg!(windows) {
             "python.exe"
@@ -51,8 +56,7 @@ impl Fixture {
             self.log.to_string_lossy().into_owned(),
             flag.into(),
         ]);
-        let (tx, rx) = mpsc::channel(128);
-        (Handle::spawn(config, options, tx), rx)
+        options
     }
     fn audit(&self) -> Vec<Value> {
         std::fs::read_to_string(&self.log)
@@ -182,4 +186,101 @@ async fn dropping_handle_during_initialize_terminates_registered_child() {
     );
     drop(handle);
     gone(pid).await;
+}
+
+#[tokio::test]
+async fn catalog_has_no_thread_or_turn_side_effects() {
+    let fixture = Fixture::new();
+    let result = available_models(fixture.options("--catalog-only"))
+        .await
+        .unwrap();
+    assert_eq!(result["models"].as_array().unwrap().len(), 2);
+    assert!(!result.to_string().contains("mock-auth-secret"));
+    let audit = fixture.audit();
+    assert!(
+        audit
+            .iter()
+            .any(|entry| entry["method"] == "account/read"
+                && entry["params"]["refreshToken"] == false)
+    );
+    assert!(!audit.iter().any(|entry| matches!(
+        entry["method"].as_str(),
+        Some("thread/start" | "thread/resume" | "thread/fork" | "turn/start")
+    )));
+    gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn hints_are_ephemeral_read_only_and_cannot_approve_writes_or_affect_manual_turns() {
+    let fixture = Fixture::new();
+    let (handle, mut events) = fixture.spawn("--hint-policy");
+    until(&mut events, "agent_state").await;
+    handle
+        .commands
+        .send(Command::Hint {
+            id: "hint".into(),
+            task: "mock:approval file".into(),
+        })
+        .await
+        .unwrap();
+    let hint = time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                Output::Ui(value) => assert_ne!(
+                    value["type"], "agent_approval",
+                    "hint must never expose an accept action"
+                ),
+                Output::Completed { id, text, .. } if id == "hint" => break text,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(hint, "APPROVAL_DECLINE");
+    handle
+        .commands
+        .send(Command::Run {
+            id: "manual".into(),
+            task: "manual task".into(),
+        })
+        .await
+        .unwrap();
+    time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, Output::Completed { id, .. } if id == "manual") {
+                return;
+            }
+        }
+        panic!("manual turn did not finish");
+    })
+    .await
+    .unwrap();
+    handle.shutdown().await;
+    let audit = fixture.audit();
+    let threads: Vec<_> = audit
+        .iter()
+        .filter(|entry| entry["method"] == "thread/start")
+        .collect();
+    assert_eq!(threads.len(), 2);
+    assert!(
+        threads
+            .iter()
+            .all(|entry| entry["params"]["ephemeral"] == true)
+    );
+    assert!(threads[0]["params"].get("sandbox").is_none());
+    assert_eq!(threads[1]["params"]["sandbox"], "read-only");
+    let turns: Vec<_> = audit
+        .iter()
+        .filter(|entry| entry["method"] == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 2);
+    assert_ne!(
+        turns[0]["params"]["threadId"],
+        turns[1]["params"]["threadId"]
+    );
+    assert_eq!(turns[0]["params"]["sandboxPolicy"]["type"], "readOnly");
+    assert_eq!(turns[0]["params"]["approvalPolicy"], "never");
+    assert!(turns[1]["params"].get("sandboxPolicy").is_none());
+    assert!(turns[1]["params"].get("approvalPolicy").is_none());
 }

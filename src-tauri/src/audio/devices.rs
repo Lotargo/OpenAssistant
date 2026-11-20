@@ -1,3 +1,4 @@
+use super::CaptureSource;
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::Serialize;
 
@@ -15,7 +16,23 @@ pub struct InputState {
 }
 
 pub fn input_state() -> InputState {
-    match devices() {
+    device_state(CaptureSource::Microphone)
+}
+
+pub fn system_state() -> InputState {
+    device_state(CaptureSource::System)
+}
+
+fn supported(source: CaptureSource) -> Result<(), String> {
+    if source == CaptureSource::System && !cfg!(windows) {
+        Err("Захват системного звука доступен только через WASAPI в Windows.".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn device_state(source: CaptureSource) -> InputState {
+    match devices(source) {
         Ok(devices) => InputState {
             available: !devices.is_empty(),
             devices,
@@ -29,16 +46,33 @@ pub fn input_state() -> InputState {
     }
 }
 
-fn devices() -> Result<Vec<InputDevice>, String> {
+fn default_device(host: &cpal::Host, source: CaptureSource) -> Option<cpal::Device> {
+    match source {
+        CaptureSource::Microphone => host.default_input_device(),
+        CaptureSource::System => host.default_output_device(),
+    }
+}
+
+fn candidates(host: &cpal::Host, source: CaptureSource) -> Result<Vec<cpal::Device>, String> {
+    supported(source)?;
+    let devices = match source {
+        CaptureSource::Microphone => host.input_devices(),
+        CaptureSource::System => host.output_devices(),
+    }
+    .map_err(|error| {
+        format!(
+            "Не удалось получить список аудиоустройств ({}): {error}",
+            source.label()
+        )
+    })?;
+    Ok(devices.collect())
+}
+
+fn devices(source: CaptureSource) -> Result<Vec<InputDevice>, String> {
     let host = cpal::default_host();
-    let default = host
-        .default_input_device()
-        .and_then(|device| device.id().ok());
+    let default = default_device(&host, source).and_then(|device| device.id().ok());
     let mut devices = Vec::new();
-    for device in host
-        .input_devices()
-        .map_err(|error| format!("Не удалось получить список микрофонов Windows: {error}"))?
-    {
+    for device in candidates(&host, source)? {
         let id = match device.id() {
             Ok(id) => id,
             Err(_) => continue,
@@ -49,7 +83,7 @@ fn devices() -> Result<Vec<InputDevice>, String> {
             name: device
                 .description()
                 .map(|d| d.name().to_owned())
-                .unwrap_or_else(|_| "Микрофон".into()),
+                .unwrap_or_else(|_| source.label().into()),
         });
     }
     devices.sort_by(|a, b| {
@@ -61,31 +95,30 @@ fn devices() -> Result<Vec<InputDevice>, String> {
     Ok(devices)
 }
 
-pub(super) fn resolve(selected: Option<&str>) -> Result<cpal::Device, String> {
+pub(super) fn resolve(
+    source: CaptureSource,
+    selected: Option<&str>,
+) -> Result<cpal::Device, String> {
+    supported(source)?;
     let host = cpal::default_host();
     match selected {
         Some(value) => {
             let id: cpal::DeviceId = value
                 .parse()
-                .map_err(|_| "Сохранённый микрофон недоступен. Выбери устройство заново.")?;
-            host.input_devices()
-                .map_err(|error| format!("Не удалось проверить микрофон: {error}"))?
+                .map_err(|_| "Сохранённое аудиоустройство недоступно. Выбери источник заново.")?;
+            candidates(&host, source)?.into_iter()
                 .find(|device| device.id().is_ok_and(|found| found == id))
-                .ok_or_else(|| {
-                    "Выбранный микрофон отключён или недоступен. Подключи его или выбери другой."
-                        .into()
-                })
+                .ok_or_else(|| format!("Выбранный источник ({}) отключён или недоступен. Подключи его или выбери другой.", source.label()))
         }
-        None => host
-            .default_input_device()
-            .ok_or_else(|| "Системный микрофон Windows не найден.".into()),
+        None => default_device(&host, source)
+            .ok_or_else(|| format!("Устройство по умолчанию ({}) не найдено.", source.label())),
     }
 }
 
-pub(super) fn connected(id: &str) -> bool {
-    cpal::default_host()
-        .input_devices()
-        .is_ok_and(|mut devices| {
-            devices.any(|device| device.id().is_ok_and(|value| value.to_string() == id))
-        })
+pub(super) fn connected(source: CaptureSource, id: &str) -> bool {
+    candidates(&cpal::default_host(), source).is_ok_and(|devices| {
+        devices
+            .into_iter()
+            .any(|device| device.id().is_ok_and(|value| value.to_string() == id))
+    })
 }

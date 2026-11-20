@@ -36,6 +36,21 @@ pub struct SpawnOptions {
     pub arguments: Option<Vec<String>>,
 }
 
+fn app_server_arguments() -> Vec<String> {
+    vec![
+        "app-server".into(),
+        "--listen".into(),
+        "stdio://".into(),
+        "-c".into(),
+        "model_provider=\"openai\"".into(),
+        // These overrides apply only to our child; never edit the user's config.
+        "-c".into(),
+        "notify=[]".into(),
+        "-c".into(),
+        "tui.notifications=false".into(),
+    ]
+}
+
 impl SpawnOptions {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
@@ -345,15 +360,7 @@ impl Client {
         }
         let executable = resolve_native_executable(options.executable.as_deref())?;
         let mut command = Command::new(executable);
-        command.args(options.arguments.unwrap_or_else(|| {
-            vec![
-                "app-server".into(),
-                "--listen".into(),
-                "stdio://".into(),
-                "-c".into(),
-                "model_provider=\"openai\"".into(),
-            ]
-        }));
+        command.args(options.arguments.unwrap_or_else(app_server_arguments));
         command
             .current_dir(options.cwd)
             .stdin(Stdio::piped())
@@ -565,7 +572,7 @@ impl Client {
     }
 
     pub async fn start_thread(&self, cwd: &Path, model: Option<&str>) -> Result<Value, SafeError> {
-        let mut params = json!({"cwd":cwd,"ephemeral":false,"modelProvider":"openai"});
+        let mut params = json!({"cwd":cwd,"ephemeral":true,"modelProvider":"openai"});
         if let Some(model) = model.filter(|value| !value.is_empty()) {
             params["model"] = json!(model);
         }
@@ -579,6 +586,29 @@ impl Client {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<Value, SafeError> {
+        self.start_turn_with_policy(thread, text, model, effort, false)
+            .await
+    }
+
+    pub async fn start_hint_turn(
+        &self,
+        thread: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Value, SafeError> {
+        self.start_turn_with_policy(thread, text, model, effort, true)
+            .await
+    }
+
+    async fn start_turn_with_policy(
+        &self,
+        thread: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        read_only: bool,
+    ) -> Result<Value, SafeError> {
         if text.trim().is_empty() {
             return Err(SafeError::new("Codex task text is empty."));
         }
@@ -591,6 +621,10 @@ impl Client {
         }
         if let Some(effort) = effort.filter(|value| !value.is_empty()) {
             params["effort"] = json!(effort);
+        }
+        if read_only {
+            params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
+            params["approvalPolicy"] = json!("never");
         }
         self.request("turn/start", params).await
     }
@@ -615,7 +649,7 @@ impl Client {
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..20 {
-            let mut params = json!({"limit":100,"modelProvider":"openai"});
+            let mut params = json!({"limit":100,"modelProvider":"openai","includeHidden":false});
             if let Some(cursor) = &cursor {
                 params["cursor"] = json!(cursor);
             }
@@ -908,6 +942,19 @@ fn approval_result(method: &str, params: &Value, response: Value) -> Result<Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_arguments_are_private_stdio_and_suppress_only_its_notifications() {
+        let args = app_server_arguments();
+        assert_eq!(&args[..3], ["app-server", "--listen", "stdio://"]);
+        assert!(args.iter().any(|arg| arg == "notify=[]"));
+        assert!(args.iter().any(|arg| arg == "tui.notifications=false"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("sandbox") || arg.contains("approval"))
+        );
+    }
 
     #[test]
     fn only_one_time_command_and_file_decisions_are_supported() {

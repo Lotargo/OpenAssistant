@@ -25,6 +25,7 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let log = root.join("requests.jsonl");
         let config = SessionConfig {
+            scenario: Scenario::default(),
             workspace: root.clone(),
             model: None,
             effort: None,

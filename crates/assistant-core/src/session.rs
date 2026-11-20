@@ -19,8 +19,18 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Scenario {
+    #[default]
+    Assistant,
+    Interview,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionConfig {
+    #[serde(default)]
+    pub scenario: Scenario,
     pub workspace: PathBuf,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -44,7 +54,7 @@ impl SessionConfig {
         }
         Ok(self)
     }
-    fn agent(&self) -> agent::Config {
+    pub(crate) fn agent(&self) -> agent::Config {
         agent::Config {
             workspace: self.workspace.clone(),
             model: self.model.clone(),
@@ -69,6 +79,7 @@ fn normalized(value: Option<String>, max: usize, field: &str) -> Result<Option<S
 pub enum SessionInput {
     Message(Value),
     Audio(Vec<u8>),
+    SystemAudio(Vec<u8>),
 }
 
 pub async fn status(default_workspace: &Path) -> Value {
@@ -111,7 +122,7 @@ impl Events {
     }
 }
 
-enum Parsed {
+pub(crate) enum Parsed {
     Voice(Input),
     Agent(agent::Command),
     Disconnect,
@@ -125,7 +136,7 @@ fn identifier(value: &Value, name: &str) -> Result<String, SafeError> {
         .ok_or_else(|| SafeError::new(format!("Некорректный параметр {name}")))
 }
 
-fn parse_message(value: Value, sequence: &mut u64) -> Result<Parsed, SafeError> {
+pub(crate) fn parse_message(value: Value, sequence: &mut u64) -> Result<Parsed, SafeError> {
     if !value.is_object()
         || serde_json::to_vec(&value)
             .map(|s| s.len())
@@ -269,6 +280,9 @@ pub async fn run(
     events: mpsc::Sender<Value>,
 ) -> Result<(), SafeError> {
     let config = config.validate()?;
+    if config.scenario == Scenario::Interview {
+        return crate::interview_session::run(config, input, events).await;
+    }
     let options = codex::SpawnOptions::new(config.workspace.clone());
     let events = Events { sender: events };
     let voice = connect_voice(&config, &events);
@@ -337,6 +351,7 @@ where
                     let Some(command)=command else {return Ok(());};
                     let parsed=match command {
                         SessionInput::Message(value)=>parse_message(value,&mut sequence),
+                        SessionInput::SystemAudio(_)=>Err(SafeError::new("Звук встречи доступен в сценарии собеседования")),
                         SessionInput::Audio(bytes)=>{
                             if bytes.is_empty() || bytes.len()>bridge::MAX_AUDIO_BYTES || !bytes.len().is_multiple_of(2) {
                                 Err(SafeError::new("Некорректный размер PCM16 аудиофрагмента"))

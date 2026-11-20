@@ -73,7 +73,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
               <p class="settings-description">Аудио, экран и подключение модели.</p>
               <p id="settings-runtime-error" class="settings-message" role="status" hidden></p>
               <div class="source-card microphone-card">
-                <div class="source-card-heading"><div><h3>Микрофон</h3><p>Системный источник по умолчанию. Устройство можно менять во время разговора.</p></div><button id="mic-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список микрофонов">${getIcon('reconnect')}</button></div>
+                <div class="source-card-heading"><div><h3>Мой микрофон</h3><p>Ваш голос учитывается отдельно от звука встречи. Устройство можно менять во время разговора.</p></div><button id="mic-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список микрофонов">${getIcon('reconnect')}</button></div>
                 <select id="mic-device" aria-label="Микрофон"><option value="">Системный по умолчанию</option></select>
                 <p id="mic-runtime" class="source-detail"></p>
                 <div id="mic-monitor" class="mic-monitor" data-active="false" data-clipped="false">
@@ -85,19 +85,56 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
                 <div class="mic-noise-row"><div class="mic-noise-copy"><label for="mic-noise-suppression">Шумоподавление</label><small>Убирает постоянный фоновый шум. По умолчанию выключено.</small></div><label class="switch"><input id="mic-noise-suppression" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label></div>
                 <p id="mic-error" class="mic-error" role="status" hidden></p>
               </div>
-              <div class="source-card"><h3>Realtime</h3><p>Речь и ответы после естественной паузы. Микрофон остаётся включённым.</p><select id="realtime-model" aria-label="Модель Realtime"><option value="gpt-realtime-2.1">gpt-realtime-2.1</option><option value="gpt-realtime-1.5">gpt-realtime-1.5</option></select></div>
-              <div class="source-card"><h3>Системный звук и экран</h3><p>Сейчас используется выбранный микрофон. Захват системного звука и изображения ещё не подключён.</p></div>
+              <div class="source-card"><h3>Realtime</h3><p>Голосовой ввод для выбранного сценария. Источники включаются только по вашему действию.</p><select id="realtime-model" aria-label="Модель Realtime"><option value="gpt-realtime-2.1">gpt-realtime-2.1</option><option value="gpt-realtime-1.5">gpt-realtime-1.5</option></select></div>
+              <div class="source-card system-audio-card">
+                <div class="source-card-heading"><div><h3>Звук встречи</h3><p>Устройство, через которое слышны участники. Учитывается весь звук этого устройства, включая другие приложения.</p></div><button id="system-audio-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список устройств вывода">${getIcon('reconnect')}</button></div>
+                <select id="system-audio-device" aria-label="Устройство звука встречи"><option value="">Системный по умолчанию</option></select>
+                <p id="system-audio-runtime" class="source-detail" role="status"></p>
+                <div id="system-audio-monitor" class="mic-monitor" data-active="false" data-clipped="false">
+                  <div class="mic-level-heading"><span id="system-audio-level-label">Звук встречи выключен</span><output id="system-audio-level-value" aria-hidden="true">−60 дБ</output></div>
+                  <div id="system-audio-level" class="mic-level" role="meter" aria-label="Уровень звука встречи" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span id="system-audio-level-fill" class="mic-level-fill"></span></div>
+                  <div class="mic-waveform" aria-hidden="true"><svg viewBox="0 0 480 64" preserveAspectRatio="none"><path class="mic-wave-center" d="M0 32H480"/><path id="system-audio-wave-path" class="mic-wave-path" d="M0 32H480"/></svg></div>
+                </div>
+                <p id="system-audio-error" class="mic-error" role="status" hidden></p>
+              </div>
+              <div class="source-card"><h3>Экран</h3><p>Захват изображения пока не подключён.</p></div>
             </section>
             <section id="section-agent" class="settings-section" role="tabpanel" aria-labelledby="tab-agent" hidden>
               <h2>Агент</h2>
-              <p class="settings-description">Codex работает в указанном проекте через вход в ChatGPT. Ответы и код появляются в основной панели.</p>
+              <p class="settings-description">Сценарий, рабочая папка и возможности Codex. Ответы и код появляются в основной панели.</p>
+              <div class="agent-field"><label for="agent-scenario">Сценарий</label><select id="agent-scenario" data-agent-setting="scenario"><option value="assistant">Обычные задачи</option><option value="interview">Собеседование</option></select></div>
+              <section id="interview-panel" class="agent-scenario-card" aria-labelledby="interview-state" hidden>
+                <div class="agent-listening-heading"><span class="agent-listening-dot" aria-hidden="true"></span><strong id="interview-state" role="status">Не слушаю</strong></div>
+                <p id="interview-detail" class="agent-field-note">Подсказки по вопросам и задачам, обращённым к вам.</p>
+                <p id="interview-source" class="agent-source-attribution"></p>
+                <p id="interview-speaker-status" class="agent-field-note"></p>
+                <div class="agent-actions"><button id="interview-start" class="action-button" type="button">Начать прослушивание</button><button id="interview-stop" class="action-button secondary" type="button">Остановить</button></div>
+                <p id="interview-error" class="settings-message" role="status" hidden></p>
+              </section>
+              <div class="agent-field"><label for="agent-workspace-mode">Рабочее пространство</label><select id="agent-workspace-mode" data-agent-setting="workspace_mode"><option value="temporary">Пустая временная папка</option><option value="project">Папка проекта</option></select></div>
+              <div id="agent-project-field" class="agent-field">
+                <label for="agent-workspace">Папка проекта</label>
+                <div class="agent-path-control"><input id="agent-workspace" data-agent-setting="workspace" type="text" spellcheck="false" placeholder="Выберите папку проекта" /><button id="agent-workspace-choose" class="action-button secondary" type="button">Выбрать папку</button></div>
+              </div>
+              <div class="agent-workspace-state">
+                <p id="agent-workspace-status" class="agent-field-note" role="status"></p>
+                <p id="agent-workspace-current" class="agent-workspace-current" hidden><span id="agent-workspace-path-label"></span><code id="agent-workspace-path"></code></p>
+                <button id="agent-workspace-clear" class="action-button secondary small" type="button">Удалить временные файлы</button>
+              </div>
+              <div class="agent-field-grid">
+                <div class="agent-field">
+                  <div class="agent-field-heading"><label for="agent-model">Модель Codex</label><button id="agent-model-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить модели Codex">${getIcon('reconnect')}</button></div>
+                  <select id="agent-model" data-agent-setting="model" aria-describedby="agent-model-description agent-catalog-status"><option value="">По умолчанию Codex</option></select>
+                  <p id="agent-model-description" class="agent-field-note"></p>
+                </div>
+                <div class="agent-field">
+                  <label for="agent-effort">Глубина рассуждений</label><select id="agent-effort" data-agent-setting="effort" aria-describedby="agent-effort-description"><option value="">По умолчанию модели</option></select>
+                  <p id="agent-effort-description" class="agent-field-note"></p>
+                </div>
+              </div>
+              <p id="agent-catalog-status" class="agent-field-note agent-catalog-status" role="status"></p>
               <p id="agent-runtime" class="agent-runtime" role="status"></p>
               <p id="agent-error" class="settings-message" role="alert" hidden></p>
-              <div class="agent-field"><label for="agent-workspace">Рабочая папка</label><input id="agent-workspace" data-agent-setting="workspace" type="text" spellcheck="false" placeholder="F:\\project" /></div>
-              <div class="agent-field-grid">
-                <div class="agent-field"><label for="agent-model">Модель Codex</label><select id="agent-model" data-agent-setting="model"><option value="">По умолчанию Codex</option></select></div>
-                <div class="agent-field"><label for="agent-effort">Глубина рассуждений</label><select id="agent-effort" data-agent-setting="effort"><option value="">По умолчанию модели</option></select></div>
-              </div>
               <div class="agent-options">
                 <label><input id="agent-web-search" data-agent-setting="web_search" type="checkbox" checked /> Поиск в интернете</label>
                 <label><input id="agent-parallel" data-agent-setting="parallel" type="checkbox" checked /> Параллельные задачи</label>

@@ -58,14 +58,15 @@ export function createAssistantTransport({ invoke, Channel, onEvent, onError } =
       return created;
     },
     send(message) { return enqueue('assistant_send', { message }); },
-    audio(buffer) {
+    audio(buffer, source = 'microphone') {
+      if (!['microphone', 'system'].includes(source)) return false;
       if (!(buffer instanceof ArrayBuffer) || !buffer.byteLength || sessionId === null || destroyed) return false;
       if (buffer.byteLength > 9600 || bufferedBytes + buffer.byteLength > MAX_AUDIO_BYTES) {
         onError?.(new Error('Передача аудио не успевает за микрофоном. Микрофон остановлен.'));
         return false;
       }
       const epoch = generation;
-      void enqueue('assistant_audio', { audio: Array.from(new Uint8Array(buffer)) }, buffer.byteLength)
+      void enqueue('assistant_audio', { audio: Array.from(new Uint8Array(buffer)), source }, buffer.byteLength)
         .catch(error => { if (epoch === generation && !destroyed) onError?.(error); });
       return true;
     },

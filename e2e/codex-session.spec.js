@@ -9,7 +9,7 @@ test('Codex connects without keys and streams tool activity, code and guidance t
   const sessionId = await connectAgent(page);
   settings = await settingsPage(page);
   const config = await page.evaluate(() => window.__nativeContract.calls.find(call => call.name === 'assistant_connect').args.config);
-  expect(config).toMatchObject({ workspace: 'F:\\fixture-workspace', realtime: false });
+  expect(config).toMatchObject({ workspace_mode: 'temporary', scenario: 'assistant', realtime: false });
   expect(Object.keys(config).some(key => /api.?key|token/i.test(key))).toBe(false);
   expect(await settings.locator('input[type="password"]').count()).toBe(0);
 

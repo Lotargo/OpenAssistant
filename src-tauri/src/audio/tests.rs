@@ -227,3 +227,83 @@ fn cpal_advisories_preserve_capture_but_real_failures_keep_diagnostics() {
         assert!(message.contains(&format!("{kind:?}")));
     }
 }
+
+#[test]
+fn system_and_microphone_have_independent_workers_and_exact_stop_ids() {
+    let mic = AudioState::default();
+    let system = SystemAudioState::default();
+    assert!(!Arc::ptr_eq(&mic.inner, &system.inner));
+    assert_eq!(mic.source, CaptureSource::Microphone);
+    assert_eq!(system.source, CaptureSource::System);
+    let mic_worker = fake_worker(800, CaptureMode::Stream);
+    let system_worker = fake_worker(801, CaptureMode::Stream);
+    lock(&mic.inner.slots).current = Some(mic_worker.clone());
+    lock(&system.inner.slots).current = Some(system_worker.clone());
+    mic.stop(Some(801)).unwrap();
+    assert!(mic_worker.control.live.load(Ordering::Acquire));
+    assert!(system_worker.control.live.load(Ordering::Acquire));
+    system.stop(Some(801)).unwrap();
+    assert!(!system_worker.control.live.load(Ordering::Acquire));
+    assert!(mic_worker.control.live.load(Ordering::Acquire));
+    mic.stop(None).unwrap();
+}
+
+#[test]
+fn quiet_loopback_does_not_fail_the_microphone_stall_watchdog() {
+    assert!(!CaptureSource::Microphone.stalled(Duration::from_secs(5)));
+    assert!(CaptureSource::Microphone.stalled(Duration::from_secs(6)));
+    assert!(!CaptureSource::System.stalled(Duration::from_secs(6)));
+    assert!(!CaptureSource::System.stalled(Duration::from_secs(60 * 60)));
+}
+
+#[test]
+fn system_retirement_cancels_queued_start_before_endpoint_access() {
+    let system = SystemAudioState::default();
+    let ticket = system.start_ticket(CaptureMode::Stream);
+    system.invalidate_test();
+    assert!(ticket.valid(&system.inner, CaptureMode::Stream));
+    system.invalidate();
+    let result = system.start_with_ticket(
+        AudioConfig {
+            device_id: Some("not-a-real-output-id".into()),
+            mode: CaptureMode::Stream,
+            noise_suppression: false,
+        },
+        ticket,
+        |_| panic!("Retired view must never start loopback"),
+    );
+    assert!(result.unwrap_err().contains("отменён"));
+    assert!(lock(&system.inner.slots).current.is_none());
+}
+
+#[test]
+fn system_channel_keeps_capture_contract_and_reports_only_source_not_identity() {
+    let events = [
+        AudioEvent::Started {
+            capture_id: 901,
+            device_id: "output-id".into(),
+            device_name: "Headphones".into(),
+        },
+        AudioEvent::Pcm {
+            capture_id: 901,
+            data: vec![0, 0, 1, 0],
+        },
+        AudioEvent::Stopped {
+            capture_id: 901,
+            reason: "stopped".into(),
+            error: None,
+        },
+    ];
+    for event in events {
+        let original = serde_json::to_value(&event).unwrap();
+        let system = serde_json::to_value(SystemAudioEvent::from(event)).unwrap();
+        assert_eq!(system["source"], "system");
+        assert_eq!(system["capture_id"], 901);
+        assert_eq!(system["type"], original["type"]);
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(&system[key], value);
+        }
+        assert!(system.get("speaker").is_none());
+        assert!(system.get("event").is_none(), "The DTO must remain flat");
+    }
+}

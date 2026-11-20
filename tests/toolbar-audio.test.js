@@ -80,3 +80,42 @@ test('toolbar signals do not invent intermediate frames and expire or hide with 
   display.update(frame(), { microphoneMuted: false });
   assertIdle(sides);
 });
+
+
+test('interview toolbar sides retain independent samples, clipping, stale deadlines and source availability', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  const { display, sides: [left, right] } = fixture(t);
+  const path = side => side.querySelector('.toolbar-audio-wave').getAttribute('d');
+  let microphone = frame({ inputPeak: .3 });
+  const runtime = {
+    microphoneMuted: false, systemAudioActive: true, interviewState: { stage: 'evaluating' },
+    systemAudioLevels: frame({ source: 'system', inputPeak: 1, waveform: [0, -.5, .3, 0] }),
+  };
+  display.update(microphone, runtime);
+  assert.notEqual(path(left), path(right));
+  assert.equal(left.dataset.clipped, 'false');
+  assert.equal(right.dataset.clipped, 'true');
+  const remotePath = path(right);
+  t.mock.timers.tick(300);
+  microphone = frame({ rawRms: .03, inputPeak: .2, waveform: [0, .2, -.1, 0] });
+  display.update(microphone, runtime);
+  assert.equal(path(right), remotePath);
+  t.mock.timers.tick(500);
+  assert.equal(left.dataset.active, 'true');
+  assert.equal(right.dataset.active, 'false', 'an old system frame expires while newer mic audio stays active');
+  runtime.systemAudioLevels = frame({ source: 'system', rawRms: .2, waveform: [0, -.3, .1, 0] });
+  display.update(microphone, runtime);
+  assert.equal(right.dataset.active, 'true');
+  t.mock.timers.tick(300);
+  assert.equal(left.dataset.active, 'false');
+  assert.equal(right.dataset.active, 'true', 'new system audio must not refresh or replace the mic frame');
+  runtime.microphoneMuted = true;
+  display.update(microphone, runtime);
+  assert.equal(left.dataset.active, 'false');
+  assert.equal(right.dataset.active, 'true');
+  runtime.microphoneMuted = false;
+  runtime.systemAudioActive = false;
+  display.update(frame(), runtime);
+  assert.equal(left.dataset.active, 'true');
+  assert.equal(right.dataset.active, 'false', 'an unavailable meeting source cannot mirror the microphone during an interview');
+});

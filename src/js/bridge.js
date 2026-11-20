@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { load } from '@tauri-apps/plugin-store';
 import { createMicrophone } from './microphone.js';
 import { createAssistantTransport } from './session-transport.js';
+import { createSystemAudio } from './system-audio.js';
 
 const APPEARANCE_KEY = 'openassistant.settings.v1';
 const AGENT_KEY = 'openassistant.agent.v1';
@@ -11,7 +12,7 @@ const WINDOW_MODE_KEY = 'openassistant.window-mode.v1';
 const validWindowMode = mode => mode === 'overlay' || mode === 'standard';
 const PREVIEW_ONLY = 'Codex доступен в приложении OpenAssistant. Браузер открыт только для просмотра интерфейса.';
 const DEFAULT_AGENT = Object.freeze({
-  workspace: '', model: '', effort: '', web_search: true, parallel: true,
+  workspace: '', workspace_mode: 'temporary', scenario: 'assistant', model: '', effort: '', web_search: true, parallel: true,
   realtime: true, realtime_model: 'gpt-realtime-2.1',
 });
 
@@ -19,6 +20,8 @@ function normalizeAgent(value = {}) {
   const source = value && typeof value === 'object' ? value : {};
   return {
     workspace: typeof source.workspace === 'string' ? source.workspace.trim() : '',
+    workspace_mode: source.workspace_mode === 'project' ? 'project' : 'temporary',
+    scenario: source.scenario === 'interview' ? 'interview' : 'assistant',
     model: typeof source.model === 'string' ? source.model : '',
     effort: typeof source.effort === 'string' ? source.effort : '',
     web_search: typeof source.web_search === 'boolean' ? source.web_search : true,
@@ -31,6 +34,7 @@ function normalizeAudio(value = {}) {
   const source = value && typeof value === 'object' ? value : {};
   return {
     deviceId: typeof source.deviceId === 'string' ? source.deviceId : '',
+    systemDeviceId: typeof source.systemDeviceId === 'string' ? source.systemDeviceId : '',
     noiseSuppression: source.noiseSuppression === true,
   };
 }
@@ -71,6 +75,11 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let voiceWaiting = null;
   let connectionPromise = null;
   let sessionConfig = null;
+  let modelsPromise = null;
+  let interviewStarting = false;
+  let interviewListeningIntent = false;
+  let interviewStartToken = null;
+  let interviewStopping = null;
   let visibleTask = null;
   let activeSource = null;
   let pinnedAgent = false;
@@ -81,6 +90,13 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     microphoneMuted: true, microphoneDevice: audioConfig.deviceId, microphoneDevices: [],
     microphoneNoiseSuppression: audioConfig.noiseSuppression, microphoneTesting: false,
     microphoneBusy: false, microphoneError: '', microphoneStatus: '', microphoneLevels: null,
+    systemAudioActive: false, systemAudioBusy: false, systemAudioAvailable: false,
+    systemAudioDevice: audioConfig.systemDeviceId, systemAudioDevices: [], systemAudioLevels: null,
+    systemAudioStatus: '', systemAudioError: '',
+    modelCatalog: { status: 'idle', error: '', updatedAt: null },
+    workspaceState: { mode: config.workspace_mode, path: '', cleanupStatus: 'idle', detail: '' },
+    interviewState: { stage: 'idle', detail: 'Прослушивание выключено' },
+    speakerState: { status: 'idle', detail: '' }, transcriptHistory: [],
     screenCaptureEnabled: false, scrollLocked: false, settingsOpen: false,
     windowMode: !native && validWindowMode(storedWindowMode) ? storedWindowMode : 'overlay',
     connectionStatus: native ? 'idle' : 'unavailable', agentStage: 'idle', agentDetail: '',
@@ -129,6 +145,9 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       available: native && Boolean(state.audioAvailable ?? runtime.audioAvailable),
     };
     publish({ ...state, audioAvailable: current.available });
+    if (state.microphoneMuted === true && !interviewStarting && interviewActive() && !interviewStopping) {
+      void stopInterview('Микрофон остановлен · прослушивание приостановлено').catch(reportError);
+    }
     if (!native || destroyed) return;
     const signature = JSON.stringify(current);
     if (signature === lastAudioState) return;
@@ -152,7 +171,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     nativeAudio: native ? { invoke, Channel } : null,
     initialSettings: audioConfig,
     onSettings(preferences) {
-      audioConfig = normalizeAudio(preferences);
+      audioConfig = normalizeAudio({ ...audioConfig, ...preferences });
       return saveValue('audio', AUDIO_KEY, audioConfig).catch(() => {});
     },
     onLevels(levels) {
@@ -161,16 +180,146 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       // must not rebuild the settings controls or move keyboard focus.
       onAudioLevels?.(levels);
     },
-    isReady: () => native && runtime.liveAvailable && config.realtime && transport.connected,
+    isReady: () => native && runtime.liveAvailable && (sessionConfig?.realtime ?? config.realtime) && transport.connected,
     sendEvent: send,
-    sendAudio(buffer) { return transport.audio(buffer); },
+    sendAudio(buffer) { return transport.audio(buffer, 'microphone'); },
     onState: syncAudio,
     onDevices: (devices, selected) => publish({ microphoneDevices: devices, microphoneDevice: selected }),
     onError: message => reportError(message),
   });
 
+  const systemAudio = createSystemAudio({
+    nativeAudio: native ? { invoke, Channel } : null,
+    initialDevice: audioConfig.systemDeviceId,
+    onDevice(deviceId) {
+      audioConfig = normalizeAudio({ ...audioConfig, systemDeviceId: deviceId });
+      return saveValue('audio', AUDIO_KEY, audioConfig);
+    },
+    onDevices: (devices, selected) => publish({ systemAudioDevices: devices, systemAudioDevice: selected }),
+    onState(state) {
+      publish(state);
+      if (state.systemAudioActive === false && !interviewStarting && interviewActive() && !interviewStopping) {
+        void stopInterview('Источник встречи остановлен · прослушивание приостановлено').catch(reportError);
+      }
+    },
+    onLevels(levels) {
+      runtime = { ...runtime, systemAudioLevels: levels };
+      onAudioLevels?.(levels);
+    },
+    onError: reportError,
+    isReady: () => native && runtime.liveAvailable && sessionConfig?.scenario === 'interview' && transport.connected,
+    sendEvent: send,
+    sendAudio: buffer => transport.audio(buffer, 'system'),
+  });
+  function interviewActive() {
+    return ['starting', 'listening', 'evaluating', 'helping'].includes(runtime.interviewState?.stage);
+  }
+  async function refreshModels() {
+    if (!native) throw new Error(PREVIEW_ONLY);
+    if (modelsPromise) return modelsPromise;
+    const operation = (async () => {
+      publish({ modelCatalog: { ...runtime.modelCatalog, status: 'loading', error: '' } });
+      try {
+        const result = await invoke('assistant_models');
+        if (!Array.isArray(result?.models)) throw new Error('Codex не вернул каталог моделей.');
+        if (!destroyed) publish({ models: result.models, modelCatalog: { status: 'ready', error: '', updatedAt: Date.now() } });
+      } catch (error) {
+        if (!destroyed) publish({ modelCatalog: { ...runtime.modelCatalog, status: 'error', error: String(error?.message ?? error) } });
+        throw error;
+      }
+    })();
+    modelsPromise = operation;
+    void operation.finally(() => { if (modelsPromise === operation) modelsPromise = null; }).catch(() => {});
+    return operation;
+  }
+  function workspaceState(value) {
+    value = value || {};
+    const cleanupStatus = ({ removed: 'cleaned', preserved: 'idle' })[value.cleanup_status] || value.cleanup_status || 'idle';
+    return { mode: value.workspace_mode || value.mode || config.workspace_mode, path: value.path || '', cleanupStatus, detail: value.message || '' };
+  }
+  async function refreshWorkspace() {
+    if (!native || destroyed) return;
+    const state = await invoke('assistant_workspace_state');
+    if (!destroyed) publish({ workspaceState: workspaceState(state) });
+  }
+  async function stopInterview(detail = 'Прослушивание остановлено', preserveStart = false) {
+    if (!preserveStart) {
+      // The text session survives Stop. Fence queued meeting events immediately,
+      // before native capture shutdown and the final cleared snapshot complete.
+      interviewListeningIntent = false;
+      interviewStarting = false;
+      if (interviewStartToken) {
+        interviewStartToken.cancelled = true;
+        interviewStartToken.cancel();
+      }
+    }
+    if (interviewStopping) return interviewStopping;
+    const operation = (async () => {
+      publish({ interviewState: { ...runtime.interviewState, stage: 'stopping', detail } });
+      if (transport.connected && sessionConfig?.scenario === 'interview') {
+        await send('interview_stop').catch(() => {});
+      }
+      const stopped = await Promise.allSettled([mic.stop(false), systemAudio.stop(false)]);
+      if (transport.connected && sessionConfig?.scenario === 'interview') {
+        await send('mic_stop').catch(() => {});
+        await send('system_stop').catch(() => {});
+      }
+      publish({ interviewState: { stage: 'idle', detail }, transcript: '', transcriptHistory: [],
+        speakerState: { status: 'idle', detail: 'Группировка голосов выключена' } });
+      const failed = stopped.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+    })();
+    interviewStopping = operation;
+    try { await operation; }
+    finally { if (interviewStopping === operation) interviewStopping = null; }
+  }
+  async function startInterview() {
+    if (!native) throw new Error(PREVIEW_ONLY);
+    if (config.scenario !== 'interview') throw new Error('Выбери сценарий «Собеседование».');
+    if (!config.realtime) throw new Error('Включи голосовое подключение для прослушивания встречи.');
+    if (interviewActive() || interviewStarting) return;
+    if (runtime.configDirty && runtime.tasks.some(task => task.status === 'running')) throw new Error('Сначала заверши текущую задачу.');
+    const cancelled = Symbol('interview-cancelled');
+    const token = { cancelled: false, cancel: null };
+    const cancellation = new Promise(resolve => { token.cancel = () => resolve(cancelled); });
+    interviewStartToken = token;
+    interviewStarting = true;
+    interviewListeningIntent = true;
+    async function step(operation) {
+      const result = await Promise.race([operation, cancellation]);
+      if (result === cancelled || token.cancelled || destroyed) throw cancelled;
+      return result;
+    }
+    publish({ interviewState: { stage: 'starting', detail: 'Подключаю собеседование' } });
+    try {
+      await step(mic.stopTest());
+      await step(connect(true));
+      await step(waitForVoice());
+      if (runtime.configDirty) throw new Error('Настройки изменились. Подключись с новыми параметрами.');
+      publish({ interviewState: { stage: 'starting', detail: 'Открываю микрофон и звук встречи' } });
+      await step(Promise.all([systemAudio.refresh(), mic.refresh()]));
+      if (!runtime.systemAudioAvailable) throw new Error('Выбери доступное устройство вывода для звука встречи.');
+      if (!runtime.audioAvailable) throw new Error('Выбери доступный микрофон.');
+      await step(systemAudio.start());
+      await step(mic.start());
+      await step(send('interview_start'));
+      publish({ interviewState: { stage: 'listening', detail: 'Слушаю микрофон и участников встречи' } });
+    } catch (error) {
+      if (error === cancelled || token.cancelled) return;
+      await stopInterview('Не удалось начать прослушивание');
+      publish({ interviewState: { stage: 'idle', detail: 'Прослушивание выключено', error: String(error?.message ?? error) } });
+      throw error;
+    } finally {
+      if (interviewStartToken === token) {
+        interviewStartToken = null;
+        interviewStarting = false;
+      }
+    }
+  }
   function stopVoiceSafely() {
-    void mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
+    if (sessionConfig?.scenario === 'interview' || systemAudio.active || interviewStarting) {
+      void stopInterview().catch(reportError);
+    } else void mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
   }
 
   function begin(source, taskId = null) {
@@ -244,7 +393,22 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         readyIfPossible();
         break;
       case 'agent_models':
-        publish({ models: Array.isArray(event.models) ? event.models : [] });
+        publish({ models: Array.isArray(event.models) ? event.models : [],
+          modelCatalog: { status: 'ready', error: '', updatedAt: Date.now() } });
+        break;
+      case 'workspace_state':
+        publish({ workspaceState: workspaceState(event) });
+        break;
+      case 'speaker_state':
+        if (sessionConfig?.scenario === 'interview' && !interviewListeningIntent
+          && !['idle', 'error', 'unavailable'].includes(event.status)) break;
+        publish({ speakerState: { status: event.status || 'unavailable', detail: event.detail || '' } });
+        break;
+      case 'interview_state':
+        if (sessionConfig?.scenario === 'interview' && !interviewListeningIntent
+          && !['idle', 'error', 'unavailable'].includes(event.stage)) break;
+        if (interviewStarting && event.stage === 'idle') break;
+        publish({ interviewState: { ...runtime.interviewState, ...event } });
         break;
       case 'agent_task_started':
         taskText.set(event.task_id, '');
@@ -333,9 +497,32 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       case 'response_done':
         if (activeSource === 'realtime') { onTurnEnd?.({ source: 'realtime' }); activeSource = null; realtimeText = ''; }
         break;
-      case 'transcript':
-        publish({ transcript: String(event.text || '') });
+      case 'transcript': {
+        if (sessionConfig?.scenario === 'interview' && !interviewListeningIntent) break;
+        const text = String(event.text || '');
+        const entry = { text, utterance_id: event.utterance_id, item_id: event.item_id,
+          source: event.source || 'microphone', speaker: event.speaker || null,
+          speaker_label: event.speaker_label || (event.source === 'system' ? 'Участники встречи' : 'Мой микрофон') };
+        publish({ transcript: sessionConfig?.scenario === 'interview' ? entry.speaker_label + ': ' + text : text,
+          transcriptHistory: [...runtime.transcriptHistory, entry].slice(-32),
+          ...(sessionConfig?.scenario === 'interview' ? { interviewState: { ...runtime.interviewState,
+            source: entry.source, speaker: entry.speaker, speaker_label: entry.speaker_label } } : {}) });
         break;
+      }
+      case 'speaker_attribution': {
+        if ((sessionConfig?.scenario === 'interview' && !interviewListeningIntent)
+          || !Number.isSafeInteger(event.utterance_id)) break;
+        const history = runtime.transcriptHistory.map(entry => entry.utterance_id === event.utterance_id
+          && entry.source === 'system' ? { ...entry, speaker: event.speaker || null,
+            speaker_label: event.speaker_label || 'Участники встречи' } : entry);
+        const latest = history.at(-1);
+        const current = latest?.utterance_id === event.utterance_id && latest.source === 'system';
+        publish({ transcriptHistory: history, ...(current ? {
+          transcript: latest.speaker_label + ': ' + latest.text,
+          interviewState: { ...runtime.interviewState, speaker: latest.speaker, speaker_label: latest.speaker_label },
+        } : {}) });
+        break;
+      }
       case 'mic_state':
         if (event.stage === 'speech' && !runtime.tasks.some(task => task.status === 'running')) pinnedAgent = false;
         publish({ micStage: event.stage, micDetail: event.detail });
@@ -390,13 +577,14 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     return promise;
   }
 
-  async function disconnect() {
+  async function disconnect(preserveInterviewStart = false) {
     ++generation;
     connectionPromise = null;
     failWaiting('Подключение отменено.');
     failVoice('Подключение отменено.');
-    await mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
+    await stopInterview('Прослушивание остановлено', preserveInterviewStart).catch(reportError);
     await transport.disconnect();
+    await refreshWorkspace().catch(() => {});
     activeSource = null;
     visibleTask = null;
     pinnedAgent = false;
@@ -404,15 +592,16 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     realtimeText = '';
     taskText.clear();
     publish({ connectionStatus: native ? 'idle' : 'unavailable', connectionDetail: '', agentStage: 'idle', agentDetail: '', liveAvailable: false,
-      approvals: [], inputs: [], tasks: [], activities: [], visibleTaskId: null, voiceError: '' });
+      approvals: [], inputs: [], tasks: [], activities: [], visibleTaskId: null, voiceError: '',
+      transcript: '', transcriptHistory: [], interviewState: { stage: 'idle', detail: 'Прослушивание выключено' } });
   }
 
-  function connect() {
+  function connect(preserveInterviewStart = false) {
     if (!native) return Promise.reject(new Error(PREVIEW_ONLY));
     if (connectionPromise) return connectionPromise;
     if (transport.connected && ['ready', 'running'].includes(runtime.agentStage) && !runtime.configDirty) return Promise.resolve();
     const operation = (async () => {
-      await disconnect();
+      await disconnect(preserveInterviewStart);
       const epoch = generation;
       publish({ connectionStatus: config.realtime ? 'connecting' : 'idle', agentStage: 'starting', lastError: '', voiceError: '' });
       let resolve;
@@ -451,6 +640,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     try {
       switch (name) {
         case 'set_microphone_muted':
+          if (config.scenario === 'interview' || sessionConfig?.scenario === 'interview' && interviewActive()) {
+            if (args.muted) await stopInterview(); else await startInterview();
+            return { ...runtime };
+          }
           if (args.muted) await mic.stop();
           else {
             await mic.stopTest();
@@ -466,7 +659,36 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           await mic.select(args.deviceId || '');
           return { ...runtime };
         case 'refresh_microphones':
-          await mic.refresh();
+          await Promise.all([mic.refresh(), systemAudio.refresh()]);
+          return { ...runtime };
+        case 'refresh_models':
+          await refreshModels();
+          return { ...runtime };
+        case 'choose_workspace': {
+          if (!native) throw new Error(PREVIEW_ONLY);
+          const path = await invoke('assistant_choose_workspace');
+          if (typeof path === 'string' && path) {
+            config = normalizeAgent({ ...config, workspace: path, workspace_mode: 'project' });
+            publish({ agentConfig: { ...config }, configDirty: true });
+            await saveValue('agent', AGENT_KEY, config);
+          }
+          return { ...runtime };
+        }
+        case 'clear_temporary_workspace':
+          if (!native) throw new Error(PREVIEW_ONLY);
+          if (runtime.tasks.some(task => task.status === 'running') || interviewActive()) throw new Error('Останови прослушивание и дождись завершения задач перед очисткой.');
+          await disconnect();
+          await invoke('assistant_cleanup_workspaces');
+          await refreshWorkspace();
+          return { ...runtime };
+        case 'start_interview':
+          await startInterview();
+          return { ...runtime };
+        case 'stop_interview':
+          await stopInterview();
+          return { ...runtime };
+        case 'set_system_audio_device':
+          await systemAudio.select(args.deviceId || '');
           return { ...runtime };
         case 'request_microphone_permission':
           await mic.requestPermission();
@@ -576,11 +798,12 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     }
     try {
       const status = await invoke('assistant_status');
-      if (!config.workspace && typeof status.workspace === 'string') config.workspace = status.workspace;
       publish({ agentConfig: { ...config }, mode: status.mode || 'real',
         codexAvailable: status.codex_available === true, auth: status.oauth, lastError: status.message || runtime.lastError || initialError });
     } catch (error) { reportError(error); }
-    await mic.refresh();
+    await Promise.all([mic.refresh(), systemAudio.refresh()]);
+    await refreshWorkspace().catch(() => {});
+    void refreshModels().catch(() => {});
   } else publish({ agentDetail: PREVIEW_ONLY });
 
   return {
@@ -608,7 +831,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       destroyed = true;
       for (const stop of unlisten) stop();
       await disconnect().catch(() => {});
-      await mic.destroy();
+      await Promise.allSettled([mic.destroy(), systemAudio.destroy()]);
       await transport.destroy().catch(() => {});
       await Promise.all([saveQueue, audioSyncQueue]);
     },

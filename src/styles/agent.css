@@ -56,3 +56,40 @@
 
 .request-permissions { max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 7px 0; padding: 10px; border: 1px solid var(--divider-color); border-radius: 7px; background: rgba(0,0,0,.15); font: 11px/1.5 "Cascadia Code", Consolas, monospace; }
 .request-link { display: block; color: #c4d9f5; overflow-wrap: anywhere; font-size: 12px; margin: 10px 0; text-underline-offset: 3px; }
+
+/* Live catalog and listening controls reuse the user's accent and solid theme. */
+.agent-field-note { min-height: 18px; margin: 0; color: var(--settings-muted); font-size: 11px; line-height: 18px; overflow-wrap: anywhere; }
+.agent-field-heading { display: flex; min-height: 18px; align-items: center; justify-content: space-between; gap: 8px; }
+.settings-dialog .agent-field-heading .source-refresh { width: 25px; height: 25px; min-width: 25px; padding: 4px; margin: -4px 0 -3px; }
+.settings-dialog .agent-field-heading .source-refresh svg { width: 17px; height: 17px; }
+.agent-field-grid .agent-field-heading + select { margin-top: 0; }
+.agent-field-grid .agent-field-note { min-height: 36px; max-height: 72px; overflow: auto; scrollbar-width: thin; }
+.agent-path-control { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.agent-path-control input { flex: 1; min-width: 0; }
+.agent-path-control .action-button { flex: none; white-space: nowrap; }
+.agent-workspace-state { display: grid; gap: 9px; margin: -4px 0 22px; min-width: 0; }
+.agent-workspace-state > .action-button { justify-self: start; }
+.agent-workspace-current { display: grid; gap: 4px; min-width: 0; margin: 0; color: var(--settings-muted); font-size: 10px; }
+.agent-workspace-current code { max-width: 100%; padding: 7px 9px; overflow-wrap: anywhere; border: 1px solid var(--settings-soft-line); border-radius: 6px; background: var(--settings-nav); color: var(--settings-text); font: 10px/16px "Cascadia Code", Consolas, monospace; }
+.agent-catalog-status { margin: -4px 0 18px; }
+.settings-dialog .agent-inline-error { color: #e6a293; }
+.agent-scenario-card { margin: 0 0 20px; padding: 14px 15px; border: 1px solid var(--settings-line); border-radius: 9px; background: var(--settings-nav); }
+.agent-listening-heading { display: flex; align-items: center; gap: 9px; min-height: 24px; font-size: 12px; }
+.agent-listening-heading strong { font-weight: 500; }
+.agent-listening-dot { flex: 0 0 6px; height: 6px; border-radius: 50%; background: var(--settings-faint); }
+.agent-scenario-card[data-stage="listening"] .agent-listening-dot,
+.agent-scenario-card[data-stage="deciding"] .agent-listening-dot,
+.agent-scenario-card[data-stage="evaluating"] .agent-listening-dot,
+.agent-scenario-card[data-stage="helping"] .agent-listening-dot,
+.agent-scenario-card[data-stage="responding"] .agent-listening-dot { background: var(--settings-accent-text); }
+.agent-scenario-card .agent-field-note { min-height: 36px; margin-top: 5px; }
+.agent-source-attribution { min-height: 17px; margin: 2px 0 10px; color: var(--settings-muted); font-size: 10px; line-height: 17px; }
+.system-audio-card .mic-waveform { height: 42px; }
+#system-audio-monitor[data-clipped="true"] #system-audio-level-label { color: #e3ac9d; }
+@media (max-width: 460px) {
+  .agent-path-control { align-items: stretch; flex-direction: column; }
+  .agent-path-control .action-button { align-self: flex-start; }
+  .agent-scenario-card { padding: 12px; }
+}
+
+.agent-scenario-card #interview-speaker-status { min-height: 18px; margin: -6px 0 12px; font-size: 10px; }

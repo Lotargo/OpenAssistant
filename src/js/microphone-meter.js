@@ -84,20 +84,22 @@ function createAudioDisplay(render, document) {
   };
 }
 
-export function createMicrophoneMeter(host) {
-  const meter = host.querySelector('#mic-level');
-  const fill = host.querySelector('#mic-level-fill');
-  const value = host.querySelector('#mic-level-value');
-  const label = host.querySelector('#mic-level-label');
-  const wave = host.querySelector('#mic-wave-path');
-  const panel = host.querySelector('#mic-monitor');
+export function createMicrophoneMeter(host, { prefix = 'mic', idleLabel = 'Микрофон выключен' } = {}) {
+  const find = suffix => host.querySelector('#' + prefix + '-' + suffix);
+  const meter = find('level');
+  const fill = find('level-fill');
+  const value = find('level-value');
+  const label = find('level-label');
+  const wave = find('wave-path');
+  const panel = find('monitor');
   return createAudioDisplay(view => {
     if (!meter) return;
+    const labelText = !view.active && !view.stale ? idleLabel : view.label;
     meter.setAttribute('aria-valuenow', String(view.db));
-    meter.setAttribute('aria-valuetext', view.value + '. ' + view.label);
+    meter.setAttribute('aria-valuetext', view.value + '. ' + labelText);
     fill.style.transform = 'scaleX(' + (view.percent / 100).toFixed(3) + ')';
     value.textContent = view.value;
-    label.textContent = view.label;
+    label.textContent = labelText;
     wave.setAttribute('d', view.path);
     panel.dataset.active = String(view.active);
     panel.dataset.clipped = String(view.clipped);
@@ -121,25 +123,32 @@ export function createMicrophoneIndicator(button) {
 }
 
 
-/** Two decorative views of the same real capture, outside the toolbar controls.
- * They share one stale-frame timer and never create audio or an animation loop.
+/** Normal mode mirrors the mic; interview mode keeps mic left, meeting right.
+ * Displays consume existing frames only and have bounded stale-frame timers.
  */
 export function createToolbarAudioIndicator(toolbar) {
-  const sides = [...toolbar.querySelectorAll('[data-toolbar-audio]')].map(panel => ({
-    panel, wave: panel.querySelector('.toolbar-audio-wave'), level: panel.querySelector('.toolbar-audio-level'),
-  }));
-  return createAudioDisplay(view => {
-    const signal = view.active && view.percent > 0;
-    const strength = signal ? view.percent / 100 : 0;
-    const path = signal ? view.path : 'M0 32H480';
-    for (const { panel, wave, level } of sides) {
+  const sides = [...toolbar.querySelectorAll('[data-toolbar-audio]')].map(panel => {
+    const wave = panel.querySelector('.toolbar-audio-wave');
+    const level = panel.querySelector('.toolbar-audio-level');
+    return createAudioDisplay(view => {
+      const signal = view.active && view.percent > 0;
+      const strength = signal ? view.percent / 100 : 0;
       panel.dataset.active = String(signal);
       panel.dataset.clipped = String(signal && view.clipped);
       panel.style.opacity = signal ? (0.25 + 0.45 * Math.sqrt(strength)).toFixed(3) : '0';
-      wave.setAttribute('d', path);
-      // Reduced-motion mode shows a quiet level segment instead of oscillations.
+      wave.setAttribute('d', signal ? view.path : 'M0 32H480');
       level.setAttribute('x1', (240 - strength * 228).toFixed(1));
       level.setAttribute('x2', (240 + strength * 228).toFixed(1));
-    }
-  }, toolbar.ownerDocument);
+    }, toolbar.ownerDocument);
+  });
+  return {
+    update(levels, runtime = {}) {
+      sides[0]?.update(levels, runtime);
+      const separate = runtime.systemAudioActive || ['starting', 'listening', 'evaluating', 'helping'].includes(runtime.interviewState?.stage);
+      sides[1]?.update(separate ? runtime.systemAudioLevels : levels, separate
+        ? { microphoneMuted: !runtime.systemAudioActive } : runtime);
+    },
+    setVisible(visible) { for (const side of sides) side.setVisible(visible); },
+    destroy() { for (const side of sides) side.destroy(); },
+  };
 }

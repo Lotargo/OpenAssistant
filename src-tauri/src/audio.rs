@@ -2,14 +2,16 @@
 //! Capture callbacks only convert/channel audio. DSP, IPC and device checks run on the worker.
 mod devices;
 mod levels;
+mod loopback;
 mod processing;
-pub use devices::{input_state, InputState};
+pub use devices::{input_state, system_state, InputState};
 pub use levels::AudioLevels;
 
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
 };
+use loopback::LoopbackClock;
 use processing::{Captured, Processor};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,6 +31,32 @@ const REPLACED: u8 = 3;
 const TEST_LIMIT: Duration = Duration::from_secs(20);
 const PACKET_SAMPLES: usize = 2400;
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Separate states own separate endpoints; system capture never replaces a microphone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CaptureSource {
+    #[default]
+    Microphone,
+    System,
+}
+impl CaptureSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Microphone => "Микрофон",
+            Self::System => "Системный звук",
+        }
+    }
+    fn thread_prefix(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone",
+            Self::System => "system-audio",
+        }
+    }
+    fn stalled(self, elapsed: Duration) -> bool {
+        // WASAPI loopback may produce no packets while the render endpoint is idle.
+        self == Self::Microphone && elapsed > Duration::from_secs(5)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +97,22 @@ pub enum AudioEvent {
     },
 }
 
+/// Keep the existing capture DTO while explicitly attributing the output mix.
+#[derive(Clone, Debug, Serialize)]
+pub struct SystemAudioEvent {
+    source: &'static str,
+    #[serde(flatten)]
+    event: AudioEvent,
+}
+impl From<AudioEvent> for SystemAudioEvent {
+    fn from(event: AudioEvent) -> Self {
+        Self {
+            source: "system",
+            event,
+        }
+    }
+}
+
 type Callback = Arc<dyn Fn(AudioEvent) -> bool + Send + Sync>;
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|p| p.into_inner())
@@ -103,7 +147,7 @@ impl Worker {
         match lock(&self.thread).take() {
             Some(thread) => thread
                 .join()
-                .map_err(|_| "Рабочий поток микрофона завершился с ошибкой.".into()),
+                .map_err(|_| "Рабочий аудиопоток завершился с ошибкой.".into()),
             None => Ok(()),
         }
     }
@@ -158,6 +202,26 @@ impl StartTicket {
 #[derive(Clone, Default)]
 pub struct AudioState {
     inner: Arc<Inner>,
+    source: CaptureSource,
+}
+
+/// Independent lifecycle for Windows render-endpoint loopback. Main-view retirement
+/// and app shutdown must invalidate and join both this state and AudioState.
+#[derive(Clone)]
+pub struct SystemAudioState(AudioState);
+impl Default for SystemAudioState {
+    fn default() -> Self {
+        Self(AudioState {
+            inner: Arc::new(Inner::default()),
+            source: CaptureSource::System,
+        })
+    }
+}
+impl std::ops::Deref for SystemAudioState {
+    type Target = AudioState;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl AudioState {
@@ -193,15 +257,15 @@ impl AudioState {
             .as_ref()
             .is_some_and(|id| id.is_empty() || id.len() > 4096)
         {
-            return Err("Некорректный идентификатор микрофона.".into());
+            return Err("Некорректный идентификатор аудиоустройства.".into());
         }
         if !ticket.valid(&self.inner, config.mode) {
-            return Err("Запуск микрофона отменён.".into());
+            return Err("Запуск захвата звука отменён.".into());
         }
         let mode = config.mode;
         let _operation = lock(&self.inner.operation);
         if !ticket.valid(&self.inner, mode) {
-            return Err("Запуск микрофона отменён.".into());
+            return Err("Запуск захвата звука отменён.".into());
         }
         self.reap_finished();
         {
@@ -212,7 +276,7 @@ impl AudioState {
                 })
             {
                 return Err(
-                    "Сначала выключи голосовой ввод, затем запусти проверку микрофона.".into(),
+                    "Сначала останови текущий захват звука, затем запусти проверку.".into(),
                 );
             }
         }
@@ -225,21 +289,23 @@ impl AudioState {
         let state = Arc::downgrade(&self.inner);
         let callback: Callback = Arc::new(callback);
         let mode = config.mode;
+        let source = self.source;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
-            .name(format!("microphone-{id}"))
+            .name(format!("{}-{id}", source.thread_prefix()))
             .spawn(move || {
                 capture(
                     id,
                     ticket,
                     state,
                     config,
+                    source,
                     worker_control,
                     callback,
                     ready_tx,
                 );
             })
-            .map_err(|e| format!("Не удалось создать поток микрофона: {e}"))?;
+            .map_err(|e| format!("Не удалось создать аудиопоток: {e}"))?;
         let candidate = Arc::new(Worker {
             id,
             mode,
@@ -251,14 +317,14 @@ impl AudioState {
             if !ticket.valid(&self.inner, mode) {
                 candidate.control.stop(DISCARD);
                 slots.retired.push(candidate);
-                return Err("Запуск микрофона отменён.".into());
+                return Err("Запуск захвата звука отменён.".into());
             }
             slots.starting = Some(candidate.clone());
         }
         let prepared = ready_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| {
-                "Микрофон не ответил за 5 секунд. Проверь устройство и доступ Windows.".to_owned()
+                "Аудиоустройство не ответило за 5 секунд. Проверь выбранный источник и доступ Windows.".to_owned()
             })
             .and_then(|value| value);
         if let Err(error) = prepared {
@@ -276,7 +342,7 @@ impl AudioState {
                 drop(slots);
                 self.retire(&candidate, DISCARD);
                 candidate.join()?;
-                return Err("Запуск микрофона отменён.".into());
+                return Err("Запуск захвата звука отменён.".into());
             }
             slots.current.take()
         };
@@ -293,7 +359,7 @@ impl AudioState {
                 drop(slots);
                 self.retire(&candidate, DISCARD);
                 candidate.join()?;
-                return Err("Запуск микрофона отменён.".into());
+                return Err("Запуск захвата звука отменён.".into());
             }
             if slots.starting.as_ref().is_some_and(|w| w.id == id) {
                 slots.starting = None;
@@ -315,7 +381,7 @@ impl AudioState {
                     && worker.control.live.load(Ordering::Acquire)
                     && worker.control.stop.load(Ordering::Acquire) == 0
             })
-            .ok_or_else(|| "Этот захват микрофона уже завершён.".to_owned())?;
+            .ok_or_else(|| "Этот захват звука уже завершён.".to_owned())?;
         worker
             .control
             .noise_suppression
@@ -415,14 +481,19 @@ impl AudioState {
 fn terminal_stream_error(cause: &cpal::Error) -> Option<String> {
     match cause.kind() {
         cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied => None,
-        _ => Some(format!("Ошибка аудиопотока микрофона: {cause} ({cause:?})")),
+        _ => Some(format!("Ошибка аудиопотока: {cause} ({cause:?})")),
     }
+}
+
+struct TimedCaptured {
+    audio: Captured,
+    at: Instant,
 }
 
 fn make_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    sender: SyncSender<Captured>,
+    sender: SyncSender<TimedCaptured>,
     overflow: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     control: Arc<Control>,
@@ -432,10 +503,17 @@ where
     f32: FromSample<T>,
 {
     let channels = config.channels as usize;
-    let chunk_samples = (config.sample_rate as usize / 50).max(1) * channels;
-    device.build_input_stream(*config,move|samples:&[T],_|{
+    let rate = config.sample_rate;
+    let chunk_samples = (rate as usize / 50).max(1) * channels;
+    device.build_input_stream(*config,move|samples:&[T],info|{
         if control.stop.load(Ordering::Acquire)!=0 || !control.activate.load(Ordering::Acquire) {return;}
-        for chunk in samples.chunks(chunk_samples) {
+        let now = Instant::now();
+        let timestamp = info.timestamp();
+        let age = timestamp.callback.duration_since(timestamp.capture);
+        let first = now.checked_sub(age).unwrap_or(now);
+        for (index, chunk) in samples.chunks(chunk_samples).enumerate() {
+            let offset = Duration::from_secs_f64((index * chunk_samples / channels) as f64 / rate as f64);
+            let at = first.checked_add(offset).unwrap_or(first);
             let mut mono=Vec::with_capacity(chunk.len()/channels);
             let mut peak=0.0_f32;
             let mut clipped=0;
@@ -451,7 +529,7 @@ where
                 mono.push((sum/channels as f32).clamp(-1.0,1.0));
             }
             if !mono.is_empty() {
-                match sender.try_send(Captured{mono,peak:peak.min(1.0),clipped,samples:chunk.len()}) {
+                match sender.try_send(TimedCaptured{audio:Captured{mono,peak:peak.min(1.0),clipped,samples:chunk.len()},at}) {
                     Err(TrySendError::Full(_))=>{overflow.store(true,Ordering::Release);return;}
                     Err(TrySendError::Disconnected(_))=>return,
                     Ok(())=>{}
@@ -463,7 +541,7 @@ where
             // Preserve the first terminal cause; later advisory callbacks cannot erase it.
             lock(&error).get_or_insert(message);
         }
-    },None).map_err(|error|format!("Не удалось открыть микрофон. Проверь разрешение Windows для классических приложений и занятость устройства. {error}"))
+    },None).map_err(|error|format!("Не удалось открыть аудиоустройство. Проверь выбранный источник, доступ Windows и занятость устройства. {error}"))
 }
 
 struct Packetizer {
@@ -520,11 +598,89 @@ fn emit_captured(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_silence(
+    frames: usize,
+    rate: u32,
+    processor: &mut Processor,
+    packets: &mut Packetizer,
+    mode: CaptureMode,
+    id: u64,
+    send: &impl Fn(AudioEvent) -> bool,
+) -> bool {
+    let mut remaining = frames;
+    while remaining > 0 {
+        let count = remaining.min((rate as usize / 10).max(1));
+        if !emit_captured(
+            Captured {
+                mono: vec![0.0; count],
+                peak: 0.0,
+                clipped: 0,
+                samples: count,
+            },
+            processor,
+            packets,
+            mode,
+            id,
+            send,
+        ) {
+            return false;
+        }
+        remaining -= count;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_source(
+    captured: TimedCaptured,
+    loopback: &mut Option<LoopbackClock>,
+    origin: Instant,
+    rate: u32,
+    processor: &mut Processor,
+    packets: &mut Packetizer,
+    mode: CaptureMode,
+    id: u64,
+    send: &impl Fn(AudioEvent) -> bool,
+) -> bool {
+    let mut audio = captured.audio;
+    if let Some(clock) = loopback {
+        let plan = clock.capture(
+            captured.at.saturating_duration_since(origin),
+            audio.mono.len(),
+        );
+        if !emit_silence(plan.silence, rate, processor, packets, mode, id, send) {
+            return false;
+        }
+        if plan.skip >= audio.mono.len() {
+            return true;
+        }
+        if plan.skip > 0 {
+            audio.mono.drain(..plan.skip);
+            // A trimmed packet no longer has valid per-channel aggregate peaks.
+            // Recompute conservative mono evidence from its actual remaining samples.
+            audio.peak = audio
+                .mono
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0, f32::max);
+            audio.clipped = audio
+                .mono
+                .iter()
+                .filter(|sample| sample.abs() >= 0.985)
+                .count();
+            audio.samples = audio.mono.len();
+        }
+    }
+    emit_captured(audio, processor, packets, mode, id, send)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn capture(
     id: u64,
     ticket: StartTicket,
     state: Weak<Inner>,
     config: AudioConfig,
+    source: CaptureSource,
     control: Arc<Control>,
     callback: Callback,
     ready: SyncSender<Result<(), String>>,
@@ -550,27 +706,31 @@ fn capture(
     };
     let prepared = (|| {
         if !is_current() {
-            return Err("Запуск микрофона отменён.".into());
+            return Err("Запуск захвата звука отменён.".into());
         }
-        let device = devices::resolve(config.device_id.as_deref())?;
+        let device = devices::resolve(source, config.device_id.as_deref())?;
         let device_id = device
             .id()
-            .map_err(|e| format!("Идентификатор микрофона: {e}"))?
+            .map_err(|e| format!("Идентификатор аудиоустройства: {e}"))?
             .to_string();
         let device_name = device
             .description()
             .map(|d| d.name().to_owned())
-            .unwrap_or_else(|_| "Микрофон".into());
-        let supported = device
-            .default_input_config()
-            .map_err(|e| format!("Формат микрофона: {e}"))?;
+            .unwrap_or_else(|_| source.label().into());
+        // CPAL's WASAPI backend enables AUDCLNT_STREAMFLAGS_LOOPBACK when an
+        // input stream is built on a render endpoint; its format is output config.
+        let supported = match source {
+            CaptureSource::Microphone => device.default_input_config(),
+            CaptureSource::System => device.default_output_config(),
+        }
+        .map_err(|e| format!("Формат аудиоустройства ({}): {e}", source.label()))?;
         let format = supported.sample_format();
         let stream_config: StreamConfig = supported.into();
         if stream_config.channels == 0 || stream_config.sample_rate == 0 {
-            return Err("Некорректный формат микрофона.".into());
+            return Err("Некорректный формат аудиоустройства.".into());
         }
         if control.stop.load(Ordering::Acquire) != 0 || !is_current() {
-            return Err("Запуск микрофона отменён.".into());
+            return Err("Запуск захвата звука отменён.".into());
         }
         let (sender, receiver) = mpsc::sync_channel(16);
         let overflow = Arc::new(AtomicBool::new(false));
@@ -598,16 +758,16 @@ fn capture(
             SampleFormat::U32 => stream!(u32),
             _ => {
                 return Err(format!(
-                    "Формат микрофона {format:?} пока не поддерживается."
+                    "Формат аудиоустройства {format:?} пока не поддерживается."
                 ))
             }
         };
         if control.stop.load(Ordering::Acquire) != 0 || !is_current() {
-            return Err("Запуск микрофона отменён.".into());
+            return Err("Запуск захвата звука отменён.".into());
         }
         stream
             .play()
-            .map_err(|e| format!("Не удалось запустить микрофон: {e}"))?;
+            .map_err(|e| format!("Не удалось запустить захват звука: {e}"))?;
         control.live.store(true, Ordering::Release);
         Ok((
             stream,
@@ -653,6 +813,7 @@ fn capture(
             })
     };
     let start = Instant::now();
+    let mut loopback = (source == CaptureSource::System).then(|| LoopbackClock::new(rate));
     let mut last_audio = Instant::now();
     let mut last_device_check = Instant::now();
     let mut failure = None;
@@ -685,18 +846,19 @@ fn capture(
             break "device_lost";
         }
         if overflow.load(Ordering::Acquire) {
-            failure=Some("Обработка звука не успевает за микрофоном. Захват остановлен, чтобы не отправлять устаревшую речь.".into());
+            failure=Some("Обработка не успевает за аудиопотоком. Захват остановлен, чтобы не отправлять устаревшую речь.".into());
             break "overflow";
         }
         if last_device_check.elapsed() >= Duration::from_secs(1) {
             last_device_check = Instant::now();
-            if !devices::connected(&device_id) {
-                failure =
-                    Some("Выбранный микрофон отключён. Подключи его или выбери другой.".into());
+            if !devices::connected(source, &device_id) {
+                failure = Some(
+                    "Выбранное аудиоустройство отключено. Подключи его или выбери другое.".into(),
+                );
                 break "device_lost";
             }
         }
-        if last_audio.elapsed() > Duration::from_secs(5) {
+        if source.stalled(last_audio.elapsed()) {
             failure = Some(
                 "Микрофон не передаёт аудиоданные. Проверь устройство и разрешение Windows.".into(),
             );
@@ -713,8 +875,11 @@ fn capture(
                     control.stop(DISCARD);
                     break "receiver_closed";
                 }
-                if !emit_captured(
+                if !emit_source(
                     captured,
+                    &mut loopback,
+                    start,
+                    rate,
                     &mut processor,
                     &mut packets,
                     config.mode,
@@ -728,7 +893,23 @@ fn capture(
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 break "device_lost";
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(clock) = &mut loopback {
+                    let silence = clock.idle(start.elapsed());
+                    if !emit_silence(
+                        silence,
+                        rate,
+                        &mut processor,
+                        &mut packets,
+                        config.mode,
+                        id,
+                        &send,
+                    ) {
+                        control.stop(DISCARD);
+                        break "receiver_closed";
+                    }
+                }
+            }
         }
     };
     // Stop the hardware first, then flush accepted PCM before the stopped acknowledgement.
@@ -736,8 +917,11 @@ fn capture(
     control.live.store(false, Ordering::Release);
     if config.mode == CaptureMode::Stream && matches!(reason, "stopped" | "replaced") {
         while let Ok(captured) = receiver.try_recv() {
-            if !emit_captured(
+            if !emit_source(
                 captured,
+                &mut loopback,
+                start,
+                rate,
                 &mut processor,
                 &mut packets,
                 config.mode,

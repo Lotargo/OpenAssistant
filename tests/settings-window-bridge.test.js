@@ -333,3 +333,36 @@ test('settings activity is scoped to its own native event and a late initial que
   await turn();
   assert.deepEqual(activity, [false, true], 'disposing the secondary view removes the native listener');
 });
+
+
+test('microphone and system frames keep independent ordering through delayed snapshots', async t => {
+  const owner = await ownerFixture();
+  await owner.host.open('sources');
+  const frames = [];
+  const proxy = await owner.proxy({ onAudioLevels: value => frames.push(value) });
+  cleanup(t, owner, proxy);
+  owner.bus.hold(packet => packet.event === 'settings:audio' || packet.event === 'settings:snapshot');
+  const microphone = { active: true, at: 1000, rawRms: .1 };
+  const system = { source: 'system', active: true, at: 1000, rawRms: .2 };
+  owner.state().microphoneLevels = microphone;
+  owner.host.updateAudioLevels(microphone);
+  owner.publish({ agentDetail: 'Snapshot between source frames' });
+  owner.state().systemAudioLevels = system;
+  owner.host.updateAudioLevels(system);
+  await until(() => owner.bus.held.length === 3);
+  owner.bus.hold(() => false);
+  const [micPacket, snapshot, systemPacket] = owner.bus.held.splice(0);
+  owner.bus.deliver(systemPacket);
+  owner.bus.deliver(micPacket); // Lower global sequence, but a newer microphone frame.
+  await until(() => frames.length === 2);
+  assert.deepEqual(proxy.getRuntimeState().microphoneLevels, microphone);
+  assert.deepEqual(proxy.getRuntimeState().systemAudioLevels, system);
+  owner.bus.deliver(snapshot);
+  await until(() => proxy.getRuntimeState().agentDetail === 'Snapshot between source frames');
+  assert.deepEqual(proxy.getRuntimeState().microphoneLevels, microphone);
+  assert.deepEqual(proxy.getRuntimeState().systemAudioLevels, system);
+  owner.bus.deliver(systemPacket);
+  owner.bus.deliver(micPacket);
+  await turn();
+  assert.equal(frames.length, 2);
+});
