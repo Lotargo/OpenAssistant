@@ -72,10 +72,11 @@ for (const change of ['stop-connect', 'mode-stop', 'instructions']) {
       await expect.poll(() => page.evaluate(() => window.__nativeContract.broadcastStarts.length)).toBe(1);
       await expect(settings.locator('#agent-realtime-status')).toContainText('подключается');
       if (change === 'mode-stop') {
-        // Changing source semantics ends the pending old broadcast; it must not
-        // automatically create a microphone-plus-system broadcast.
+        // Changing source semantics schedules a fresh broadcast. Explicit Stop
+        // must cancel that intent before either the old or new voice becomes ready.
         await settings.locator('#agent-custom-behavior').selectOption('selective');
         await expect.poll(() => page.evaluate(() => window.__nativeContract.agentSaves.at(-1)?.custom_behavior)).toBe('selective');
+        await settings.locator('#interview-stop').click();
       } else {
         await settings.locator('#agent-custom-instructions').fill('Новое правило после готовности текстового агента.');
         await settings.locator('#agent-custom-name').focus();

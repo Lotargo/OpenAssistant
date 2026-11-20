@@ -1,4 +1,5 @@
 import { getBackgroundDragRects, getScrollbarRects } from './window-interaction.js';
+import { createOverlayGrowth } from './output-motion.js';
 
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 
@@ -24,7 +25,7 @@ function visibleRect(element) {
 export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }) {
   let stopped = false;
   let windowActive = true;
-  let timer;
+  let timer = null;
   let rectFrame;
   let lastSize = '';
   let lastRects = '';
@@ -33,6 +34,7 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
   let resizing = false;
   let resizeAgain = false;
   const byId = id => document.getElementById(id);
+  const outputGrowth = createOverlayGrowth(overlay);
 
   async function syncRects() {
     if (stopped || !windowActive || !bridge.native || document.hidden || window.innerWidth <= 0 || window.innerHeight <= 0) return;
@@ -105,10 +107,13 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
       const signature = `${size.width}:${size.height}`;
       if (signature !== lastSize) {
         resizing = true;
+        const finishGrowth = outputGrowth.prepare(size.height, split ? 'code' : 'text');
         try {
           await bridge.resize(size.width, size.height);
           lastSize = signature;
+          finishGrowth();
         } catch (error) {
+          finishGrowth(false);
           bridge.reportError(error);
         } finally {
           resizing = false;
@@ -120,9 +125,17 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
   }
 
   function schedule() {
-    clearTimeout(timer);
-    if (stopped || !windowActive || document.hidden) return;
-    timer = setTimeout(() => void resize(), 90);
+    if (stopped || !windowActive || document.hidden) {
+      clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    // Throttle rather than debounce: a continuous 70ms stream must still grow
+    // before it ends, with the latest natural content height at each resize.
+    if (timer === null) timer = setTimeout(() => {
+      timer = null;
+      void resize();
+    }, 90);
     requestRects();
   }
 
@@ -153,12 +166,14 @@ export function createGeometrySync({ bridge, overlay, getSettings, isModalOpen }
     schedule,
     setActive(active) {
       windowActive = active !== false;
+      if (!windowActive) outputGrowth.cancel();
       refreshViewport();
     },
     destroy() {
       stopped = true;
       rectEpoch++;
       observer.disconnect();
+      outputGrowth.destroy();
       clearTimeout(timer);
       cancelAnimationFrame(rectFrame);
       for (const panel of scrollSources) panel.removeEventListener('scroll', requestRects);

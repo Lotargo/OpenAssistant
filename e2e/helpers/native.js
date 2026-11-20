@@ -5,9 +5,16 @@ const nativeWindows = new WeakMap();
 async function routeWindowEvent(record, { target, event, payload }) {
   // Tauri emit_to visits every WebView: Any listeners also receive sibling
   // window events. The registered listener target, not its owner, filters them.
-  await Promise.all([record.main, record.settings, record.notification].filter(view => view && !view.isClosed()).map(view =>
-    view.evaluate(packet => window.__receiveNativeEvent?.(packet.event, packet.payload, packet.target),
-      { target, event, payload })));
+  await Promise.all([record.main, record.settings, record.notification].filter(view => view && !view.isClosed()).map(async view => {
+    try {
+      await view.evaluate(packet => window.__receiveNativeEvent?.(packet.event, packet.payload, packet.target),
+        { target, event, payload });
+    } catch (error) {
+      // A native event has no recipient in a destroyed/navigating JS context;
+      // a sibling notification boot must not reject a settings-close command.
+      if (!view.isClosed() && !String(error.message).includes('Execution context was destroyed')) throw error;
+    }
+  }));
 
 }
 
@@ -234,6 +241,7 @@ export async function openNative(page, options = {}) {
     const sessions = new Map();
     const tasks = new Map();
     const captures = new Map();
+    const heldSessionCloses = new Set();
     let notification = null;
     let notificationWanted = false;
     let notificationVisible = false;
@@ -247,7 +255,7 @@ export async function openNative(page, options = {}) {
     }
     function closeIdleSession(sessionId) {
       const session = sessions.get(sessionId);
-      if (!session?.active || session.broadcast?.stage !== 'ended'
+      if (!session?.active || heldSessionCloses.has(sessionId) || session.broadcast?.stage !== 'ended'
         || [...tasks.values()].some(task => task.sessionId === sessionId && task.status === 'running')) return;
       session.active = false;
       if (workspaceState?.path === session.workspace) {
@@ -271,6 +279,9 @@ export async function openNative(page, options = {}) {
       queueWorkspaceChoice(path) { workspaceChoices.push(path); },
       getWorkspaceState() { return structuredClone(workspaceState); },
       getState() { return { ...state }; },
+      // A completed Codex task is not proof that its native session has closed.
+      holdSessionClose(sessionId) { heldSessionCloses.add(sessionId); },
+      releaseSessionClose(sessionId) { heldSessionCloses.delete(sessionId); closeIdleSession(sessionId); },
       invalidateAudioTest() {
         for (const capture of captures.values()) {
           if (capture.active && capture.mode === 'test') {

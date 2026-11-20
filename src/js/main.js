@@ -7,6 +7,7 @@ import { createSettingsModal } from './settings-modal.js';
 import { createSettingsWindowHost } from './settings-window-bridge.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
 import { setButtonIcon, setModeButtonIcon } from './icons.js';
+import { broadcastStatus } from './agent-settings-view.js';
 import { createMicrophoneIndicator, createToolbarAudioIndicator, selectToolbarAudio } from './microphone-meter.js';
 import { createGeometrySync } from './geometry.js';
 import { createWindowInteraction } from './window-interaction.js';
@@ -103,6 +104,7 @@ function observeBroadcast(state = {}) {
   if (stage === 'starting' && previousBroadcastStage !== 'starting') broadcastEpoch++;
   previousBroadcastStage = stage;
   if (stage !== 'ended') return;
+  if (runtime.modeTransition?.resumeBroadcast && state.reason !== 'error') return;
   const key = state.broadcast_id == null ? 'local:' + broadcastEpoch : String(state.broadcast_id);
   if (notifiedBroadcasts.has(key)) return;
   notifiedBroadcasts.add(key);
@@ -134,8 +136,9 @@ function renderControls(next = runtime) {
   const reconnect = document.querySelector('[data-action="reconnect"]');
   mic.setAttribute('aria-pressed', String(Boolean(runtime.microphoneMuted)));
   const broadcast = runtime.broadcastState || {};
-  const stage = broadcast.stage || 'idle';
-  const active = ['starting', 'live', 'stopping'].includes(stage);
+  const broadcastView = broadcastStatus(broadcast, runtime.modeTransition);
+  const stage = broadcastView.stage;
+  const active = broadcastView.active;
   mic.disabled = stage !== 'live' || Boolean(runtime.microphoneBusy);
   mic.setAttribute('aria-label', stage !== 'live' ? 'Микрофон доступен во время эфира'
     : runtime.microphoneMuted ? 'Включить микрофон в эфире' : 'Выключить микрофон в эфире');
@@ -151,7 +154,8 @@ function renderControls(next = runtime) {
   const modeButton = byId('mode-btn');
   modeButton.dataset.currentScenario = scenario;
   modeButton.setAttribute('aria-label', 'Режим: ' + modeLabels[scenario] + '. Переключить: ' + modeLabels[nextScenario]);
-  modeButton.disabled = modeChanging || stage === 'stopping';
+  modeButton.disabled = modeChanging || Boolean(runtime.modeTransition) || stage === 'stopping';
+  modeButton.setAttribute('aria-busy', String(modeChanging || Boolean(runtime.modeTransition)));
   setModeButtonIcon(modeButton, { assistant: 'mode-assistant', interview: 'mode-meeting', custom: 'mode-custom' }[scenario]);
   renderNotificationControl();
   observeBroadcast(broadcast);
@@ -168,8 +172,11 @@ function renderControls(next = runtime) {
   lock.setAttribute('aria-pressed', String(Boolean(runtime.scrollLocked)));
   lock.setAttribute('aria-label', runtime.scrollLocked ? 'Разблокировать прокрутку' : 'Заблокировать прокрутку');
   setButtonIcon(lock, runtime.scrollLocked ? 'lock' : 'unlock');
-  reconnect.dataset.state = runtime.connectionStatus || 'unavailable';
-  reconnect.disabled = ['starting', 'stopping'].includes(stage) || runtime.connectionStatus === 'connecting';
+  const preparing = Boolean(runtime.modeTransition) || stage === 'starting' || runtime.connectionStatus === 'connecting';
+  reconnect.dataset.state = preparing ? 'connecting' : runtime.connectionStatus || 'unavailable';
+  reconnect.setAttribute('aria-busy', String(preparing));
+  reconnect.setAttribute('aria-label', runtime.modeTransition?.detail || (preparing ? 'Подключение эфира и агента' : 'Переподключить сессию'));
+  reconnect.disabled = preparing || stage === 'stopping';
   const windowMode = runtime.windowMode === 'standard' ? 'standard' : 'overlay';
   const windowButton = byId('window-mode-btn');
   windowButton.setAttribute('aria-pressed', String(windowMode === 'standard'));
@@ -303,8 +310,9 @@ async function start() {
   }
 
   async function toggleBroadcast() {
-    const state = bridge.getRuntimeState().broadcastState || {};
-    const stop = ['starting', 'live', 'stopping'].includes(state.stage) || broadcastOperation?.kind === 'start';
+    const current = bridge.getRuntimeState();
+    const state = broadcastStatus(current.broadcastState, current.modeTransition);
+    const stop = state.active || broadcastOperation?.kind === 'start';
     const operation = { kind: stop ? 'stop' : 'start' };
     broadcastOperation = operation;
     renderControls(bridge.getRuntimeState());

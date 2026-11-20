@@ -112,3 +112,29 @@ test('destroy cancels pending writes', async () => {
   assert.equal(elements.textContent.textContent, '');
   dom.window.close();
 });
+
+test('stream append preserves an earlier paragraph, its text node and the reader selection', async () => {
+  const { dom, document, elements } = fixture();
+  const renderer = createRenderer(elements);
+  const first = 'Сохраняем выбранный фрагмент.';
+  renderer.update({ text: first + '\n\nНовый ответ', codeMeta: {} });
+  await renderer.flush();
+  const paragraph = elements.textContent.querySelector('p');
+  const textNode = paragraph.firstChild;
+  const range = document.createRange();
+  range.setStart(textNode, 10);
+  range.setEnd(textNode, 18);
+  const selection = dom.window.getSelection();
+  selection.addRange(range);
+  const selected = selection.toString();
+  for (const ending of [' продолжается', ' продолжается **постепенно**.']) {
+    renderer.update({ text: first + '\n\nНовый ответ' + ending, codeMeta: {} });
+    await renderer.flush();
+    assert.equal(elements.textContent.firstElementChild, paragraph);
+    assert.equal(paragraph.firstChild, textNode);
+    assert.equal(selection.toString(), selected);
+  }
+  assert.equal(elements.textContent.querySelector('strong').textContent, 'постепенно');
+  renderer.destroy();
+  dom.window.close();
+});

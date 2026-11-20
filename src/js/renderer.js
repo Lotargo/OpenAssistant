@@ -1,5 +1,6 @@
 import { marked } from 'marked';
 import createDOMPurify from 'dompurify';
+import { createOutputReveal } from './output-motion.js';
 
 const LANGUAGE_LOADERS = {
   sql: () => import('@shikijs/langs/sql'),
@@ -70,6 +71,42 @@ export function createMarkdownRenderer(document) {
   };
 }
 
+// Incoming nodes have already passed the Markdown sanitizer. Keep unchanged
+// blocks and text nodes in place so streaming does not reset selection or links.
+function reconcileMarkdown(parent, incoming) {
+  let current = parent.firstChild;
+  for (const next of [...incoming.childNodes]) {
+    if (!current) { parent.append(next); continue; }
+    let retained = current;
+    if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+      parent.replaceChild(next, current);
+      retained = next;
+    } else if (!current.isEqualNode(next)) {
+      if (current.nodeType === 3) {
+        if (next.data.startsWith(current.data)) current.appendData(next.data.slice(current.data.length));
+        else current.data = next.data;
+      } else if (current.nodeType === 1) {
+        for (const { name } of [...current.attributes]) {
+          if (!next.hasAttribute(name)) current.removeAttribute(name);
+        }
+        for (const { name, value } of [...next.attributes]) {
+          if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+        }
+        reconcileMarkdown(current, next);
+      } else {
+        parent.replaceChild(next, current);
+        retained = next;
+      }
+    }
+    current = retained.nextSibling;
+  }
+  while (current) {
+    const next = current.nextSibling;
+    current.remove();
+    current = next;
+  }
+}
+
 function scrollContainer(element) {
   return element.closest('[data-scroll-panel]') || element.parentElement || element;
 }
@@ -115,7 +152,7 @@ function codeFragment(document, source, tokens) {
 }
 
 /**
- * Batches stream updates and only replaces changed panels. Async highlighting
+ * Batches stream updates and reconciles changed Markdown. Async highlighting
  * never overwrites a newer response, and each pane retains its own scroll.
  */
 export function createRenderer({ textContent, codeContent, notesContent, codeFilename, onRender, getAutoScroll = () => true } = {}) {
@@ -125,6 +162,7 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
   const document = textContent.ownerDocument;
   const window = document.defaultView;
   const renderMarkdown = createMarkdownRenderer(document);
+  const outputReveal = createOutputReveal(textContent);
   let latest = null;
   let revision = 0;
   let renderedRevision = 0;
@@ -149,8 +187,11 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
     for (const [key, element] of [['text', textContent], ['notes', notesContent]]) {
       const value = current[key] || '';
       if (value !== previous[key]) {
-        preserveScroll(element, () => element.replaceChildren(renderMarkdown(value)), autoScroll);
+        const firstText = key === 'text' && !previous.text?.trim() && Boolean(value.trim());
+        if (key === 'text' && !value.trim()) outputReveal.cancel();
+        preserveScroll(element, () => reconcileMarkdown(element, renderMarkdown(value)), autoScroll);
         previous[key] = value;
+        if (firstText) outputReveal.start();
       }
     }
     const blocksFor = value => value.codeBlocks?.length ? value.codeBlocks : [{
@@ -229,6 +270,7 @@ export function createRenderer({ textContent, codeContent, notesContent, codeFil
   function destroy() {
     destroyed = true;
     cancelScheduled();
+    outputReveal.destroy();
     latest = null;
   }
 

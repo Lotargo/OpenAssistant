@@ -87,15 +87,18 @@ test('native stream start rejected after Stop cannot reopen a capture or leak an
   expect(errors).toEqual([]);
 });
 
-test('mode switch stops the old broadcast and stale end events cannot close a fresh broadcast', async ({ page }) => {
+test('live mode switch resumes once with the new configuration and stale end events cannot close it', async ({ page }) => {
   await openNative(page);
   const old = await startBroadcast(page);
   await setScenario(page, 'interview');
-  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
-  expect(await page.evaluate(() => ({ starts: window.__nativeContract.broadcastStarts.length, active: window.__nativeContract.lastCapture().active })))
-    .toEqual({ starts: 1, active: false });
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.broadcastStarts.length)).toBe(2);
+  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'live');
+  await expect(page.locator('#mode-btn')).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture('system')?.active)).toBe(true);
   await expect.poll(() => page.evaluate(() => window.__nativeContract.agentSaves.at(-1)?.scenario)).toBe('interview');
-  const current = await startBroadcast(page);
+  const current = await page.evaluate(() => window.__nativeContract.lastBroadcast());
+  expect(await page.evaluate(() => window.__nativeContract.calls.filter(call => call.name === 'assistant_connect').at(-1).args.config))
+    .toMatchObject({ scenario: 'interview', realtime: true });
   expect(current.sessionId).not.toBe(old.sessionId);
   expect(current.id).not.toBe(old.id);
   await emitSession(page, old.sessionId, { type: 'broadcast_state', stage: 'ended', broadcast_id: old.id, reason: 'silence' });
@@ -108,6 +111,17 @@ test('mode switch stops the old broadcast and stale end events cannot close a fr
     system: window.__nativeContract.lastCapture('system').active,
     closes: window.__nativeContract.voiceCloses.length,
   }))).toMatchObject({ broadcast: { id: current.id, stage: 'live', voiceOpen: true }, microphone: true, system: true, closes: 1 });
+  // The default custom policy is dialogue: returning to one source must retire loopback.
+  await setScenario(page, 'custom');
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.broadcastStarts.length)).toBe(3);
+  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'live');
+  await expect(page.locator('#mode-btn')).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture()?.active)).toBe(true);
+  expect(await page.evaluate(() => ({
+    source: window.__nativeContract.voiceOpens.at(-1).sources,
+    system: window.__nativeContract.lastCapture('system').active,
+    closes: window.__nativeContract.voiceCloses.length,
+  }))).toEqual({ source: ['microphone'], system: false, closes: 2 });
 });
 
 for (const reason of ['silence', 'agent']) {
@@ -219,7 +233,7 @@ test('failed broadcast Stop preserves running text work and retires the session 
   expect(errors).toEqual([]);
 });
 
-test('mode change awaiting Stop preserves a concurrent configuration edit and never auto-starts', async ({ page }) => {
+test('mode change awaiting Stop preserves a concurrent configuration edit in the resumed broadcast', async ({ page }) => {
   await openNative(page);
   await startBroadcast(page);
   const settings = await openSettingsTab(page, 'agent');
@@ -234,9 +248,12 @@ test('mode change awaiting Stop preserves a concurrent configuration edit and ne
   await expect(page.locator('#mode-btn')).toHaveAttribute('data-current-scenario', 'interview');
   await expect(settings.locator('#agent-web-search')).toHaveAttribute('aria-pressed', 'false');
   await expect.poll(() => page.evaluate(() => window.__nativeContract.agentSaves.at(-1))).toMatchObject({ scenario: 'interview', web_search: false });
-  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'ended');
-  expect(await page.evaluate(() => ({ starts: window.__nativeContract.broadcastStarts.length, capture: window.__nativeContract.lastCapture().active })))
-    .toEqual({ starts: 1, capture: false });
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.broadcastStarts.length)).toBe(2);
+  await expect(page.locator('#broadcast-btn')).toHaveAttribute('data-stage', 'live');
+  await expect(page.locator('#mode-btn')).toBeEnabled();
+  expect(await page.evaluate(() => window.__nativeContract.calls.filter(call => call.name === 'assistant_connect').at(-1).args.config))
+    .toMatchObject({ scenario: 'interview', web_search: false });
+  await expect.poll(() => page.evaluate(() => window.__nativeContract.lastCapture().active)).toBe(true);
 });
 
 test('session close without a terminal task event releases busy guards and preserves partial output', async ({ page }) => {

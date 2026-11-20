@@ -372,8 +372,8 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     fillOptions(byId('agent-silence-timeout'), timeoutOptions, String(timeout));
     byId('agent-custom-fields').hidden = !mode.custom;
     byId('mode-description').textContent = mode.description;
-    byId('mode-config-status').textContent = runtime.configDirty
-      ? 'Изменения применятся при следующем подключении. Текущий сеанс использует прежние настройки.' : '';
+    byId('mode-config-status').textContent = runtime.modeTransition?.detail || (runtime.configDirty
+      ? 'Изменения применятся при следующем подключении. Текущий сеанс использует прежние настройки.' : '');
     const workspace = workspaceStatus(config, runtime.workspaceState);
     fillOptions(byId('agent-workspace-mode'), [{ value: 'temporary', label: 'Пустая временная папка' }, { value: 'project', label: 'Папка проекта' }], workspace.mode);
     byId('agent-project-field').hidden = workspace.mode !== 'project';
@@ -385,11 +385,11 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     byId('agent-workspace-current').hidden = !workspace.path;
     byId('agent-workspace-path-label').textContent = workspace.pathLabel;
     byId('agent-workspace-path').textContent = workspace.path;
-    const sessionActive = ['starting', 'connecting', 'ready', 'running'].includes(runtime.agentStage)
+    const sessionActive = Boolean(runtime.modeTransition) || ['starting', 'connecting', 'ready', 'running'].includes(runtime.agentStage)
       || runtime.connectionStatus === 'connecting' || ['starting', 'live', 'stopping'].includes(runtime.broadcastState?.stage);
     byId('agent-workspace-clear').hidden = workspace.mode !== 'temporary' && runtime.workspaceState?.mode !== 'temporary';
     byId('agent-workspace-clear').disabled = !runtime.nativeWindow || workspace.busy || sessionActive || pendingActions.has('clear_temporary_workspace');
-    const broadcast = broadcastStatus(runtime.broadcastState);
+    const broadcast = broadcastStatus(runtime.broadcastState, runtime.modeTransition);
     const broadcastPending = pendingActions.has('start_broadcast');
     const interview = interviewStatus(runtime.interviewState);
     const meetingView = mode.meeting || Boolean(runtime.systemAudioActive || runtime.interviewStarting);
@@ -428,7 +428,7 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     const voiceError = runtime.voiceError || runtime.microphoneError || broadcast.error;
     byId('voice-error').textContent = voiceError;
     byId('voice-error').hidden = !voiceError;
-    byId('agent-realtime-status').textContent = runtime.voiceError || (runtime.liveAvailable ? 'Realtime подключён.'
+    byId('agent-realtime-status').textContent = runtime.voiceError || runtime.modeTransition?.detail || (runtime.liveAvailable ? 'Realtime подключён.'
       : config.realtime === false ? 'Голосовой ввод выключен в параметрах агента.'
         : runtime.connectionStatus === 'connecting' ? 'Realtime подключается…' : 'Realtime сейчас не подключён.');
     byId('agent-realtime-status').classList.toggle('agent-inline-error', Boolean(runtime.voiceError));
@@ -468,14 +468,14 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     byId('screen-window-status').textContent = !runtime.nativeWindow ? 'Режим окна доступен в приложении OpenAssistant.'
       : runtime.windowMode === 'standard' ? 'Обычное окно доступно для демонстрации экрана и не закреплено поверх других окон.'
         : 'Оверлей закреплён поверх окон и скрывается из поддерживаемых способов демонстрации.';
-    byId('agent-runtime').textContent = runtime.agentDetail || (runtime.agentStage === 'ready' ? 'Codex подключён' : 'Подключение создаётся при отправке задачи или включении микрофона.');
+    byId('agent-runtime').textContent = runtime.modeTransition?.detail || runtime.agentDetail || (runtime.agentStage === 'ready' ? 'Codex подключён' : 'Подключение создаётся при отправке задачи или включении микрофона.');
     byId('agent-error').textContent = runtime.lastError || '';
     byId('agent-error').hidden = !runtime.lastError;
-    const connecting = ['starting', 'connecting'].includes(runtime.agentStage) || runtime.connectionStatus === 'connecting';
+    const connecting = Boolean(runtime.modeTransition) || ['starting', 'connecting'].includes(runtime.agentStage) || runtime.connectionStatus === 'connecting';
     const connected = ['ready', 'running'].includes(runtime.agentStage);
-    byId('agent-connect').textContent = connecting ? 'Подключение…' : runtime.configDirty && connected ? 'Применить и переподключить' : connected ? 'Переподключить' : 'Подключить';
+    byId('agent-connect').textContent = runtime.modeTransition ? 'Подготовка…' : connecting ? 'Подключение…' : runtime.configDirty && connected ? 'Применить и переподключить' : connected ? 'Переподключить' : 'Подключить';
     byId('agent-connect').disabled = connecting || ['starting', 'stopping'].includes(broadcast.stage) || pendingActions.has('reconnect_session');
-    byId('agent-disconnect').disabled = (runtime.agentStage === 'idle' && runtime.connectionStatus === 'idle') || pendingActions.has('disconnect_session');
+    byId('agent-disconnect').disabled = (!runtime.modeTransition && runtime.agentStage === 'idle' && runtime.connectionStatus === 'idle') || pendingActions.has('disconnect_session');
     byId('agent-send').disabled = busy;
     byId('agent-send').textContent = busy ? 'Отправляю…' : 'Отправить';
     const tasks = runtime.tasks || [];

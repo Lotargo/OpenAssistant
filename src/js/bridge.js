@@ -68,6 +68,13 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let sessionBroadcastUsed = false;
   let sessionBroadcastId = null;
   let sessionBroadcastEnded = false;
+  let closedSession = null;
+  let modeRequest = null;
+  let modeWorker = null;
+  let requestedStart = null;
+  let microphoneIntentMuted = false;
+  const modeWaiters = new Set();
+  let modeWakeScheduled = false;
   let retireAfterTasksSessionId = null;
   let microphoneChanging = false;
   let interviewStarting = false;
@@ -92,6 +99,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     interviewStarting: false, interviewState: { stage: 'idle', detail: 'Прослушивание выключено' },
     speakerState: { status: 'idle', detail: '' }, transcriptHistory: [],
     broadcastState: { stage: 'idle', detail: 'Эфир выключен', reason: '' },
+    modeTransition: null,
     screenCaptureEnabled: false, scrollLocked: false, settingsOpen: false,
     windowMode: !native && validWindowMode(storedWindowMode) ? storedWindowMode : 'overlay',
     connectionStatus: native ? 'idle' : 'unavailable', agentStage: 'idle', agentDetail: '',
@@ -104,6 +112,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   function publish(patch = {}) {
     runtime = { ...runtime, ...patch };
     onState?.({ ...runtime });
+    wakeModeWaiters();
     return { ...runtime };
   }
   function publishNative(state = {}) {
@@ -242,6 +251,178 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     const state = await invoke('assistant_workspace_state');
     if (!destroyed) publish({ workspaceState: workspaceState(state) });
   }
+  const MODE_CANCELLED = Symbol('mode-transition-cancelled');
+  function busyTasks() {
+    return runtime.tasks.some(task => task.status === 'running')
+      || runtime.approvals.length > 0 || runtime.inputs.length > 0;
+  }
+  function wakeModeWaiters() {
+    if (modeWakeScheduled || !modeWaiters.size) return;
+    modeWakeScheduled = true;
+    queueMicrotask(() => {
+      modeWakeScheduled = false;
+      for (const check of [...modeWaiters]) check();
+    });
+  }
+  function currentModeRequest(request) {
+    return modeRequest === request && !request.cancelled && !destroyed;
+  }
+  function publishModeTransition(request, stage, detail) {
+    if (!currentModeRequest(request)) return;
+    const next = { scenario: config.scenario, stage, resumeBroadcast: true, detail };
+    if (JSON.stringify(runtime.modeTransition) !== JSON.stringify(next)) publish({ modeTransition: next });
+  }
+  function cancelRequestedStart() {
+    if (requestedStart) requestedStart.cancelled = true;
+    requestedStart = null;
+  }
+  function finishModeRequest(request, error = null) {
+    if (modeRequest !== request) return;
+    modeRequest = null;
+    request.cancelled = true;
+    request.cancel();
+    publish({ modeTransition: null });
+    if (error) {
+      reportError(error);
+      request.reject(error);
+    } else request.resolve();
+  }
+  function cancelModeTransition() {
+    const previous = modeRequest;
+    if (previous) finishModeRequest(previous);
+  }
+  async function modeStep(request, operation) {
+    const result = await Promise.race([operation, request.cancellation]);
+    if (result === MODE_CANCELLED || !currentModeRequest(request)) throw MODE_CANCELLED;
+    return result;
+  }
+  function waitForModeDrain(request) {
+    const oldSession = request.sessionId;
+    if (oldSession === null) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      let idleTimer = null;
+      function finish(error = null) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(idleTimer);
+        modeWaiters.delete(check);
+        if (error) reject(error); else resolve();
+      }
+      function check() {
+        if (finished) return;
+        if (!currentModeRequest(request)) return finish(MODE_CANCELLED);
+        if (closedSession?.id === oldSession) {
+          return finish(closedSession.unexpected
+            ? new Error(closedSession.message || 'Предыдущая сессия закрылась с незавершённой задачей. Эфир остановлен.')
+            : null);
+        }
+        if (transport.sessionId !== oldSession) return finish();
+        if (busyTasks()) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+          publishModeTransition(request, 'waiting_tasks', 'Дожидаюсь задач Codex — затем продолжу эфир в новом режиме');
+        } else {
+          // A text-only session has no native broadcast terminal to await.
+          // Its accepted work has drained; the next connect retires it normally.
+          if (!request.waitForSessionClose) return finish();
+          if (idleTimer === null) {
+            // Do not force-disconnect an opaque/slow native session: accepted work
+            // may not have reached its first UI event. Failure leaves Codex intact.
+            idleTimer = setTimeout(() => finish(new Error(
+              'Не удалось подтвердить закрытие предыдущей сессии. Эфир выключен; задачи Codex не отменены.',
+            )), 15_000);
+          }
+          publishModeTransition(request, 'stopping', 'Завершаю предыдущую сессию перед сменой режима');
+        }
+      }
+      modeWaiters.add(check);
+      void request.cancellation.then(check);
+      check();
+    });
+  }
+  function runModeTransitions() {
+    if (modeWorker) return;
+    const operation = (async () => {
+      while (modeRequest && !destroyed) {
+        const request = modeRequest;
+        try {
+          await modeStep(request, request.stopping);
+          await modeStep(request, request.saved);
+          if (runtime.broadcastState?.broadcast_id === request.broadcastId
+            && runtime.broadcastState.stage === 'ended' && runtime.broadcastState.reason === 'error') {
+            throw new Error(runtime.broadcastState.detail || 'Не удалось завершить предыдущий эфир.');
+          }
+          await modeStep(request, waitForModeDrain(request));
+          if (!config.realtime) { finishModeRequest(request); continue; }
+          publishModeTransition(request, 'connecting', 'Подключаю эфир в режиме «' + modeLabel(config) + '»');
+          await modeStep(request, startBroadcast({
+            microphoneMuted: request.microphoneMuted,
+            isCurrent: () => currentModeRequest(request),
+          }));
+          if (!broadcastIntent || runtime.broadcastState?.stage !== 'live') {
+            throw new Error(runtime.voiceError || runtime.broadcastState?.detail || 'Не удалось восстановить эфир.');
+          }
+          finishModeRequest(request);
+        } catch (error) {
+          if (error === MODE_CANCELLED || !currentModeRequest(request)) continue;
+          await stopBroadcast('error', { detail: String(error?.message ?? error) }).catch(() => {});
+          if (currentModeRequest(request)) finishModeRequest(request, error);
+        }
+      }
+    })();
+    modeWorker = operation;
+    void operation.finally(() => {
+      if (modeWorker === operation) modeWorker = null;
+      if (modeRequest && !destroyed) runModeTransitions();
+    }).catch(reportError);
+  }
+  function requestModeTransition(saved) {
+    const previous = modeRequest;
+    if (previous) {
+      previous.cancelled = true;
+      previous.cancel();
+      previous.resolve(); // Superseded commands settle without stale failures.
+    }
+    cancelRequestedStart();
+    let cancel, resolve, reject;
+    const cancellation = new Promise(yes => { cancel = () => yes(MODE_CANCELLED); });
+    const completion = new Promise((yes, no) => { resolve = yes; reject = no; });
+    completion.catch(() => {});
+    const sessionId = transport.sessionId;
+    const request = {
+      cancelled: false, cancel, cancellation, resolve, reject, completion, saved,
+      sessionId, broadcastId, microphoneMuted: microphoneIntentMuted,
+      // Set before send() enqueues broadcast_start; preserve it when a newer
+      // config replaces preparation for this same session during teardown.
+      waitForSessionClose: sessionBroadcastId !== null
+        || previous?.sessionId === sessionId && previous.waitForSessionClose,
+    };
+    modeRequest = request;
+    publishModeTransition(request, 'stopping', 'Переключаю режим — эфир продолжится автоматически');
+    request.stopping = stopBroadcast('user', { detail: 'Переключаю режим эфира' });
+    request.stopping.catch(() => {});
+    runModeTransitions();
+    return completion;
+  }
+  function requestBroadcastStart() {
+    if (modeRequest) return modeRequest.completion;
+    if (requestedStart) return requestedStart.promise;
+    if (broadcastIntent || broadcastStartToken) return Promise.resolve();
+    microphoneIntentMuted = false; // An explicit start keeps the existing both-sources behavior.
+    const request = { cancelled: false, promise: null };
+    requestedStart = request;
+    const operation = startBroadcast({
+      microphoneMuted: false,
+      isCurrent: () => requestedStart === request && !request.cancelled && !destroyed,
+    });
+    request.promise = operation;
+    void operation.finally(() => {
+      if (requestedStart === request) requestedStart = null;
+    }).catch(() => {});
+    return operation;
+  }
+
   function broadcastActive() {
     return ['starting', 'live', 'stopping'].includes(runtime.broadcastState?.stage);
   }
@@ -367,12 +548,14 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     try { await operation; }
     finally { if (broadcastStopping === operation) broadcastStopping = null; }
   }
-  async function startBroadcast() {
+  async function startBroadcast({ microphoneMuted = false, isCurrent = () => true } = {}) {
     if (!native) throw new Error(PREVIEW_ONLY);
+    if (!isCurrent()) return;
     if (broadcastStopping) await broadcastStopping;
+    if (!isCurrent()) return;
     if (broadcastStartToken || broadcastIntent) return;
     if (!config.realtime) throw new Error('Включи голосовое подключение во вкладке «Агенты».');
-    if ((runtime.configDirty || sessionBroadcastUsed) && runtime.tasks.some(task => task.status === 'running')) {
+    if ((runtime.configDirty || sessionBroadcastUsed) && busyTasks()) {
       throw new Error('Дождись завершения текущих задач перед новым эфиром.');
     }
     const cancelled = Symbol('broadcast-cancelled');
@@ -387,11 +570,11 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     interviewListeningIntent = meeting;
     const force = sessionBroadcastUsed || sessionBroadcastEnded;
     publish({ broadcastState: { broadcast_id: token.id, stage: 'starting', reason: '', detail: 'Подключаю эфир' },
-      microphoneStarting: !meeting, interviewStarting: meeting,
+      microphoneStarting: !meeting && !microphoneMuted, interviewStarting: meeting,
       ...(meeting ? { interviewState: { stage: 'starting', detail: 'Подключаю режим «' + modeLabel(config) + '»' } } : {}) });
     async function step(operation) {
       const result = await Promise.race([operation, cancellation]);
-      if (result === cancelled || token.cancelled || broadcastId !== token.id || !broadcastIntent || destroyed) throw cancelled;
+      if (result === cancelled || token.cancelled || broadcastId !== token.id || !broadcastIntent || destroyed || !isCurrent()) throw cancelled;
       return result;
     }
     try {
@@ -404,17 +587,18 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       await step(waitForVoice());
       if (runtime.configDirty) throw new Error('Настройки изменились во время подключения. Включи эфир заново.');
       await step(Promise.all([mic.refresh(), ...(meeting ? [systemAudio.refresh()] : [])]));
-      if (!runtime.audioAvailable) throw new Error('Выбери доступный микрофон.');
+      if (!microphoneMuted && !runtime.audioAvailable) throw new Error('Выбери доступный микрофон.');
       if (meeting && !runtime.systemAudioAvailable) throw new Error('Выбери устройство вывода для звука встречи.');
       if (meeting) await step(systemAudio.start());
-      await step(mic.start());
+      if (!microphoneMuted) await step(mic.start());
       if (meeting) await step(send('interview_start'));
       broadcastSourcesReady = true;
       publish({ broadcastState: { broadcast_id: token.id, stage: 'live', reason: '', detail: 'Эфир включён' },
-        ...(meeting ? { interviewState: { stage: 'listening', detail: 'Слушаю микрофон и участников встречи' } } : {}) });
+        ...(meeting ? { interviewState: { stage: 'listening', detail: microphoneMuted
+          ? 'Слушаю участников встречи · микрофон выключен' : 'Слушаю микрофон и участников встречи' } } : {}) });
       log({ kind: 'broadcast', title: 'Эфир включён', status: 'live', detail: modeLabel(sessionConfig) });
     } catch (error) {
-      if (error === cancelled || token.cancelled) return;
+      if (error === cancelled || token.cancelled || !isCurrent()) return;
       await stopBroadcast('error', { detail: String(error?.message ?? error) }).catch(() => {});
       throw error;
     } finally {
@@ -674,6 +858,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         break;
       }
       case 'session_closed': {
+        closedSession = { id: transport.sessionId, unexpected: busyTasks(), message: event.message || '' };
         retireAfterTasksSessionId = null;
         failWaiting(event.message || 'Сессия закрыта.');
         failVoice(event.message || 'Сессия закрыта.');
@@ -723,6 +908,8 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
 
   async function disconnect({ preserveBroadcast = false } = {}) {
     if (!preserveBroadcast) {
+      cancelRequestedStart();
+      cancelModeTransition();
       broadcastIntent = false;
       broadcastSourcesReady = false;
       interviewListeningIntent = false;
@@ -781,6 +968,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       }, 60_000) };
       try {
         sessionConfig = { ...config };
+        closedSession = null;
         const created = await transport.connect(sessionConfig);
         if (epoch !== generation || destroyed || created === null) throw new Error('Подключение отменено.');
         readyIfPossible();
@@ -803,18 +991,22 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   }
 
   async function setAgentSettings(patch) {
-    let next = normalizeAgent({ ...config, ...patch });
+    const next = normalizeAgent({ ...config, ...patch });
     validateCustomSettings(next);
-    if ((next.scenario !== config.scenario || next.custom_behavior !== config.custom_behavior) && broadcastActive()) {
-      await stopBroadcast('user', { detail: 'Эфир остановлен при смене режима' });
-      // Another settings window may save unrelated options while Stop waits.
-      next = normalizeAgent({ ...config, ...patch });
-      validateCustomSettings(next);
-    }
     const changed = JSON.stringify(next) !== JSON.stringify(config);
+    const modeChanged = next.scenario !== config.scenario
+      || next.scenario === 'custom' && next.custom_behavior !== config.custom_behavior;
+    const resume = Boolean(modeRequest || broadcastIntent
+      || requestedStart && !requestedStart.cancelled);
+    // Commit the latest target before any await. An older Stop/save completion
+    // must never reapply its mode over a newer selection from either window.
     config = next;
     publish({ agentConfig: { ...config }, configDirty: runtime.configDirty || changed });
-    await saveValue('agent', AGENT_KEY, config);
+    const saved = saveValue('agent', AGENT_KEY, config);
+    saved.catch(() => {});
+    const preparation = changed && resume && (modeChanged || modeRequest)
+      ? requestModeTransition(saved) : null;
+    await Promise.all([saved, preparation]);
     return { ...runtime };
   }
 
@@ -826,9 +1018,11 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         case 'notification_theme':
           return native ? await invoke(name, args) : { delivered: false };
         case 'start_broadcast':
-          await startBroadcast();
+          await requestBroadcastStart();
           return { ...runtime };
         case 'stop_broadcast':
+          cancelRequestedStart();
+          cancelModeTransition();
           await stopBroadcast();
           return { ...runtime };
         case 'set_scenario':
@@ -838,6 +1032,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           if (!broadcastIntent || runtime.broadcastState?.stage !== 'live') throw new Error('Сначала включи эфир.');
           if (microphoneChanging) return { ...runtime };
           microphoneChanging = true;
+          microphoneIntentMuted = Boolean(args.muted);
           try {
             if (args.muted) await mic.stop();
             else await mic.start();
@@ -872,23 +1067,23 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           if (!native) throw new Error(PREVIEW_ONLY);
           const path = await invoke('assistant_choose_workspace');
           if (typeof path === 'string' && path) {
-            config = normalizeAgent({ ...config, workspace: path, workspace_mode: 'project' });
-            publish({ agentConfig: { ...config }, configDirty: true });
-            await saveValue('agent', AGENT_KEY, config);
+            await setAgentSettings({ workspace: path, workspace_mode: 'project' });
           }
           return { ...runtime };
         }
         case 'clear_temporary_workspace':
           if (!native) throw new Error(PREVIEW_ONLY);
-          if (runtime.tasks.some(task => task.status === 'running') || broadcastActive()) throw new Error('Останови эфир и дождись завершения задач перед очисткой.');
+          if (busyTasks() || broadcastActive() || modeRequest) throw new Error('Останови эфир и дождись завершения задач перед очисткой.');
           await disconnect();
           await invoke('assistant_cleanup_workspaces');
           await refreshWorkspace();
           return { ...runtime };
         case 'start_interview':
-          await startBroadcast();
+          await requestBroadcastStart();
           return { ...runtime };
         case 'stop_interview':
+          cancelRequestedStart();
+          cancelModeTransition();
           await stopBroadcast();
           return { ...runtime };
         case 'set_system_audio_device':
@@ -928,15 +1123,20 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           if (!args.enabled) return publish({ screenCaptureEnabled: false });
           throw new Error('Передача изображения экрана модели в этой версии не подключена.');
         case 'reconnect_session':
-          if (broadcastActive()) await stopBroadcast();
+          cancelRequestedStart();
+          cancelModeTransition();
+          await stopBroadcast();
           await connect({ force: true });
           return { ...runtime };
         case 'disconnect_session':
-          if (broadcastActive()) await stopBroadcast();
+          cancelRequestedStart();
+          cancelModeTransition();
+          await stopBroadcast();
           if (runtime.tasks.some(task => task.status === 'running')) throw new Error('Дождись завершения текущих задач перед отключением.');
           await disconnect();
           return { ...runtime };
         case 'agent_task': {
+          if (modeRequest) throw new Error('Дождись смены режима, затем отправь новую задачу. Текущие задачи продолжают работу.');
           const task = String(args.task || '').trim();
           if (!task) throw new Error('Введи задачу Codex.');
           if ([...task].length > 16000) throw new Error('Задача слишком длинная: максимум 16000 символов.');
@@ -980,7 +1180,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
       'overlay:error': payload => reportError(payload?.message ?? payload),
       'overlay:action': payload => {
         const action = payload?.action === 'microphone'
-          ? broadcastActive()
+          ? modeRequest ? command('stop_broadcast') : broadcastActive()
             ? runtime.broadcastState.stage === 'live' ? command('set_microphone_muted', { muted: payload.muted ?? !runtime.microphoneMuted }) : command('stop_broadcast')
             : command('start_broadcast')
           : payload?.action === 'reconnect' ? command('reconnect_session') : null;

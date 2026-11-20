@@ -32,7 +32,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: roun
   display: flex;
   flex-direction: column;
   width: 100%;
-  min-height: 112px;
+  min-height: min(144px, 100vh);
+  height: var(--output-height, auto);
   max-height: var(--overlay-max-height, min(var(--max-height-percent), 760px));
   border: 1px solid var(--line-color);
   border-top-color: rgba(255, 255, 255, .25);
@@ -42,12 +43,13 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: roun
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025);
   font-size: var(--font-size);
   line-height: 1.5;
-  transition: width 180ms ease, max-height 180ms ease;
+  transition: width 180ms ease, max-height 180ms ease, height 180ms ease;
 }
 
 /* The native window may be slightly taller than measured content. Pin the
    controls to its bottom edge instead of allowing that spare height to drift. */
-body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; max-height: min(var(--overlay-max-height, 100vh), 100vh); }
+body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; height: var(--output-height, 100%); max-height: min(var(--overlay-max-height, 100vh), 100vh); }
+.overlay[data-output-sizing="frozen"] { transition-property: width, max-height; }
 
 .drag-region { position: absolute; z-index: 2; top: 0; left: 22px; right: 22px; height: 12px; user-select: none; }
 [data-window-drag] { cursor: grab; }
@@ -60,7 +62,11 @@ body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; ma
 .scroll-panel::-webkit-scrollbar, .settings-dialog::-webkit-scrollbar, .settings-main::-webkit-scrollbar { width: 8px; height: 8px; }
 .scroll-panel::-webkit-scrollbar-track, .settings-main::-webkit-scrollbar-track { background: rgba(255,255,255,.035); border-radius: 8px; }
 .scroll-panel::-webkit-scrollbar-thumb, .settings-dialog::-webkit-scrollbar-thumb, .settings-main::-webkit-scrollbar-thumb { border: 2px solid transparent; background: rgba(202,207,215,.34); background-clip: padding-box; border-radius: 8px; }
-.text-panel { padding: 24px 28px 28px; flex: 1 1 auto; max-height: var(--content-max-height, none); }
+.text-panel { display: flex; flex-direction: column; padding: 24px 28px; flex: 1 1 auto; max-height: var(--content-max-height, none); }
+/* Auto margins center a short response, but resolve to zero on overflow so the
+   beginning of a long response remains reachable by normal scrolling. */
+.text-panel > .markdown-content { flex: 0 0 auto; width: 100%; max-width: 72ch; margin: auto; text-align: center; }
+.text-panel > .markdown-content :is(ul, ol, pre, table, blockquote) { text-align: left; }
 .text-panel:empty { min-height: 56px; }
 .markdown-content { overflow-wrap: anywhere; }
 .markdown-content > :first-child { margin-top: 0; }
@@ -188,7 +194,7 @@ body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; ma
 
 @media (max-width: 720px) {
   .overlay { border-radius: 17px; }
-  .text-panel { padding: 21px 20px 23px; }
+  .text-panel { padding: 22px 20px; }
   .split-view { padding: 14px; gap: 10px; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
   .notes-panel { padding: 14px; }
   .toolbar { --toolbar-gap: 8px; }
@@ -218,6 +224,7 @@ body:not(.browser-preview) .overlay { position: absolute; left: 0; bottom: 0; ma
   .toolbar-audio { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
+  .overlay { transition: none; }
   .toolbar-audio-wave { display: none; }
   .toolbar-audio-level { display: block; }
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
