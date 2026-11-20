@@ -16,6 +16,11 @@ export async function openNative(page, options = {}) {
     let nextCallback = 1;
     let nextSession = 1;
     let nextTask = 1;
+    let nextCapture = 1;
+    let audioDevices = options.audioDevices || [
+      { id: 'fixture-default', name: 'Fixture Microphone', is_default: true },
+      { id: 'fixture-usb', name: 'USB Microphone', is_default: false },
+    ];
     let state = {
       revision: 1, microphoneMuted: true, screenCaptureEnabled: false,
       scrollLocked: false, settingsOpen: false, connectionStatus: 'idle',
@@ -25,23 +30,39 @@ export async function openNative(page, options = {}) {
     const callbacks = new Map();
     const listeners = new Map();
     const delayed = new Map();
+    const failures = new Map();
     const pending = [];
     const values = new Map();
     const sessions = new Map();
     const tasks = new Map();
+    const captures = new Map();
     const models = [
       { id: 'fixture-codex', display_name: 'Fixture Codex', is_default: true, reasoning_efforts: ['medium', 'high'] },
       { id: 'fixture-codex-small', display_name: 'Fixture Small', is_default: false, reasoning_efforts: ['low', 'medium'] },
     ];
     const harness = {
       calls: [], resizes: [], saves: [], agentSaves: [], sessionIds: [], events: [],
-      messages: [], audio: [], pending, applyResizes: true,
+      messages: [], audio: [], audioStarts: [], audioStops: [], audioNoiseChanges: [], audioSaves: [], captureIds: [], pending, applyResizes: true,
+      setAudioDevices(devices) { audioDevices = structuredClone(devices); },
+      emitAudio(captureId, event) {
+        const capture = captures.get(captureId);
+        if (!capture) throw new Error('Unknown fixture capture ' + captureId);
+        const callback = callbacks.get(capture.channel.id);
+        if (!callback) throw new Error('Audio Channel callback is not registered');
+        callback({ message: { capture_id: captureId, ...event }, index: capture.index++ });
+      },
+      lastCapture() {
+        const capture = [...captures.values()].at(-1);
+        return capture ? { id: capture.id, channelId: capture.channel.id, mode: capture.mode, active: capture.active, noiseSuppression: capture.noiseSuppression } : null;
+      },
       delayNext(name) { delayed.set(name, (delayed.get(name) || 0) + 1); },
+      failNext(name, message = 'Fixture command failed') { failures.set(name, message); },
       release(name) {
         const index = pending.findIndex(item => item.name === name);
         if (index < 0) throw new Error('No pending ' + name + ' reply');
         const [item] = pending.splice(index, 1);
-        item.resolve(item.value);
+        if (item.failure) item.reject(item.failure);
+        else item.resolve(item.value);
       },
       emit(event, payload) {
         for (const id of listeners.get(event) || []) callbacks.get(id)?.({ event, id, payload });
@@ -90,6 +111,11 @@ export async function openNative(page, options = {}) {
       const recorded = { ...args };
       delete recorded.onEvent;
       harness.calls.push({ name, args: recorded });
+      if (failures.has(name)) {
+        const message = failures.get(name);
+        failures.delete(name);
+        throw new Error(message);
+      }
       switch (name) {
         case 'plugin:event|listen': {
           const ids = listeners.get(args.event) || [];
@@ -112,6 +138,41 @@ export async function openNative(page, options = {}) {
         case 'update_hit_rects':
           harness.hitRects = args.rects;
           return null;
+        case 'audio_input_state':
+          return { devices: structuredClone(audioDevices), available: audioDevices.length > 0 };
+        case 'audio_start': {
+          const device = args.deviceId ? audioDevices.find(item => item.id === args.deviceId)
+            : audioDevices.find(item => item.is_default);
+          if (!device) throw new Error('Выбранный микрофон недоступен.');
+          const id = nextCapture++;
+          for (const previous of captures.values()) {
+            if (previous.active) {
+              previous.active = false;
+              harness.emitAudio(previous.id, { type: 'stopped', reason: 'replaced' });
+            }
+          }
+          captures.set(id, { id, channel: args.onEvent, index: 0, active: true, mode: args.mode, noiseSuppression: args.noiseSuppression });
+          harness.captureIds.push(id);
+          harness.audioStarts.push({ captureId: id, mode: args.mode, deviceId: args.deviceId, noiseSuppression: args.noiseSuppression });
+          queueMicrotask(() => harness.emitAudio(id, { type: 'started', device_id: device.id, device_name: device.name }));
+          return id;
+        }
+        case 'audio_set_noise_suppression': {
+          const capture = captures.get(args.captureId);
+          if (!capture?.active) throw new Error('Audio capture is closed');
+          capture.noiseSuppression = args.enabled;
+          harness.audioNoiseChanges.push({ captureId: args.captureId, enabled: args.enabled });
+          return null;
+        }
+        case 'audio_stop': {
+          harness.audioStops.push(args.captureId);
+          const capture = captures.get(args.captureId);
+          if (capture?.active) {
+            capture.active = false;
+            harness.emitAudio(capture.id, { type: 'stopped', reason: 'requested' });
+          }
+          return null;
+        }
         case 'assistant_status':
           return { codex_available: true, oauth: 'available', workspace: 'F:\\fixture-workspace', mode: 'real' };
         case 'assistant_connect': {
@@ -165,6 +226,7 @@ export async function openNative(page, options = {}) {
         case 'plugin:store|save':
           harness.saves.push(structuredClone(values.get('appearance')));
           harness.agentSaves.push(structuredClone(values.get('agent')));
+          harness.audioSaves.push(structuredClone(values.get('audio')));
           return null;
         default: throw new Error('Unexpected native command in contract test: ' + name);
       }
@@ -183,8 +245,12 @@ export async function openNative(page, options = {}) {
       async invoke(name, args = {}) {
         const hold = (delayed.get(name) || 0) > 0;
         if (hold) delayed.set(name, delayed.get(name) - 1);
-        const value = await execute(name, args);
-        if (hold) return new Promise(resolve => pending.push({ name, value, resolve }));
+        let value;
+        let failure;
+        try { value = await execute(name, args); }
+        catch (error) { failure = error; }
+        if (hold) return new Promise((resolve, reject) => pending.push({ name, value, failure, resolve, reject }));
+        if (failure) throw failure;
         return value;
       },
     };

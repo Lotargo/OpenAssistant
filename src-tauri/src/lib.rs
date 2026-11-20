@@ -1,4 +1,6 @@
 mod assistant;
+mod audio;
+mod audio_commands;
 mod state;
 mod window_stealth;
 
@@ -43,7 +45,7 @@ fn set_microphone_muted(
     state.snapshot()
 }
 
-/// Reports actual capture state after WebView audio setup/teardown.
+/// Reports actual capture state after native audio setup/teardown.
 #[tauri::command]
 fn sync_audio_state(
     app: AppHandle,
@@ -107,6 +109,9 @@ fn set_settings_open(
     state: State<'_, OverlayState>,
     open: bool,
 ) -> Result<RuntimeState, String> {
+    if !open {
+        window.state::<audio::AudioState>().invalidate_test();
+    }
     window_stealth::set_settings_focus(&window, &state, open)?;
     publish(window.app_handle(), state.snapshot()?)
 }
@@ -144,6 +149,8 @@ struct SettingsEvent {
 }
 
 fn retire_webview_session(app: &AppHandle) {
+    // Revoke capture immediately, including a start still waiting for the device.
+    app.state::<audio::AudioState>().invalidate();
     app.state::<assistant::AssistantState>().invalidate_view();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -152,6 +159,13 @@ fn retire_webview_session(app: &AppHandle) {
             .close_stale_view()
             .await;
     });
+}
+
+fn toggle_overlay_visibility(window: &WebviewWindow) -> Result<(), String> {
+    // A local microphone check follows the visible settings panel. Dictation
+    // keeps running when the non-focusable overlay is hidden or loses focus.
+    window.state::<audio::AudioState>().invalidate_test();
+    window_stealth::toggle_visibility(window)
 }
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -183,7 +197,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 "toggle" => app
                     .get_webview_window("main")
                     .ok_or_else(|| "Overlay window is unavailable".to_owned())
-                    .and_then(|window| window_stealth::toggle_visibility(&window)),
+                    .and_then(|window| toggle_overlay_visibility(&window)),
                 "settings" => open_settings(app),
                 "reconnect" => app
                     .emit("overlay:action", serde_json::json!({"action":"reconnect"}))
@@ -222,7 +236,7 @@ fn setup_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                         let window = app
                             .get_webview_window("main")
                             .ok_or("Overlay window is unavailable")?;
-                        window_stealth::toggle_visibility(&window)?;
+                        toggle_overlay_visibility(&window)?;
                     } else if shortcut == &shortcuts[1] {
                         let muted = !state.snapshot()?.microphone_muted;
                         app.emit(
@@ -259,6 +273,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(OverlayState::default())
         .manage(assistant::AssistantState::default())
+        .manage(audio::AudioState::default())
         .plugin(tauri_plugin_store::Builder::default().build())
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
@@ -268,11 +283,19 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
-                retire_webview_session(window.app_handle());
+            if window.label() == "main" {
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    retire_webview_session(window.app_handle());
+                } else if matches!(event, tauri::WindowEvent::Focused(false)) {
+                    window.state::<audio::AudioState>().invalidate_test();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
+            audio_commands::audio_input_state,
+            audio_commands::audio_start,
+            audio_commands::audio_stop,
+            audio_commands::audio_set_noise_suppression,
             assistant::assistant_status,
             assistant::assistant_connect,
             assistant::assistant_send,
@@ -302,6 +325,9 @@ pub fn run() {
         .expect("could not start OpenAssistant");
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            let audio = handle.state::<audio::AudioState>();
+            audio.invalidate();
+            let _ = audio.stop(None);
             tauri::async_runtime::block_on(handle.state::<assistant::AssistantState>().shutdown());
         }
     });

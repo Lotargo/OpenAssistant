@@ -1,3 +1,6 @@
+import { createMicrophoneMeter } from './microphone-meter.js';
+import { setButtonIcon } from './icons.js';
+
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -25,6 +28,12 @@ function safeDetail(value) {
 export function createAgentSettings({ host, bridge, getRuntimeState, closeModal }) {
   const abort = new AbortController();
   const byId = id => host.querySelector('#' + id);
+  const microphoneMeter = createMicrophoneMeter(host);
+  microphoneMeter.setVisible(false);
+  let testRequested = false;
+  let testEpoch = 0;
+  let noiseIntent = null;
+  let destroyed = false;
   let busy = false;
   let logSignature = '';
   let approvalSignature = '';
@@ -39,6 +48,34 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
       if (close) await closeModal();
     } catch (failure) { error(failure); }
     finally { if (button) button.disabled = false; refresh(); }
+  }
+  async function setNoiseSuppression(enabled) {
+    if (!bridge || noiseIntent !== null) return;
+    noiseIntent = Boolean(enabled);
+    refresh();
+    try { await bridge.command('set_microphone_noise_suppression', { enabled: noiseIntent }); }
+    catch (failure) { error(failure); }
+    finally { noiseIntent = null; refresh(); }
+  }
+  async function startMicrophoneTest() {
+    if (!bridge || byId('mic-test').disabled) return;
+    const epoch = ++testEpoch;
+    testRequested = true;
+    refresh();
+    try { await bridge.command('start_microphone_test'); }
+    catch (failure) { error(failure); }
+    finally {
+      if (testEpoch === epoch) testRequested = false;
+      refresh();
+    }
+  }
+  async function stopMicrophoneTest() {
+    if (!bridge || (!testRequested && !getRuntimeState()?.microphoneTesting)) return;
+    ++testEpoch;
+    testRequested = false;
+    try { await bridge.command('stop_microphone_test'); }
+    catch (failure) { error(failure); }
+    finally { refresh(); }
   }
   async function submitTask(event) {
     event?.preventDefault();
@@ -67,6 +104,7 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     }
     if (target.id === 'realtime-model') void bridge.setAgentSettings({ realtime_model: target.value }).catch(error);
     if (target.id === 'mic-device') void action(null, 'set_microphone_device', { deviceId: target.value });
+    if (target.id === 'mic-noise-suppression') void setNoiseSuppression(target.checked);
     if (target.matches('[data-answer-choice]')) {
       const other = target.closest('fieldset').querySelector('[data-answer-other]');
       if (other) { other.hidden = target.value !== '__other__'; other.required = !other.hidden; }
@@ -79,6 +117,11 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     if (button.id === 'agent-connect') void action(button, 'reconnect_session');
     if (button.id === 'agent-disconnect') void action(button, 'disconnect_session');
     if (button.id === 'agent-interrupt') void action(button, 'agent_interrupt');
+    if (button.id === 'mic-refresh') void action(button, 'refresh_microphones');
+    if (button.id === 'mic-test') {
+      if (testRequested || getRuntimeState()?.microphoneTesting) void stopMicrophoneTest();
+      else void startMicrophoneTest();
+    }
     if (button.dataset.approvalDecision) {
       const pending = getRuntimeState().approvals?.find(item => String(item.request_id) === button.dataset.requestId);
       if (pending) void action(button, 'agent_approval', { request_id: pending.request_id, decision: button.dataset.approvalDecision });
@@ -217,6 +260,7 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
   }
 
   function refresh() {
+    if (destroyed) return;
     const runtime = getRuntimeState() || {};
     const config = runtime.agentConfig || bridge?.getAgentSettings?.() || {};
     for (const input of host.querySelectorAll('[data-agent-setting]')) {
@@ -231,12 +275,30 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
     const efforts = model?.reasoning_efforts || [];
     fillOptions(byId('agent-effort'), [{ value: '', label: 'По умолчанию модели' },
       ...efforts.map(effort => ({ value: typeof effort === 'string' ? effort : effort.reasoningEffort || effort.effort, label: typeof effort === 'string' ? effort : effort.reasoningEffort || effort.effort }))], config.effort);
-    fillOptions(byId('mic-device'), (runtime.microphoneDevices || [{ deviceId: '', label: 'Системный по умолчанию' }])
-      .map(device => ({ value: device.deviceId, label: device.label })), runtime.microphoneDevice);
+    const microphoneDevices = runtime.microphoneDevices?.length ? runtime.microphoneDevices
+      : [{ deviceId: '', label: 'Системный по умолчанию' }];
+    fillOptions(byId('mic-device'), microphoneDevices.map(device => ({ value: device.deviceId, label: device.label })), runtime.microphoneDevice);
     if (document.activeElement !== byId('realtime-model')) byId('realtime-model').value = config.realtime_model || 'gpt-realtime-2.1';
-    byId('mic-device').disabled = !runtime.audioAvailable;
+    const testing = Boolean(runtime.microphoneTesting || testRequested);
+    const dictating = runtime.microphoneMuted === false && !runtime.microphoneTesting;
+    const audioBusy = Boolean(runtime.microphoneBusy);
+    byId('mic-device').disabled = !runtime.nativeWindow || audioBusy;
+    byId('mic-refresh').disabled = !runtime.nativeWindow || audioBusy;
     byId('mic-runtime').textContent = !runtime.nativeWindow ? 'Микрофон доступен в приложении OpenAssistant.'
-      : runtime.microphoneMuted ? 'Микрофон выключен' : runtime.micDetail || 'Микрофон включён';
+      : runtime.microphoneStatus || (runtime.microphoneMuted ? 'Микрофон выключен' : runtime.micDetail || 'Микрофон включён');
+    byId('mic-test').disabled = !testing && (!runtime.audioAvailable || audioBusy || dictating);
+    byId('mic-test').setAttribute('aria-pressed', String(testing));
+    byId('mic-test-label').textContent = testing ? 'Остановить проверку' : 'Проверить микрофон';
+    setButtonIcon(byId('mic-test-icon'), testing ? 'stop' : 'play');
+    const remaining = Number(runtime.microphoneTestRemaining);
+    byId('mic-test-status').textContent = testing
+      ? (runtime.microphoneTesting ? 'Говорите обычным голосом' + (remaining > 0 ? ' · ' + Math.ceil(remaining) + ' с' : '') : 'Открываем микрофон…')
+      : dictating ? 'Уровень текущего голосового ввода.' : 'Локальная проверка на 20 секунд. Звук не отправляется.';
+    byId('mic-noise-suppression').checked = noiseIntent ?? Boolean(runtime.microphoneNoiseSuppression);
+    byId('mic-noise-suppression').disabled = !runtime.nativeWindow || audioBusy || noiseIntent !== null;
+    byId('mic-error').textContent = runtime.microphoneError || '';
+    byId('mic-error').hidden = !runtime.microphoneError;
+    microphoneMeter.update(runtime.microphoneLevels, runtime);
     byId('agent-runtime').textContent = runtime.agentDetail || (runtime.agentStage === 'ready' ? 'Codex подключён' : 'Подключение создаётся при отправке задачи или включении микрофона.');
     byId('agent-error').textContent = runtime.lastError || '';
     byId('agent-error').hidden = !runtime.lastError;
@@ -298,5 +360,11 @@ export function createAgentSettings({ host, bridge, getRuntimeState, closeModal 
       if (pinned) log.scrollTop = log.scrollHeight;
     }
   }
-  return { refresh, destroy() { abort.abort(); } };
+  return {
+    refresh,
+    stopMicrophoneTest,
+    updateAudioLevels(levels) { if (!destroyed) microphoneMeter.update(levels, getRuntimeState() || {}); },
+    setAudioVisible(visible) { microphoneMeter.setVisible(visible); },
+    destroy() { destroyed = true; microphoneMeter.destroy(); void stopMicrophoneTest(); abort.abort(); },
+  };
 }

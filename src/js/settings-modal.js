@@ -29,7 +29,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
             <button id="tab-appearance" class="settings-tab" type="button" role="tab" aria-selected="true" aria-controls="section-appearance" data-tab="appearance">${getIcon('appearance')}<span>Внешний вид</span></button>
             <button id="tab-behavior" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-behavior" tabindex="-1" data-tab="behavior">${getIcon('behavior')}<span>Поведение</span></button>
             <button id="tab-sources" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-sources" tabindex="-1" data-tab="sources">${getIcon('sources')}<span>Источники</span></button>
-            <button id="tab-agent" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-agent" tabindex="-1" data-tab="agent">${getIcon('behavior')}<span>Агент</span></button>
+            <button id="tab-agent" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="section-agent" tabindex="-1" data-tab="agent">${getIcon('agent')}<span>Агент</span></button>
           </nav>
           <div class="settings-main">
             <section id="section-appearance" class="settings-section" role="tabpanel" aria-labelledby="tab-appearance">
@@ -70,7 +70,19 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
               <h2>Источники</h2>
               <p class="settings-description">Аудио, экран и подключение модели.</p>
               <p id="settings-runtime-error" class="settings-message" role="status" hidden></p>
-              <div class="source-card"><h3>Микрофон</h3><p>Системный источник выбирается по умолчанию. Устройство можно менять во время разговора.</p><select id="mic-device" aria-label="Микрофон"><option value="">Системный по умолчанию</option></select><p id="mic-runtime" class="source-detail"></p></div>
+              <div class="source-card microphone-card">
+                <div class="source-card-heading"><div><h3>Микрофон</h3><p>Системный источник по умолчанию. Устройство можно менять во время разговора.</p></div><button id="mic-refresh" class="icon-button source-refresh" type="button" aria-label="Обновить список микрофонов">${getIcon('reconnect')}</button></div>
+                <select id="mic-device" aria-label="Микрофон"><option value="">Системный по умолчанию</option></select>
+                <p id="mic-runtime" class="source-detail"></p>
+                <div id="mic-monitor" class="mic-monitor" data-active="false" data-clipped="false">
+                  <div class="mic-level-heading"><span id="mic-level-label">Микрофон выключен</span><output id="mic-level-value" aria-hidden="true">−60 дБ</output></div>
+                  <div id="mic-level" class="mic-level" role="meter" aria-label="Уровень входящего звука" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span id="mic-level-fill" class="mic-level-fill"></span></div>
+                  <div class="mic-waveform" aria-hidden="true"><svg viewBox="0 0 480 64" preserveAspectRatio="none"><path class="mic-wave-center" d="M0 32H480"/><path id="mic-wave-path" class="mic-wave-path" d="M0 32H480"/></svg></div>
+                </div>
+                <div class="mic-test-row"><button id="mic-test" class="action-button secondary" type="button"><span id="mic-test-icon" aria-hidden="true">${getIcon('play')}</span><span id="mic-test-label">Проверить микрофон</span></button><p id="mic-test-status" class="mic-test-status" role="status">Локальная проверка на 20 секунд.</p></div>
+                <div class="mic-noise-row"><div class="mic-noise-copy"><label for="mic-noise-suppression">Шумоподавление</label><small>Убирает постоянный фоновый шум. По умолчанию выключено.</small></div><label class="switch"><input id="mic-noise-suppression" type="checkbox"/><span class="switch-track" aria-hidden="true"></span></label></div>
+                <p id="mic-error" class="mic-error" role="status" hidden></p>
+              </div>
               <div class="source-card"><h3>Realtime</h3><p>Речь и ответы после естественной паузы. Микрофон остаётся включённым.</p><select id="realtime-model" aria-label="Модель Realtime"><option value="gpt-realtime-2.1">gpt-realtime-2.1</option><option value="gpt-realtime-1.5">gpt-realtime-1.5</option></select></div>
               <div class="source-card"><h3>Системный звук и экран</h3><p>Сейчас используется выбранный микрофон. Захват системного звука и изображения ещё не подключён.</p></div>
             </section>
@@ -146,7 +158,9 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
   }
 
   function selectTab(tab, focus = false) {
-    activeTab = TABS.includes(tab) ? tab : 'appearance';
+    const nextTab = TABS.includes(tab) ? tab : 'appearance';
+    if (activeTab === 'sources' && nextTab !== 'sources') void agentSettings.stopMicrophoneTest();
+    activeTab = nextTab;
     for (const button of host.querySelectorAll('[data-tab]')) {
       const active = button.dataset.tab === activeTab;
       button.setAttribute('aria-selected', String(active));
@@ -155,6 +169,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
     }
     for (const tabName of TABS) host.querySelector(`#section-${tabName}`).hidden = tabName !== activeTab;
     host.querySelector('.settings-main').scrollTop = 0;
+    agentSettings.setAudioVisible(opened && activeTab === 'sources');
     if (activeTab === 'appearance') requestAnimationFrame(() => picker.refresh());
   }
 
@@ -166,6 +181,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
       opened = true;
       previousFocus = document.activeElement;
       backdrop.hidden = false;
+      agentSettings.setAudioVisible(activeTab === 'sources');
       overlay.inert = true;
       document.body.classList.add('settings-open');
       settingsButton?.setAttribute('aria-expanded', 'true');
@@ -190,8 +206,10 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
 
   async function close() {
     if (!opened) return;
+    void agentSettings.stopMicrophoneTest();
     opened = false;
     backdrop.hidden = true;
+    agentSettings.setAudioVisible(false);
     overlay.inert = false;
     document.body.classList.remove('settings-open');
     settingsButton?.setAttribute('aria-expanded', 'false');
@@ -242,6 +260,7 @@ export function createSettingsModal({ getSettings, onChange, onOpenChange, getRu
     open,
     close,
     refresh() { current = normalizeSettings(getSettings()); renderValues(); },
+    updateAudioLevels(levels) { agentSettings.updateAudioLevels(levels); },
     get isOpen() { return opened; },
     destroy() { void close(); abort.abort(); picker.destroy(); agentSettings.destroy(); host.replaceChildren(); },
   };

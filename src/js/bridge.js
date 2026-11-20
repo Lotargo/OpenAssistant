@@ -6,6 +6,7 @@ import { createAssistantTransport } from './session-transport.js';
 
 const APPEARANCE_KEY = 'openassistant.settings.v1';
 const AGENT_KEY = 'openassistant.agent.v1';
+const AUDIO_KEY = 'openassistant.audio.v1';
 const PREVIEW_ONLY = 'Codex доступен в приложении OpenAssistant. Браузер открыт только для просмотра интерфейса.';
 const DEFAULT_AGENT = Object.freeze({
   workspace: '', model: '', effort: '', web_search: true, parallel: true,
@@ -24,12 +25,19 @@ function normalizeAgent(value = {}) {
     realtime_model: ['gpt-realtime-2.1', 'gpt-realtime-1.5'].includes(source.realtime_model) ? source.realtime_model : 'gpt-realtime-2.1',
   };
 }
+function normalizeAudio(value = {}) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    deviceId: typeof source.deviceId === 'string' ? source.deviceId : '',
+    noiseSuppression: source.noiseSuppression === true,
+  };
+}
 function readStored(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key) || 'null') || fallback; } catch { return fallback; }
 }
 
 /** Native IPC carries only safe status, events and user input. OAuth stays in Rust. */
-export async function createBridge({ onState, onScroll, onSettings, onError, onTurnStart, onChunk, onTurnEnd } = {}) {
+export async function createBridge({ onState, onScroll, onSettings, onError, onTurnStart, onChunk, onTurnEnd, onAudioLevels } = {}) {
   const native = isTauri();
   let storePromise;
   const getStore = () => storePromise ??= load('settings.json', { autoSave: false, defaults: {} });
@@ -41,6 +49,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   let storedAgent;
   try { storedAgent = native ? await (await getStore()).get('agent') : readStored(AGENT_KEY, DEFAULT_AGENT); }
   catch (error) { initialError = 'Не удалось прочитать параметры агента: ' + String(error); }
+  let storedAudio;
+  try { storedAudio = native ? await (await getStore()).get('audio') : readStored(AUDIO_KEY, {}); }
+  catch (error) { initialError = 'Не удалось прочитать параметры микрофона: ' + String(error); }
+  let audioConfig = normalizeAudio(storedAudio);
   let config = normalizeAgent(storedAgent);
   let generation = 0;
   let destroyed = false;
@@ -55,10 +67,12 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   const taskText = new Map();
   let realtimeText = '';
   let runtime = {
-    microphoneMuted: true, microphoneDevice: '', microphoneDevices: [],
+    microphoneMuted: true, microphoneDevice: audioConfig.deviceId, microphoneDevices: [],
+    microphoneNoiseSuppression: audioConfig.noiseSuppression, microphoneTesting: false,
+    microphoneBusy: false, microphoneError: '', microphoneStatus: '', microphoneLevels: null,
     screenCaptureEnabled: false, scrollLocked: false, settingsOpen: false,
     connectionStatus: native ? 'idle' : 'unavailable', agentStage: 'idle', agentDetail: '',
-    audioAvailable: native && Boolean(navigator.mediaDevices?.getUserMedia),
+    audioAvailable: false,
     screenCaptureAvailable: false, liveAvailable: false, nativeWindow: native,
     platform: native ? 'desktop' : 'browser', lastError: initialError, agentConfig: { ...config }, models: [],
     activities: [], approvals: [], inputs: [], tasks: [], transcript: '',
@@ -98,7 +112,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     return operation.catch(error => { reportError('Не удалось сохранить настройки: ' + String(error)); throw error; });
   }
   function syncAudio(state) {
-    const current = { muted: Boolean(state.microphoneMuted), available: native && Boolean(state.audioAvailable) };
+    const current = {
+      muted: Boolean(state.microphoneMuted ?? runtime.microphoneMuted),
+      available: native && Boolean(state.audioAvailable ?? runtime.audioAvailable),
+    };
     publish({ ...state, audioAvailable: current.available });
     if (!native || destroyed) return;
     const signature = JSON.stringify(current);
@@ -109,7 +126,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
   }
   const transport = createAssistantTransport({
     invoke, Channel, onEvent: receive,
-    onError(error) { reportError(error); void mic.stop(false); },
+    onError(error) { reportError(error); stopVoiceSafely(); },
   });
   function send(type, data = {}) { return transport.send({ type, ...data }); }
   function log(activity) {
@@ -120,6 +137,18 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     }].slice(-80) });
   }
   const mic = createMicrophone({
+    nativeAudio: native ? { invoke, Channel } : null,
+    initialSettings: audioConfig,
+    onSettings(preferences) {
+      audioConfig = normalizeAudio(preferences);
+      return saveValue('audio', AUDIO_KEY, audioConfig).catch(() => {});
+    },
+    onLevels(levels) {
+      runtime = { ...runtime, microphoneLevels: levels };
+      // Audio meters have their own lightweight rendering path. A signal frame
+      // must not rebuild the settings controls or move keyboard focus.
+      onAudioLevels?.(levels);
+    },
     isReady: () => native && runtime.liveAvailable && config.realtime && transport.connected,
     sendEvent: send,
     sendAudio(buffer) { return transport.audio(buffer); },
@@ -127,6 +156,10 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     onDevices: (devices, selected) => publish({ microphoneDevices: devices, microphoneDevice: selected }),
     onError: message => reportError(message),
   });
+
+  function stopVoiceSafely() {
+    void mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
+  }
 
   function begin(source, taskId = null) {
     activeSource = source;
@@ -177,17 +210,17 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           const message = event.detail || 'Голосовая сессия недоступна. Текстовые задачи Codex доступны.';
           publish({ voiceError: message });
           failVoice(message);
-          void mic.stop(false);
+          stopVoiceSafely();
           reportError(message);
         } else if (stage === 'ready') {
           if (voiceReady) { publish({ voiceError: '' }); void mic.refresh(); resolveVoice(); }
           else {
-            void mic.stop(false);
+            stopVoiceSafely();
             failVoice('Голосовой режим отключён. Текстовые задачи Codex доступны.');
           }
         }
         if (stage === 'disconnected') {
-          void mic.stop(false);
+          stopVoiceSafely();
           failVoice(event.detail || 'Realtime отключён.');
         }
         break;
@@ -306,14 +339,14 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         const message = event.message || 'Ошибка Realtime.';
         publish({ voiceError: message, connectionStatus: 'error', liveAvailable: false });
         failVoice(message);
-        void mic.stop(false);
+        stopVoiceSafely();
         reportError(message);
         break;
       }
       case 'session_closed':
         failWaiting(event.message || 'Сессия закрыта.');
         failVoice(event.message || 'Сессия закрыта.');
-        void mic.stop(false);
+        stopVoiceSafely();
         publish({ connectionStatus: 'idle', connectionDetail: '', agentStage: 'idle', agentDetail: event.message || 'Сессия закрыта.', liveAvailable: false, approvals: [], inputs: [] });
         break;
       default: break;
@@ -350,7 +383,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
     connectionPromise = null;
     failWaiting('Подключение отменено.');
     failVoice('Подключение отменено.');
-    await mic.stop(false);
+    await mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
     await transport.disconnect();
     activeSource = null;
     visibleTask = null;
@@ -391,7 +424,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
           failWaiting(message);
           failVoice(message);
           publish({ agentStage: 'error', agentDetail: message, connectionStatus: 'error', connectionDetail: message, liveAvailable: false });
-          await mic.stop(false);
+          await mic.stop(false).catch(error => reportError('Не удалось остановить микрофон: ' + String(error)));
           await transport.disconnect().catch(() => {});
         }
         throw error;
@@ -408,6 +441,7 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         case 'set_microphone_muted':
           if (args.muted) await mic.stop();
           else {
+            await mic.stopTest();
             if (!config.realtime) throw new Error('Включи Realtime во вкладке «Агент», чтобы использовать микрофон.');
             if (runtime.configDirty && runtime.tasks.some(item => item.status === 'running')) throw new Error('Примени изменённые параметры после завершения текущей задачи.');
             await connect();
@@ -422,9 +456,23 @@ export async function createBridge({ onState, onScroll, onSettings, onError, onT
         case 'refresh_microphones':
           await mic.refresh();
           return { ...runtime };
+        case 'request_microphone_permission':
+          await mic.requestPermission();
+          return { ...runtime };
+        case 'start_microphone_test':
+          if (!native) throw new Error('Проверка микрофона доступна в приложении OpenAssistant.');
+          await mic.startTest();
+          return { ...runtime };
+        case 'stop_microphone_test':
+          await mic.stopTest();
+          return { ...runtime };
+        case 'set_microphone_noise_suppression':
+          await mic.setNoiseSuppression(Boolean(args.enabled));
+          return { ...runtime };
         case 'set_scroll_locked':
           return native ? publishNative(await invoke(name, args)) : publish({ scrollLocked: Boolean(args.locked) });
         case 'set_settings_open':
+          if (!args.open) await mic.stopTest();
           return native ? publishNative(await invoke(name, args)) : publish({ settingsOpen: Boolean(args.open) });
         case 'set_screen_capture_enabled':
           if (!args.enabled) return publish({ screenCaptureEnabled: false });

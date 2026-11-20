@@ -5,6 +5,7 @@ import { createRenderer } from './renderer.js';
 import { createSettingsModal } from './settings-modal.js';
 import { DEFAULT_SETTINGS, normalizeSettings, applyTheme } from './settings.js';
 import { setButtonIcon } from './icons.js';
+import { createMicrophoneIndicator } from './microphone-meter.js';
 import { createGeometrySync } from './geometry.js';
 import { playDemo } from './demo.js';
 
@@ -18,6 +19,7 @@ let modalOpen = false;
 let saveTimer;
 let runtime = {};
 const demoAbort = new AbortController();
+const microphoneIndicator = createMicrophoneIndicator(document.querySelector('[data-action="microphone"]'));
 
 function persist() {
   clearTimeout(saveTimer);
@@ -33,6 +35,10 @@ function renderControls(next = runtime) {
   mic.setAttribute('aria-pressed', String(Boolean(runtime.microphoneMuted)));
   mic.setAttribute('aria-label', runtime.microphoneMuted ? 'Включить микрофон' : 'Выключить микрофон');
   setButtonIcon(mic, runtime.microphoneMuted ? 'microphone-muted' : 'microphone');
+  setButtonIcon(screenButton, 'screen');
+  setButtonIcon(reconnect, 'reconnect');
+  setButtonIcon(document.querySelector('[data-action="settings"]'), 'settings');
+  microphoneIndicator.update(runtime.microphoneLevels, runtime);
   screenButton.setAttribute('aria-pressed', String(Boolean(runtime.screenCaptureEnabled)));
   screenButton.dataset.state = runtime.screenCaptureEnabled ? 'active' : 'idle';
   lock.setAttribute('aria-pressed', String(Boolean(runtime.scrollLocked)));
@@ -86,6 +92,11 @@ async function applySettings(next) {
 async function start() {
   bridge = await createBridge({
     onState: renderControls,
+    onAudioLevels(levels) {
+      runtime = { ...runtime, microphoneLevels: levels };
+      microphoneIndicator.update(levels, runtime);
+      modal?.updateAudioLevels(levels);
+    },
     onScroll: scrollPanel,
     onSettings: ({ open, tab, request }) => open ? modal?.open(tab || 'agent', request) : modal?.close(),
     onError: () => modal?.refresh(),
@@ -161,6 +172,7 @@ async function start() {
 window.addEventListener('pagehide', () => {
   clearTimeout(saveTimer);
   demoAbort.abort();
+  microphoneIndicator.destroy();
   geometry?.destroy();
   renderer.destroy();
   modal?.destroy();
